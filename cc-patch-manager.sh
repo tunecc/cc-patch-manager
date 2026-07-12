@@ -2104,7 +2104,7 @@ status_label() {
     applied) printf '%s✓ 已应用%s' "$GREEN" "$NC" ;;
     idle)    printf '%s· 未应用%s' "$DIM" "$NC" ;;
     error)   printf '%s! 错误%s' "$RED" "$NC" ;;
-    *)       printf '%s? 未知%s' "$YELLOW" "$NC" ;;
+    *)       printf '%s? 未检测%s' "$YELLOW" "$NC" ;;
   esac
 }
 
@@ -2118,10 +2118,16 @@ applied_ids() {
 count_applied() { count_status applied; }
 
 draw_header() {
-  local a i e
+  local a i e u=0 id
   a=$(count_status applied)
   i=$(count_status idle)
   e=$(count_status error)
+  for id in "${PATCH_IDS[@]}"; do
+    case "${STATUS[$id]:-}" in
+      applied|idle|error) ;;
+      *) u=$((u + 1)) ;;
+    esac
+  done
   printf '%sClaude Code 补丁管理器%s  v%s\n' "$BOLD" "$NC" "$VERSION"
   printf '%s\n' '----------------------------------------'
   if [[ -n "$CLI_PATH" ]]; then
@@ -2129,7 +2135,13 @@ draw_header() {
   else
     printf '目标:  %s(未找到)%s\n' "$RED" "$NC"
   fi
-  printf '状态:  %s 已应用 · %s 未应用 · %s 错误\n' "$a" "$i" "$e"
+  if [[ $((a + i + e)) -eq 0 ]]; then
+    printf '状态:  %s尚未检测%s — 按 [r] 刷新全部，或进入补丁后按 [c]\n' "$YELLOW" "$NC"
+  else
+    printf '状态:  %s 已应用 · %s 未应用 · %s 错误' "$a" "$i" "$e"
+    [[ "$u" -gt 0 ]] && printf ' · %s 未检测' "$u"
+    printf '\n'
+  fi
   printf '%s\n' '----------------------------------------'
 }
 
@@ -2145,7 +2157,7 @@ draw_main() {
     idx=$((idx + 1))
   done
   printf '%s\n' '----------------------------------------'
-  printf '[1-4] 选择补丁   [r] 刷新   [p] 换路径   [q] 退出\n'
+  printf '[1-4] 选择补丁   [r] 刷新全部   [p] 换路径   [q] 退出\n'
 }
 
 confirm_apply() {
@@ -2269,9 +2281,9 @@ set_path_interactive() {
   read -r p || true
   if [[ -f "$p" ]]; then
     CLI_PATH="$p"
-    success "目标已设置"
-    info "正在检测全部补丁..."
-    refresh_all
+    STATUS=()
+    MSG=()
+    success "目标已设置（状态已清空，按 [r] 检测）"
   else
     error "不是可读文件: $p"
   fi
@@ -2280,11 +2292,8 @@ set_path_interactive() {
 
 menu_loop() {
   local choice id
-  # 启动时只在还没有任何状态时全量检测一次
-  if [[ ${#STATUS[@]} -eq 0 ]]; then
-    info "首次启动，正在检测全部补丁（仅此一次，可能稍慢）..."
-    refresh_all || true
-  fi
+  # 启动不自动全量扫描：每次进程 STATUS 都是空的，所谓「首次」实际是每次启动。
+  # 需要状态时再按 [r] 刷新全部，或进入补丁后按 [c] 只检当前。
   while true; do
     draw_main
     printf '请选择: '
