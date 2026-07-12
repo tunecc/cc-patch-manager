@@ -31,7 +31,7 @@ PATCH_IDS=(auto-mode keybindings transcript-dialog ultracode)
 patch_name() {
   case "$1" in
     auto-mode) echo "自动模式解锁" ;;
-    keybindings) echo "快捷键与 Ctrl+C" ;;
+    keybindings) echo "Ctrl+C 回滚" ;;
     transcript-dialog) echo "权限弹窗重放" ;;
     ultracode) echo "Ultracode 解锁" ;;
     *) echo "$1" ;;
@@ -41,7 +41,7 @@ patch_name() {
 patch_note() {
   case "$1" in
     auto-mode) echo "非默认模型也能开 Auto；分类器可改用 Haiku" ;;
-    keybindings) echo "开自定义快捷键；Ctrl+C 退出，Esc 才中断" ;;
+    keybindings) echo "2.1 起 Ctrl+C 直接打断 Agent；打回旧退出习惯" ;;
     transcript-dialog) echo "Ctrl+O 看会话时审批卡 Waiting… / 被中断" ;;
     ultracode) echo "在只支持 max、不支持 xhigh 的模型上启用" ;;
     *) echo "" ;;
@@ -73,12 +73,12 @@ EOF
       ;;
     keybindings)
       cat <<'EOF'
-现象：自定义快捷键被功能开关关掉；且 2.1.x 起 Ctrl+C 默认直接打断
-Agent（旧版更像「再按一次才退出」），习惯旧行为的人容易误触。
+现象：2.1.x 起 Ctrl+C 默认直接打断 Agent；旧版是执行中先 tip、再按一次
+才退出，习惯旧行为的人改不回来。自定义快捷键也被功能开关关掉。
 
 改动：
-  (1) 强制开启自定义快捷键（~/.claude/keybindings.json）
-  (2) 默认 Ctrl+C 改为退出程序；中断 Agent 仍用 Escape
+  (1) 默认 Ctrl+C 改回退出程序；中断 Agent 仍用 Escape
+  (2) 强制开启自定义快捷键（~/.claude/keybindings.json）
 EOF
       ;;
     transcript-dialog)
@@ -2344,8 +2344,9 @@ draw_main() {
   clear_screen
   draw_header
   local idx=1 id st plain name note pad
-  # 固定显示列宽：状态 8、补丁 14，说明从同一列起笔
-  printf '  #  %s  %s  %s\n' "$(pad_right "状态" 9)" "$(pad_right "补丁" 14)" "说明"
+  # 固定显示列宽：状态 9、补丁 16（须 ≥ 最长补丁名显示宽，否则说明列首字不齐）
+  local name_w=16
+  printf '  #  %s  %s  %s\n' "$(pad_right "状态" 9)" "$(pad_right "补丁" "$name_w")" "说明"
   for id in "${PATCH_IDS[@]}"; do
     st="${STATUS[$id]:-unknown}"
     plain=$(status_plain "$st")
@@ -2355,7 +2356,7 @@ draw_main() {
     (( pad < 0 )) && pad=0
     printf '  %d  ' "$idx"
     status_label "$st"
-    printf '%*s  %s  %s\n' "$pad" '' "$(pad_right "$name" 14)" "$note"
+    printf '%*s  %s  %s\n' "$pad" '' "$(pad_right "$name" "$name_w")" "$note"
     idx=$((idx + 1))
   done
   printf '%s\n' '----------------------------------------'
