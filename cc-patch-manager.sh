@@ -207,6 +207,26 @@ ensure_acorn() {
   return 0
 }
 
+# 每个补丁后缀只保留最新 keep 份整文件备份（默认 1），其余删除。
+# 原脚本每次 apply 都会新建带时间戳的备份且从不清理，长期会占满磁盘。
+prune_old_backups() {
+  local id="$1"
+  local keep="${2:-1}"
+  local suffix dir f n=0
+  suffix=$(patch_suffix "$id")
+  [[ -n "${CLI_PATH:-}" ]] || return 0
+  dir=$(dirname "$CLI_PATH")
+  # shellcheck disable=SC2012
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    n=$((n + 1))
+    if (( n > keep )); then
+      rm -f "$f"
+      info "已清理旧备份: $(basename "$f")"
+    fi
+  done < <(ls -t "$dir"/cli.js."${suffix}"-* 2>/dev/null || true)
+}
+
 # restore_patch id → 0 success, 1 fail
 restore_patch() {
   local id="$1"
@@ -2063,7 +2083,14 @@ run_node_patch() {
   set -e
   rm -f "$script"
   LAST_OUTPUT="$output"
-  parse_and_set_status "$id" "$mode" "$output" "$ec"
+  if parse_and_set_status "$id" "$mode" "$output" "$ec"; then
+    # 仅在真正写入（有 BACKUP 标记）后清理该后缀的旧备份
+    if [[ "$mode" == "apply" && -n "${LAST_BACKUP:-}" ]]; then
+      prune_old_backups "$id" 1
+    fi
+    return 0
+  fi
+  return 1
 }
 
 refresh_one() {
