@@ -40,7 +40,7 @@ patch_name() {
 
 patch_note() {
   case "$1" in
-    auto-mode) echo "非默认模型也能开 Auto；分类器可改用 Haiku" ;;
+    auto-mode) echo "放开 Auto 模型门禁；分类器可自定义；不可用时改询问" ;;
     keybindings) echo "2.1 起 Ctrl+C 直接打断 Agent；打回旧退出习惯" ;;
     transcript-dialog) echo "Ctrl+O 看会话时审批卡 Waiting… / 被中断" ;;
     ultracode) echo "在只支持 max、不支持 xhigh 的模型上启用" ;;
@@ -62,13 +62,14 @@ patch_purpose() {
   case "$1" in
     auto-mode)
       cat <<'EOF'
-现象：部分模型（如早期 Opus 4.6）进不了 Auto Mode；分类器常跟主对话
-用同一模型，贵且易 429，作者实践里 Haiku 更稳。
+现象：部分模型进不了 Auto Mode；分类器常跟主对话同一模型（贵且易 429）；
+分类器暂时不可用时官方会直接拒绝工具，对话容易卡住。
 
 改动：
-  (1) 放开自动模式的模型资格检查
+  (1) 放开 Auto 的模型资格检查（不限官方默认名单）
   (2) 分类器暂时不可用时改为询问，而不是直接拒绝
-  (3) 支持环境变量 CLAUDE_CLASSIFIER_MODEL 指定分类模型
+  (3) 支持环境变量 CLAUDE_CLASSIFIER_MODEL 自定义分类模型
+     （可设 Haiku 等；也支持 settings.json / --settings 的 env）
 EOF
       ;;
     keybindings)
