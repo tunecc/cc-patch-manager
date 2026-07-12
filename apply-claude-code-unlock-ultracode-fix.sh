@@ -442,64 +442,53 @@ for (const ifStmt of oaIfStmts) {
     // Found the xhigh degradation IfStatement — inspect consequent
     xhighDegradeIf = ifStmt;
 
-    // Two shapes exist across versions:
-    //   Old (≤2.1.162): return "high"           (ReturnStatement)
-    //   New (≥2.1.195): i = "high"              (ExpressionStatement + AssignmentExpression)
+    // Three shapes: return "high" | i="high" | i=gBe(e)?"max":"high" (2.1.204 patched)
     let retStmt = null;
     let assignExpr = null;
-    if (ifStmt.consequent.type === 'ReturnStatement') retStmt = ifStmt.consequent;
-    else if (ifStmt.consequent.type === 'BlockStatement' &&
-             ifStmt.consequent.body.length === 1 &&
-             ifStmt.consequent.body[0].type === 'ReturnStatement') {
-        retStmt = ifStmt.consequent.body[0];
-    } else if (ifStmt.consequent.type === 'ExpressionStatement' &&
-               ifStmt.consequent.expression.type === 'AssignmentExpression' &&
-               ifStmt.consequent.expression.operator === '=' &&
-               ifStmt.consequent.expression.right?.type === 'Literal' &&
-               ifStmt.consequent.expression.right.value === 'high') {
-        assignExpr = ifStmt.consequent.expression;
-    } else if (ifStmt.consequent.type === 'BlockStatement' &&
-               ifStmt.consequent.body.length === 1 &&
-               ifStmt.consequent.body[0].type === 'ExpressionStatement' &&
-               ifStmt.consequent.body[0].expression.type === 'AssignmentExpression' &&
-               ifStmt.consequent.body[0].expression.operator === '=' &&
-               ifStmt.consequent.body[0].expression.right?.type === 'Literal' &&
-               ifStmt.consequent.body[0].expression.right.value === 'high') {
-        assignExpr = ifStmt.consequent.body[0].expression;
+    const cons = ifStmt.consequent;
+    if (cons.type === 'ReturnStatement') retStmt = cons;
+    else if (cons.type === 'BlockStatement' &&
+             cons.body.length === 1 &&
+             cons.body[0].type === 'ReturnStatement') {
+        retStmt = cons.body[0];
+    } else if (cons.type === 'ExpressionStatement' &&
+               cons.expression.type === 'AssignmentExpression' &&
+               cons.expression.operator === '=') {
+        assignExpr = cons.expression;
+    } else if (cons.type === 'BlockStatement' &&
+               cons.body.length === 1 &&
+               cons.body[0].type === 'ExpressionStatement' &&
+               cons.body[0].expression.type === 'AssignmentExpression' &&
+               cons.body[0].expression.operator === '=') {
+        assignExpr = cons.body[0].expression;
     }
     if (!retStmt && !assignExpr) break;
 
+    function isKj6MaxHighConditional(cond) {
+        const testCallsKj6 = cond?.type === 'ConditionalExpression' &&
+            cond.test?.type === 'CallExpression' &&
+            cond.test.callee?.type === 'Identifier' &&
+            cond.test.callee.name === kj6Name;
+        const consequentIsMax = cond?.consequent?.type === 'Literal' &&
+            cond.consequent.value === 'max';
+        const altIsHigh = cond?.alternate?.type === 'Literal' &&
+            cond.alternate.value === 'high';
+        return testCallsKj6 && consequentIsMax && altIsHigh;
+    }
+
     if (retStmt) {
         if (retStmt.argument?.type === 'Literal' && retStmt.argument.value === 'high') {
-            // Unpatched old form: return "high"
             xhighDegradeReturn = retStmt.argument;
-        } else if (retStmt.argument?.type === 'ConditionalExpression') {
-            const cond = retStmt.argument;
-            const testCallsKj6 = cond.test?.type === 'CallExpression' &&
-                cond.test.callee?.type === 'Identifier' &&
-                cond.test.callee.name === kj6Name;
-            const consequentIsMax = cond.consequent?.type === 'Literal' &&
-                cond.consequent.value === 'max';
-            if (testCallsKj6 && consequentIsMax) {
-                console.log('FOUND:' + oaName + ' xhigh degradation already patched (' + kj6Name + '→"max")');
-                patchedFlags.oa = true;
-            }
+        } else if (isKj6MaxHighConditional(retStmt.argument)) {
+            console.log('FOUND:' + oaName + ' xhigh degradation already patched (' + kj6Name + '→"max")');
+            patchedFlags.oa = true;
         }
     } else if (assignExpr) {
         if (assignExpr.right?.type === 'Literal' && assignExpr.right.value === 'high') {
-            // Unpatched new form: i = "high"
             xhighDegradeReturn = assignExpr.right;
-        } else if (assignExpr.right?.type === 'ConditionalExpression') {
-            const cond = assignExpr.right;
-            const testCallsKj6 = cond.test?.type === 'CallExpression' &&
-                cond.test.callee?.type === 'Identifier' &&
-                cond.test.callee.name === kj6Name;
-            const consequentIsMax = cond.consequent?.type === 'Literal' &&
-                cond.consequent.value === 'max';
-            if (testCallsKj6 && consequentIsMax) {
-                console.log('FOUND:' + oaName + ' xhigh degradation already patched (' + kj6Name + '→"max") [assign form]');
-                patchedFlags.oa = true;
-            }
+        } else if (isKj6MaxHighConditional(assignExpr.right)) {
+            console.log('FOUND:' + oaName + ' xhigh degradation already patched (' + kj6Name + '→"max") [assign form]');
+            patchedFlags.oa = true;
         }
     }
     break;

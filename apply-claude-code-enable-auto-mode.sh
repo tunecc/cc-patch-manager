@@ -275,7 +275,11 @@ let replacements = [];
 let patchCount = 0;
 
 // ============================================================
-// Phase 1: Find the auto-mode model check function (oQq)
+// Phase 1: Find the auto-mode model eligibility function
+//
+// Legacy (≤~2.1.201): nested BlockStatement first child, 1× return !0, ≥3× return !1
+// 2.1.204+ (TBe-style): flat body, model denylist string literals, ≥2× return !1, 1× return !0
+// Patch both by replacing entire body with {return !0}
 // ============================================================
 console.log('STEP:1 - Finding auto-mode model check function');
 
@@ -283,7 +287,16 @@ const allFuncDecls = findNodes(ast, n =>
     n.type === 'FunctionDeclaration' && n.params.length === 1
 );
 
-const oQqCandidates = allFuncDecls.filter(fn => {
+function isReturnBoolLiteral(n, boolAsZeroOrOne) {
+    // return !0  (true) or return !1 (false) in minified form
+    return n.type === 'ReturnStatement' && n.argument &&
+        n.argument.type === 'UnaryExpression' && n.argument.operator === '!' &&
+        n.argument.argument && n.argument.argument.type === 'Literal' &&
+        n.argument.argument.value === boolAsZeroOrOne;
+}
+
+// Shape A: legacy nested-block gate
+const oQqCandidatesLegacy = allFuncDecls.filter(fn => {
     const body = fn.body;
     if (body.type !== 'BlockStatement') return false;
     const stmts = body.body;
@@ -291,23 +304,60 @@ const oQqCandidates = allFuncDecls.filter(fn => {
     if (stmts[0].type !== 'BlockStatement') return false;
     if (stmts[stmts.length - 1].type !== 'ReturnStatement') return false;
 
-    const rets0 = findNodes(fn, n =>
-        n.type === 'ReturnStatement' && n.argument &&
-        n.argument.type === 'UnaryExpression' && n.argument.operator === '!' &&
-        n.argument.argument && n.argument.argument.type === 'Literal' &&
-        n.argument.argument.value === 0
-    );
+    const rets0 = findNodes(fn, n => isReturnBoolLiteral(n, 0));
     if (rets0.length !== 1) return false;
-
-    const rets1 = findNodes(fn, n =>
-        n.type === 'ReturnStatement' && n.argument &&
-        n.argument.type === 'UnaryExpression' && n.argument.operator === '!' &&
-        n.argument.argument && n.argument.argument.type === 'Literal' &&
-        n.argument.argument.value === 1
-    );
+    const rets1 = findNodes(fn, n => isReturnBoolLiteral(n, 1));
     if (rets1.length < 3) return false;
     return true;
 });
+
+// Shape B: 2.1.204+ TBe(e) flat model denylist
+// function TBe(e){let t=lo(e),r=wn();if(!Z6t(r))return!1;if(t.includes("claude-3-")||...)return!1;...;return!0}
+const oQqCandidatesFlat = allFuncDecls.filter(fn => {
+    const body = fn.body;
+    if (body.type !== 'BlockStatement') return false;
+    const stmts = body.body;
+    if (stmts.length < 2) return false;
+    // Flat shape: first stmt is VariableDeclaration, not nested BlockStatement
+    if (stmts[0].type === 'BlockStatement') return false;
+    if (stmts[stmts.length - 1].type !== 'ReturnStatement') return false;
+    // Size guard: model eligibility is a small gate, not a huge helper
+    if (fn.end - fn.start > 800) return false;
+
+    const rets0 = findNodes(fn, n => isReturnBoolLiteral(n, 0));
+    if (rets0.length !== 1) return false;
+    const rets1 = findNodes(fn, n => isReturnBoolLiteral(n, 1));
+    if (rets1.length < 2) return false;
+
+    const bodySrc = code.slice(fn.body.start, fn.body.end);
+    // Must look like the auto-mode model denylist + provider gate (TBe in 2.1.204)
+    if (!bodySrc.includes('claude-3-')) return false;
+    if (!bodySrc.includes('firstParty')) return false;
+    if (!bodySrc.includes('anthropicAws')) return false;
+    if (!bodySrc.includes('claude-opus-4-') && !bodySrc.includes('claude-sonnet-4-')) return false;
+    return true;
+});
+
+// Prefer flat matches that include more denylist markers; else legacy
+function rankFlat(fn) {
+    const s = code.slice(fn.body.start, fn.body.end);
+    let score = 0;
+    if (s.includes('firstParty')) score += 2;
+    if (s.includes('anthropicAws')) score += 2;
+    if (s.includes('claude-opus-4-0')) score += 1;
+    if (s.includes('claude-sonnet-4-6')) score += 1;
+    if (s.includes('haiku')) score += 1;
+    return score;
+}
+
+let oQqCandidates = [];
+if (oQqCandidatesFlat.length > 0) {
+    oQqCandidates = oQqCandidatesFlat.slice().sort((a, b) => rankFlat(b) - rankFlat(a));
+    console.log('FOUND:using flat TBe-style model eligibility detector (' + oQqCandidatesFlat.length + ' candidate(s))');
+} else if (oQqCandidatesLegacy.length > 0) {
+    oQqCandidates = oQqCandidatesLegacy;
+    console.log('FOUND:using legacy nested-block model eligibility detector');
+}
 
 let oQqPatched = false;
 let oQqName = '(unknown)';
@@ -315,13 +365,15 @@ let oQqFunc = null;
 
 if (oQqCandidates.length === 0) {
     // Check if already patched: 1-param FuncDecl with body = {return !0}
-    // This happens when @cometix/claude-code or a prior run already patched it
+    // Prefer ones previously matched as model gates via nearby string markers, else any small body
     const alreadyPatched = allFuncDecls.filter(fn => {
         const s = code.slice(fn.body.start, fn.body.end).replace(/\s+/g, '');
         return s === '{return!0}';
     });
     if (alreadyPatched.length > 0) {
-        oQqName = alreadyPatched[0].id.name;
+        // Prefer a previously-known gate near auto-mode helpers if multiple
+        oQqFunc = alreadyPatched[0];
+        oQqName = oQqFunc.id.name;
         oQqPatched = true;
         console.log('FOUND:' + oQqName + ' already patched (body = {return !0})');
     } else {
@@ -339,7 +391,7 @@ if (oQqCandidates.length === 0) {
     console.log('FOUND:func = ' + oQqName + '(' + oQqFunc.params.map(p => p.name).join(',') +
         ') at offset ' + oQqFunc.start + ' [' + (oQqFunc.end - oQqFunc.start) + ' bytes]');
 
-    // Check if oQq already patched
+    // Check if already patched
     const bodySrc = code.slice(oQqFunc.body.start, oQqFunc.body.end);
     const normalizedBody = bodySrc.replace(/\s+/g, '');
     if (normalizedBody === '{return!0}') {
