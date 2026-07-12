@@ -207,45 +207,105 @@ ensure_acorn() {
   return 0
 }
 
-# 每个补丁后缀只保留最新 keep 份整文件备份（默认 1），其余删除。
-# 原脚本每次 apply 都会新建带时间戳的备份且从不清理，长期会占满磁盘。
-prune_old_backups() {
-  local id="$1"
-  local keep="${2:-1}"
-  local suffix dir f n=0
-  suffix=$(patch_suffix "$id")
-  [[ -n "${CLI_PATH:-}" ]] || return 0
-  dir=$(dirname "$CLI_PATH")
-  # shellcheck disable=SC2012
-  while IFS= read -r f; do
-    [[ -n "$f" ]] || continue
-    n=$((n + 1))
-    if (( n > keep )); then
-      rm -f "$f"
-      info "已清理旧备份: $(basename "$f")"
-    fi
-  done < <(ls -t "$dir"/cli.js."${suffix}"-* 2>/dev/null || true)
+# ============================================================
+# 备份策略：干净基线（golden baseline）只存一份
+#
+# 思路（类似系统还原点 / 干净镜像）：
+#   - 第一次改 cli.js 前，若尚无基线，则复制一份干净原件
+#     路径固定：<cli.js 同目录>/cli.js.cc-patch-baseline
+#   - 之后每次 apply 不再按补丁另存时间戳备份（避免「谁是谁」）
+#   - 还原某个补丁 = 回基线 + 重打「除该补丁外」原先已应用的其它补丁
+#   - 一键还原干净 = 仅回基线
+# ============================================================
+baseline_path() {
+  printf '%s.cc-patch-baseline\n' "$CLI_PATH"
 }
 
-# restore_patch id → 0 success, 1 fail
-restore_patch() {
-  local id="$1"
-  local suffix dir latest
-  suffix=$(patch_suffix "$id")
+has_baseline() {
+  [[ -n "${CLI_PATH:-}" && -f "$(baseline_path)" ]]
+}
+
+# 若无基线则创建；已有则跳过。返回 0=就绪，1=失败
+ensure_baseline() {
+  local bp
+  if ! require_target_writable; then
+    error "目标不可写，无法创建基线备份: ${CLI_PATH:-无}"
+    return 1
+  fi
+  bp=$(baseline_path)
+  if [[ -f "$bp" ]]; then
+    info "已有干净基线，跳过备份: $(basename "$bp")"
+    LAST_BACKUP="$bp"
+    return 0
+  fi
+  cp "$CLI_PATH" "$bp"
+  success "已创建干净基线（仅此一次）: $bp"
+  LAST_BACKUP="$bp"
+  return 0
+}
+
+# 整文件回到干净基线
+restore_baseline() {
+  local bp
   if ! require_target_writable; then
     error "目标不可写: ${CLI_PATH:-无}"
     return 1
   fi
-  dir=$(dirname "$CLI_PATH")
-  # shellcheck disable=SC2012
-  latest=$(ls -t "$dir"/cli.js."${suffix}"-* 2>/dev/null | head -1 || true)
-  if [[ -z "${latest:-}" ]]; then
-    error "未找到备份文件 (cli.js.${suffix}-*)"
+  bp=$(baseline_path)
+  if [[ ! -f "$bp" ]]; then
+    error "未找到干净基线: $bp"
+    error "提示: 基线在第一次成功应用补丁前创建；若从未用本管理器改过，则无基线可还。"
     return 1
   fi
-  cp "$latest" "$CLI_PATH"
-  success "已从备份还原: $latest"
+  cp "$bp" "$CLI_PATH"
+  success "已还原到干净基线: $bp"
   return 0
+}
+
+# 还原单个补丁：回基线后重打其它已应用补丁（保持「一次干净备份」模型）
+restore_patch() {
+  local id="$1" other kept=() x
+  if ! has_baseline; then
+    # 兼容旧版按 suffix 的时间戳备份
+    local suffix dir latest
+    suffix=$(patch_suffix "$id")
+    dir=$(dirname "$CLI_PATH")
+    # shellcheck disable=SC2012
+    latest=$(ls -t "$dir"/cli.js."${suffix}"-* 2>/dev/null | head -1 || true)
+    if [[ -n "${latest:-}" ]]; then
+      warning "无干净基线，回退使用旧式备份: $latest"
+      cp "$latest" "$CLI_PATH"
+      success "已从旧备份还原: $latest"
+      return 0
+    fi
+    error "未找到干净基线，也无该补丁旧备份 (cli.js.$(patch_suffix "$id")-*)"
+    return 1
+  fi
+
+  mapfile -t kept < <(applied_ids)
+  info "还原「$(patch_name "$id")」= 回干净基线后重打其它补丁..."
+  restore_baseline || return 1
+
+  for x in "${kept[@]}"; do
+    [[ -n "$x" && "$x" != "$id" ]] || continue
+    info "重打: $(patch_name "$x")..."
+    if ! run_node_patch "$x" apply; then
+      warning "重打失败: $(patch_name "$x") — ${MSG[$x]:-}"
+    fi
+  done
+  return 0
+}
+
+# 可选：清理历史 timestamp 备份（旧策略残留），保留基线
+prune_legacy_timestamp_backups() {
+  local dir f
+  [[ -n "${CLI_PATH:-}" ]] || return 0
+  dir=$(dirname "$CLI_PATH")
+  for f in "$dir"/cli.js.backup-*-20*; do
+    [[ -e "$f" ]] || continue
+    rm -f "$f"
+    info "已清理旧式时间戳备份: $(basename "$f")"
+  done
 }
 
 # ---------- node runner + status mapping ----------
@@ -279,6 +339,10 @@ parse_and_set_status() {
         ;;
       BACKUP:*)
         LAST_BACKUP="${line#BACKUP:}"
+        ;;
+      BASELINE_CREATED:*)
+        LAST_BACKUP="${line#BASELINE_CREATED:}"
+        info "已创建干净基线: $LAST_BACKUP"
         ;;
       PARSE_ERROR:*)
         has_err=1
@@ -902,10 +966,21 @@ if (!classifierPatched) {
 // ============================================================
 // Backup and write
 // ============================================================
-const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-const backupPath = cliPath + '.' + backupSuffix + '-' + timestamp;
-fs.copyFileSync(cliPath, backupPath);
-console.log('BACKUP:' + backupPath);
+// 管理器模式：只在真正写入前、且尚无基线时，保存唯一干净原件
+let backupPath = '';
+if (process.env.CC_PATCH_SKIP_BACKUP === '1') {
+    backupPath = process.env.CC_PATCH_BASELINE || (cliPath + '.cc-patch-baseline');
+    if (!fs.existsSync(backupPath)) {
+        fs.copyFileSync(cliPath, backupPath);
+        console.log('BASELINE_CREATED:' + backupPath);
+    }
+    console.log('BACKUP:' + backupPath);
+} else {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    backupPath = cliPath + '.' + backupSuffix + '-' + timestamp;
+    fs.copyFileSync(cliPath, backupPath);
+    console.log('BACKUP:' + backupPath);
+}
 
 fs.writeFileSync(cliPath, shebang + newCode);
 console.log('SUCCESS:' + patchCount);
@@ -1128,10 +1203,21 @@ if (fixes.ctrlCBinding.patched) {
     }
 }
 
-const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-const backupPath = cliPath + '.' + backupSuffix + '-' + timestamp;
-fs.copyFileSync(cliPath, backupPath);
-console.log('BACKUP:' + backupPath);
+// 管理器模式：只在真正写入前、且尚无基线时，保存唯一干净原件
+let backupPath = '';
+if (process.env.CC_PATCH_SKIP_BACKUP === '1') {
+    backupPath = process.env.CC_PATCH_BASELINE || (cliPath + '.cc-patch-baseline');
+    if (!fs.existsSync(backupPath)) {
+        fs.copyFileSync(cliPath, backupPath);
+        console.log('BASELINE_CREATED:' + backupPath);
+    }
+    console.log('BACKUP:' + backupPath);
+} else {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    backupPath = cliPath + '.' + backupSuffix + '-' + timestamp;
+    fs.copyFileSync(cliPath, backupPath);
+    console.log('BACKUP:' + backupPath);
+}
 
 fs.writeFileSync(cliPath, shebang + newCode);
 console.log('SUCCESS:' + patchedCount);
@@ -1510,10 +1596,21 @@ if (replacements.some(r => r.name === 'dialog-host-nondestructive-cleanup') &&
     process.exit(1);
 }
 
-const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-const backupPath = cliPath + '.' + backupSuffix + '-' + timestamp;
-fs.copyFileSync(cliPath, backupPath);
-console.log('BACKUP:' + backupPath);
+// 管理器模式：只在真正写入前、且尚无基线时，保存唯一干净原件
+let backupPath = '';
+if (process.env.CC_PATCH_SKIP_BACKUP === '1') {
+    backupPath = process.env.CC_PATCH_BASELINE || (cliPath + '.cc-patch-baseline');
+    if (!fs.existsSync(backupPath)) {
+        fs.copyFileSync(cliPath, backupPath);
+        console.log('BASELINE_CREATED:' + backupPath);
+    }
+    console.log('BACKUP:' + backupPath);
+} else {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    backupPath = cliPath + '.' + backupSuffix + '-' + timestamp;
+    fs.copyFileSync(cliPath, backupPath);
+    console.log('BACKUP:' + backupPath);
+}
 
 fs.writeFileSync(cliPath, shebang + newCode);
 console.log('SUCCESS:' + replacements.length);
@@ -2044,10 +2141,21 @@ if (!patchedFlags.za) {
 // ============================================================
 // Backup and write
 // ============================================================
-const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-const backupPath = cliPath + '.' + backupSuffix + '-' + timestamp;
-fs.copyFileSync(cliPath, backupPath);
-console.log('BACKUP:' + backupPath);
+// 管理器模式：只在真正写入前、且尚无基线时，保存唯一干净原件
+let backupPath = '';
+if (process.env.CC_PATCH_SKIP_BACKUP === '1') {
+    backupPath = process.env.CC_PATCH_BASELINE || (cliPath + '.cc-patch-baseline');
+    if (!fs.existsSync(backupPath)) {
+        fs.copyFileSync(cliPath, backupPath);
+        console.log('BASELINE_CREATED:' + backupPath);
+    }
+    console.log('BACKUP:' + backupPath);
+} else {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    backupPath = cliPath + '.' + backupSuffix + '-' + timestamp;
+    fs.copyFileSync(cliPath, backupPath);
+    console.log('BACKUP:' + backupPath);
+}
 
 fs.writeFileSync(cliPath, shebang + newCode);
 console.log('FUNC_NAMES:' + guName + '|' + oaName + '|' + zaCandidates[0].id.name);
@@ -2071,6 +2179,15 @@ run_node_patch() {
     return 1
   fi
 
+  if [[ "$mode" == "apply" ]]; then
+    # 引擎真正写入前才会创建基线（已应用则不写、不建基线）
+    export CC_PATCH_SKIP_BACKUP=1
+    export CC_PATCH_BASELINE
+    CC_PATCH_BASELINE=$(baseline_path)
+  else
+    unset CC_PATCH_SKIP_BACKUP || true
+  fi
+
   script=$(write_patch_script "$id") || return 1
   [[ "$mode" == "check" ]] && check_arg="--check"
 
@@ -2083,14 +2200,7 @@ run_node_patch() {
   set -e
   rm -f "$script"
   LAST_OUTPUT="$output"
-  if parse_and_set_status "$id" "$mode" "$output" "$ec"; then
-    # 仅在真正写入（有 BACKUP 标记）后清理该后缀的旧备份
-    if [[ "$mode" == "apply" && -n "${LAST_BACKUP:-}" ]]; then
-      prune_old_backups "$id" 1
-    fi
-    return 0
-  fi
-  return 1
+  parse_and_set_status "$id" "$mode" "$output" "$ec"
 }
 
 refresh_one() {
@@ -2236,14 +2346,24 @@ draw_main() {
     idx=$((idx + 1))
   done
   printf '%s\n' '----------------------------------------'
-  printf '[1-4] 选择补丁   [r] 刷新全部   [p] 换路径   [q] 退出\n'
+  printf '[1-4] 选择补丁   [a] 一键应用全部   [r] 刷新全部   [p] 换路径   [q] 退出\n'
+  if has_baseline 2>/dev/null; then
+    printf '基线:  %s\n' "$(basename "$(baseline_path)")"
+  else
+    printf '基线:  %s尚未创建%s（首次应用时自动生成干净原件）\n' "$DIM" "$NC"
+  fi
 }
 
 confirm_apply() {
-  local id="$1" list="" x
+  local id="$1" list="" x bp
+  bp=$(baseline_path 2>/dev/null || true)
   printf '\n即将【应用】: %s\n' "$(patch_name "$id")"
   printf '目标:  %s\n' "$CLI_PATH"
-  printf '备份:  将创建 cli.js.%s-<时间戳>\n' "$(patch_suffix "$id")"
+  if has_baseline; then
+    printf '备份:  已有干净基线，本次不再另存 (%s)\n' "$(basename "$bp")"
+  else
+    printf '备份:  将创建唯一干净基线 cli.js.cc-patch-baseline（仅首次）\n'
+  fi
   printf '当前已应用:\n'
   while IFS= read -r x; do
     [[ -n "$x" ]] && printf '  · %s\n' "$(patch_name "$x")" && list=1
@@ -2261,17 +2381,18 @@ confirm_restore() {
   n=$(count_applied)
   printf '\n即将【还原】: %s\n' "$(patch_name "$id")"
   printf '目标:  %s\n' "$CLI_PATH"
-  printf '来源:  最新 cli.js.%s-*\n' "$(patch_suffix "$id")"
+  if has_baseline; then
+    printf '策略:  回干净基线后，自动重打其它已应用补丁\n'
+  else
+    printf '策略:  无基线时回退旧式 cli.js.%s-* 备份\n' "$(patch_suffix "$id")"
+  fi
   if [[ "$n" -ge 2 ]]; then
-    printf '\n%s⚠ 多补丁风险%s\n' "$YELLOW" "$NC"
-    printf '还原会用该补丁的整文件备份覆盖整个 cli.js。\n'
-    printf '其它已应用补丁可能一并被撤销。\n'
+    printf '\n%s说明%s\n' "$YELLOW" "$NC"
     printf '当前已应用:\n'
     while IFS= read -r x; do
       [[ -n "$x" ]] && printf '  · %s%s\n' "$(patch_name "$x")" \
-        "$([[ "$x" == "$id" ]] && echo '  ← 正在还原' || true)"
+        "$([[ "$x" == "$id" ]] && echo '  ← 将移除' || echo '  ← 将重打')"
     done < <(applied_ids)
-    printf '\n建议按应用的逆序还原（后进先出）。\n'
     printf '请输入 %syes%s 继续（其它任意键取消）: ' "$BOLD" "$NC"
     read -r ans || true
     [[ "$ans" == "yes" ]]
@@ -2291,8 +2412,13 @@ show_detail() {
     printf '%s\n\n' "$(patch_purpose "$id")"
     printf '状态: '; status_label "${STATUS[$id]:-unknown}"; printf '\n'
     printf '详情: %s\n' "${MSG[$id]:-}"
-    printf '备份后缀: %s\n\n' "$(patch_suffix "$id")"
-    printf '[a] 应用  [r] 还原  [c] 检测  [b] 返回\n'
+    printf '补丁 id: %s\n' "$id"
+    if has_baseline; then
+      printf '干净基线: %s\n\n' "$(basename "$(baseline_path)")"
+    else
+      printf '干净基线: (尚未创建)\n\n'
+    fi
+    printf '[a] 应用  [r] 还原本补丁  [c] 检测  [b] 返回\n'
     printf '请选择: '
     if ! read -r choice; then
       return 0
@@ -2305,7 +2431,9 @@ show_detail() {
         if confirm_apply "$id"; then
           if run_node_patch "$id" apply; then
             success "应用完成: ${MSG[$id]}"
-            [[ -n "$LAST_BACKUP" ]] && info "备份: $LAST_BACKUP"
+            if has_baseline; then
+              info "干净基线: $(baseline_path)"
+            fi
             warning "请重启 Claude Code 使更改生效"
             # 只复检当前补丁，避免对 18MB cli.js 连跑四次 AST
             info "正在复检当前补丁..."
@@ -2324,21 +2452,10 @@ show_detail() {
         if ! require_target_writable; then
           error "目标不存在或不可写"; pause; continue
         fi
-        mapfile -t _before < <(applied_ids)
         if confirm_restore "$id"; then
           if restore_patch "$id"; then
-            # 整文件回滚可能影响其它补丁，必须全量复检
-            info "正在复检全部补丁（整文件还原可能影响其它项）..."
+            info "正在复检全部补丁..."
             refresh_all
-            local lost="" x
-            for x in "${_before[@]}"; do
-              if [[ "$x" != "$id" && "${STATUS[$x]:-}" != "applied" ]]; then
-                lost+="$(patch_name "$x"), "
-              fi
-            done
-            if [[ -n "$lost" ]]; then
-              warning "因整文件回滚，以下补丁也不再处于已应用: ${lost%, }"
-            fi
           fi
         else
           info "已取消"
@@ -2353,6 +2470,60 @@ show_detail() {
       *) warning "未知选项" ; pause ;;
     esac
   done
+}
+
+# 一键应用全部未应用补丁（已应用跳过）
+apply_all_patches() {
+  local id ans need=() n
+  if ! require_target_writable; then
+    error "目标不存在或不可写"
+    return 1
+  fi
+  # 若尚未检测，先快速检测
+  if [[ $(count_status applied) -eq 0 && $(count_status idle) -eq 0 && $(count_status error) -eq 0 ]]; then
+    info "尚未检测，先刷新状态..."
+    refresh_all
+  fi
+  for id in "${PATCH_IDS[@]}"; do
+    case "${STATUS[$id]:-}" in
+      applied) ;;
+      *) need+=("$id") ;;
+    esac
+  done
+  n=${#need[@]}
+  if [[ "$n" -eq 0 ]]; then
+    success "全部补丁均已应用，无需操作"
+    return 0
+  fi
+  printf '\n即将【一键应用】以下 %s 个补丁:\n' "$n"
+  for id in "${need[@]}"; do
+    printf '  · %s  (当前: ' "$(patch_name "$id")"
+    status_label "${STATUS[$id]:-unknown}"
+    printf ')\n'
+  done
+  printf '目标:  %s\n' "$CLI_PATH"
+  if has_baseline; then
+    printf '备份:  已有干净基线，本次不另存\n'
+  else
+    printf '备份:  将创建唯一干净基线 cli.js.cc-patch-baseline\n'
+  fi
+  printf '\n确认执行？ [Y/n] '
+  read -r ans || true
+  if [[ -n "$ans" && "$ans" != "y" && "$ans" != "Y" ]]; then
+    info "已取消"
+    return 0
+  fi
+  for id in "${need[@]}"; do
+    info "应用: $(patch_name "$id")..."
+    if run_node_patch "$id" apply; then
+      success "  → ${MSG[$id]}"
+    else
+      error "  → 失败: ${MSG[$id]:-}"
+    fi
+  done
+  info "正在复检全部补丁..."
+  refresh_all
+  warning "请重启 Claude Code 使更改生效"
 }
 
 set_path_interactive() {
@@ -2382,6 +2553,10 @@ menu_loop() {
     fi
     case "$choice" in
       q|Q) exit 0 ;;
+      a|A)
+        apply_all_patches
+        pause
+        ;;
       r|R)
         info "正在刷新全部补丁..."
         refresh_all
