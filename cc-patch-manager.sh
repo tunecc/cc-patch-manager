@@ -62,22 +62,32 @@ patch_purpose() {
   case "$1" in
     auto-mode)
       cat <<'EOF'
-三处补丁：(1) 强制自动模式模型资格检查恒为 true；(2) 分类器不可用时 fail-open，deny→ask；(3) 注入 CLAUDE_CLASSIFIER_MODEL 环境变量覆盖。
+三处补丁：
+  (1) 强制自动模式模型资格检查恒为 true
+  (2) 分类器不可用时 fail-open，deny→ask
+  (3) 注入 CLAUDE_CLASSIFIER_MODEL 环境变量覆盖
 EOF
       ;;
     keybindings)
       cat <<'EOF'
-强制开启 tengu_keybinding_customization_release，并将默认 ctrl+c 从 app:interrupt 改为 app:exit。
+两处补丁：
+  (1) 强制开启 tengu_keybinding_customization_release
+  (2) 默认 ctrl+c 从 app:interrupt 改为 app:exit
 EOF
       ;;
     transcript-dialog)
       cat <<'EOF'
-持久化/重放待处理的权限弹窗，避免 Ctrl+O 会话记录界面丢弃审批 UI（卡在 Waiting…）。
+两处补丁：
+  (1) 权限弹窗通道支持重放待处理请求
+  (2) 切换会话记录界面时不取消待审批
 EOF
       ;;
     ultracode)
       cat <<'EOF'
-允许支持 max 的模型使用 ultracode：可用性门控、努力度降级 xhigh→max、激活检查接受 max。
+三处补丁：
+  (1) 可用性门控：支持 max 的模型也可进入 ultracode
+  (2) 努力度降级：xhigh 不可用时落到 max（而非 high）
+  (3) 激活检查：接受 max 作为有效 ultracode 努力度
 EOF
       ;;
   esac
@@ -2094,9 +2104,15 @@ clear_screen() {
 }
 
 pause() {
-  printf '\n按回车继续...'
-  # shellcheck disable=SC2162
-  read _ || true
+  printf '\n按任意键继续...'
+  if [[ -t 0 ]]; then
+    # shellcheck disable=SC2162
+    IFS= read -r -n 1 -s _ || true
+    printf '\n'
+  else
+    # shellcheck disable=SC2162
+    read _ || true
+  fi
 }
 
 status_label() {
@@ -2106,6 +2122,35 @@ status_label() {
     error)   printf '%s! 错误%s' "$RED" "$NC" ;;
     *)       printf '%s? 未检测%s' "$YELLOW" "$NC" ;;
   esac
+}
+
+# 不含 ANSI 的状态文案（用于对齐列宽）
+status_plain() {
+  case "${1:-unknown}" in
+    applied) printf '✓ 已应用' ;;
+    idle)    printf '· 未应用' ;;
+    error)   printf '! 错误' ;;
+    *)       printf '? 未检测' ;;
+  esac
+}
+
+# 显示宽度：ASCII=1，其它（含中文）=2
+disp_width() {
+  local s="$1"
+  # node 为补丁引擎硬依赖，菜单对齐复用它
+  node -e 'let s=process.argv[1],w=0;for(const c of s){const cp=c.codePointAt(0);w+=cp>127?2:1}process.stdout.write(String(w))' "$s"
+}
+
+# 按显示宽度右侧补空格
+pad_right() {
+  local s="$1" width="$2" n pad
+  n=$(disp_width "$s")
+  if (( n >= width )); then
+    printf '%s' "$s"
+    return
+  fi
+  pad=$((width - n))
+  printf '%s%*s' "$s" "$pad" ''
 }
 
 applied_ids() {
@@ -2148,12 +2193,19 @@ draw_header() {
 draw_main() {
   clear_screen
   draw_header
-  local idx=1 id
-  printf '  #  %-12s  %-18s  %s\n' "状态" "补丁" "说明"
+  local idx=1 id st plain name note pad
+  # 固定显示列宽：状态 8、补丁 14，说明从同一列起笔
+  printf '  #  %s  %s  %s\n' "$(pad_right "状态" 9)" "$(pad_right "补丁" 14)" "说明"
   for id in "${PATCH_IDS[@]}"; do
+    st="${STATUS[$id]:-unknown}"
+    plain=$(status_plain "$st")
+    name=$(patch_name "$id")
+    note=$(patch_note "$id")
+    pad=$((9 - $(disp_width "$plain")))
+    (( pad < 0 )) && pad=0
     printf '  %d  ' "$idx"
-    status_label "${STATUS[$id]:-unknown}"
-    printf '  %-18s  %s\n' "$(patch_name "$id")" "$(patch_note "$id")"
+    status_label "$st"
+    printf '%*s  %s  %s\n' "$pad" '' "$(pad_right "$name" 14)" "$note"
     idx=$((idx + 1))
   done
   printf '%s\n' '----------------------------------------'
@@ -2170,10 +2222,11 @@ confirm_apply() {
     [[ -n "$x" ]] && printf '  · %s\n' "$(patch_name "$x")" && list=1
   done < <(applied_ids)
   [[ -z "${list:-}" ]] && printf '  （无）\n'
-  printf '\n确认执行？ [y/N] '
+  printf '\n确认执行？ [Y/n] '
   local ans
   read -r ans || true
-  [[ "$ans" == "y" || "$ans" == "Y" ]]
+  # 默认回车 = 确认
+  [[ -z "$ans" || "$ans" == "y" || "$ans" == "Y" ]]
 }
 
 confirm_restore() {
@@ -2196,9 +2249,9 @@ confirm_restore() {
     read -r ans || true
     [[ "$ans" == "yes" ]]
   else
-    printf '\n确认执行？ [y/N] '
+    printf '\n确认执行？ [Y/n] '
     read -r ans || true
-    [[ "$ans" == "y" || "$ans" == "Y" ]]
+    [[ -z "$ans" || "$ans" == "y" || "$ans" == "Y" ]]
   fi
 }
 
