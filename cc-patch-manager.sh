@@ -30,9 +30,9 @@ PATCH_IDS=(auto-mode keybindings transcript-dialog ultracode)
 
 patch_name() {
   case "$1" in
-    auto-mode) echo "自动模式" ;;
-    keybindings) echo "快捷键" ;;
-    transcript-dialog) echo "会话记录弹窗" ;;
+    auto-mode) echo "自动模式解锁" ;;
+    keybindings) echo "快捷键与 Ctrl+C" ;;
+    transcript-dialog) echo "权限弹窗重放" ;;
     ultracode) echo "Ultracode 解锁" ;;
     *) echo "$1" ;;
   esac
@@ -40,10 +40,10 @@ patch_name() {
 
 patch_note() {
   case "$1" in
-    auto-mode) echo "解锁自动模式：模型资格 + 分类器 fail-open + 分类模型环境变量" ;;
-    keybindings) echo "启用自定义快捷键；Ctrl+C 退出（Escape 中断）" ;;
-    transcript-dialog) echo "修复 Ctrl+O 会话记录时权限弹窗丢失" ;;
-    ultracode) echo "为支持 max 但不支持 xhigh 的模型解锁 ultracode" ;;
+    auto-mode) echo "非默认模型也能开 Auto；分类器可改用 Haiku" ;;
+    keybindings) echo "开自定义快捷键；Ctrl+C 退出，Esc 才中断" ;;
+    transcript-dialog) echo "Ctrl+O 看会话时审批卡 Waiting… / 被中断" ;;
+    ultracode) echo "在只支持 max、不支持 xhigh 的模型上启用" ;;
     *) echo "" ;;
   esac
 }
@@ -62,32 +62,44 @@ patch_purpose() {
   case "$1" in
     auto-mode)
       cat <<'EOF'
-三处补丁：
-  (1) 强制自动模式模型资格检查恒为 true
-  (2) 分类器不可用时 fail-open，deny→ask
-  (3) 注入 CLAUDE_CLASSIFIER_MODEL 环境变量覆盖
+现象：部分模型（如早期 Opus 4.6）进不了 Auto Mode；分类器常跟主对话
+用同一模型，贵且易 429，作者实践里 Haiku 更稳。
+
+改动：
+  (1) 放开自动模式的模型资格检查
+  (2) 分类器暂时不可用时改为询问，而不是直接拒绝
+  (3) 支持环境变量 CLAUDE_CLASSIFIER_MODEL 指定分类模型
 EOF
       ;;
     keybindings)
       cat <<'EOF'
-两处补丁：
-  (1) 强制开启 tengu_keybinding_customization_release
-  (2) 默认 ctrl+c 从 app:interrupt 改为 app:exit
+现象：自定义快捷键被功能开关关掉；且 2.1.x 起 Ctrl+C 默认直接打断
+Agent（旧版更像「再按一次才退出」），习惯旧行为的人容易误触。
+
+改动：
+  (1) 强制开启自定义快捷键（~/.claude/keybindings.json）
+  (2) 默认 Ctrl+C 改为退出程序；中断 Agent 仍用 Escape
 EOF
       ;;
     transcript-dialog)
       cat <<'EOF'
-两处补丁：
-  (1) 权限弹窗通道支持重放待处理请求
+现象：从约 2.1.140+ 起，在 Ctrl+O 会话记录视图时若触发权限审批，
+会一直 Waiting…；反过来在审批将出时切视图，也可能直接中断对话。
+
+改动：
+  (1) 权限弹窗通道记住待处理请求，宿主挂载后可重放
   (2) 切换会话记录界面时不取消待审批
 EOF
       ;;
     ultracode)
       cat <<'EOF'
-三处补丁：
-  (1) 可用性门控：支持 max 的模型也可进入 ultracode
-  (2) 努力度降级：xhigh 不可用时落到 max（而非 high）
-  (3) 激活检查：接受 max 作为有效 ultracode 努力度
+现象：Ultracode 默认要求 xhigh；只支持 max 的模型（如 4.6 系）
+进不去，或努力度被降成 high 导致 ultracode 实际不生效。
+
+改动：
+  (1) 支持 max 的模型也可进入 ultracode
+  (2) xhigh 不可用时优先落到 max（而不是 high）
+  (3) 激活检查把 max 也算作有效 ultracode 努力度
 EOF
       ;;
   esac
@@ -104,6 +116,7 @@ LAST_BACKUP=""
 usage() {
   cat <<EOF
 Claude Code 补丁管理器 v${VERSION}
+四个社区常用 Claude Code 本地补丁的统一管理（中文交互）。
 
 用法:
   $(basename "$0")                  进入交互菜单
