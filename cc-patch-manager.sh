@@ -222,14 +222,14 @@ ensure_acorn() {
 }
 
 # ============================================================
-# 备份策略：干净基线（golden baseline）只存一份
+# 备份策略：备份文件只存一份（cli.js.cc-patch-baseline）
 #
-# 思路（类似系统还原点 / 干净镜像）：
-#   - 第一次改 cli.js 前，若尚无基线，则复制一份干净原件
-#     路径固定：<cli.js 同目录>/cli.js.cc-patch-baseline
+# 思路：
+#   - 主菜单 [b] 可随时把「当前 cli.js」备份到固定路径
+#   - 第一次 apply 改写前，若尚无备份，也会自动复制一份
 #   - 之后每次 apply 不再按补丁另存时间戳备份（避免「谁是谁」）
-#   - 还原某个补丁 = 回基线 + 重打「除该补丁外」原先已应用的其它补丁
-#   - 一键还原干净 = 仅回基线
+#   - 还原某个补丁 = 从备份还原 + 重打「除该补丁外」原先已应用的其它补丁
+#   - 覆盖备份会更新还原点（需确认 yes）
 # ============================================================
 baseline_path() {
   printf '%s.cc-patch-baseline\n' "$CLI_PATH"
@@ -239,26 +239,67 @@ has_baseline() {
   [[ -n "${CLI_PATH:-}" && -f "$(baseline_path)" ]]
 }
 
-# 若无基线则创建；已有则跳过。返回 0=就绪，1=失败
+# 若无备份则创建；已有则跳过。返回 0=就绪，1=失败
 ensure_baseline() {
   local bp
   if ! require_target_writable; then
-    error "目标不可写，无法创建基线备份: ${CLI_PATH:-无}"
+    error "目标不可写，无法创建备份: ${CLI_PATH:-无}"
     return 1
   fi
   bp=$(baseline_path)
   if [[ -f "$bp" ]]; then
-    info "已有干净基线，跳过备份: $(basename "$bp")"
+    info "已有备份，跳过: $(basename "$bp")"
     LAST_BACKUP="$bp"
     return 0
   fi
   cp "$CLI_PATH" "$bp"
-  success "已创建干净基线（仅此一次）: $bp"
+  success "已创建备份: $bp"
   LAST_BACKUP="$bp"
   return 0
 }
 
-# 整文件回到干净基线
+# 用户主动备份当前 cli.js → cli.js.cc-patch-baseline
+# 已有备份时需确认覆盖（会丢掉旧还原点）
+backup_current_cli() {
+  local bp ans n_applied
+  if ! require_target_writable; then
+    error "目标不存在或不可写: ${CLI_PATH:-无}"
+    return 1
+  fi
+  bp=$(baseline_path)
+  printf '\n即将【备份当前文件】\n'
+  printf '源:  %s\n' "$CLI_PATH"
+  printf '到:  %s\n' "$bp"
+  if [[ -f "$bp" ]]; then
+    warning "已存在备份，继续将覆盖该文件"
+    n_applied=$(count_applied)
+    if [[ "$n_applied" -gt 0 ]]; then
+      warning "当前已有 $n_applied 个补丁显示为已应用 — 覆盖后还原点会变成「带补丁的当前文件」"
+    fi
+    printf '确认覆盖？请输入 %syes%s 继续: ' "$BOLD" "$NC"
+    read -r ans || true
+    if [[ "$ans" != "yes" ]]; then
+      info "已取消"
+      return 0
+    fi
+  else
+    printf '确认执行？ [Y/n] '
+    read -r ans || true
+    if [[ -n "$ans" && "$ans" != "y" && "$ans" != "Y" ]]; then
+      info "已取消"
+      return 0
+    fi
+  fi
+  if ! cp "$CLI_PATH" "$bp"; then
+    error "备份失败: $bp"
+    return 1
+  fi
+  LAST_BACKUP="$bp"
+  success "已备份当前文件 → $(basename "$bp")"
+  return 0
+}
+
+# 整文件回到备份
 restore_baseline() {
   local bp
   if ! require_target_writable; then
@@ -267,16 +308,16 @@ restore_baseline() {
   fi
   bp=$(baseline_path)
   if [[ ! -f "$bp" ]]; then
-    error "未找到干净基线: $bp"
-    error "提示: 基线在第一次成功应用补丁前创建；若从未用本管理器改过，则无基线可还。"
+    error "未找到备份: $bp"
+    error "提示: 可在主菜单按 [b] 备份当前 cli.js，或先成功应用一次补丁（会自动建备份）。"
     return 1
   fi
   cp "$bp" "$CLI_PATH"
-  success "已还原到干净基线: $bp"
+  success "已从备份还原: $bp"
   return 0
 }
 
-# 还原单个补丁：回基线后重打其它已应用补丁（保持「一次干净备份」模型）
+# 还原单个补丁：从备份还原后重打其它已应用补丁（保持「一份备份」模型）
 restore_patch() {
   local id="$1" other kept=() x
   if ! has_baseline; then
@@ -287,17 +328,17 @@ restore_patch() {
     # shellcheck disable=SC2012
     latest=$(ls -t "$dir"/cli.js."${suffix}"-* 2>/dev/null | head -1 || true)
     if [[ -n "${latest:-}" ]]; then
-      warning "无干净基线，回退使用旧式备份: $latest"
+      warning "无备份文件，回退使用旧式备份: $latest"
       cp "$latest" "$CLI_PATH"
       success "已从旧备份还原: $latest"
       return 0
     fi
-    error "未找到干净基线，也无该补丁旧备份 (cli.js.$(patch_suffix "$id")-*)"
+    error "未找到备份，也无该补丁旧备份 (cli.js.$(patch_suffix "$id")-*)"
     return 1
   fi
 
   mapfile -t kept < <(applied_ids)
-  info "还原「$(patch_name "$id")」= 回干净基线后重打其它补丁..."
+  info "还原「$(patch_name "$id")」= 从备份还原后重打其它补丁..."
   restore_baseline || return 1
 
   for x in "${kept[@]}"; do
@@ -356,7 +397,7 @@ parse_and_set_status() {
         ;;
       BASELINE_CREATED:*)
         LAST_BACKUP="${line#BASELINE_CREATED:}"
-        info "已创建干净基线: $LAST_BACKUP"
+        info "已创建备份: $LAST_BACKUP"
         ;;
       PARSE_ERROR:*)
         has_err=1
@@ -2361,11 +2402,11 @@ draw_main() {
     idx=$((idx + 1))
   done
   printf '%s\n' '----------------------------------------'
-  printf '[1-4] 选择补丁   [a] 一键应用全部   [r] 刷新全部   [p] 换路径   [q] 退出\n'
+  printf '[1-4] 选择补丁   [a] 一键应用全部   [b] 备份当前   [r] 刷新全部   [p] 换路径   [q] 退出\n'
   if has_baseline 2>/dev/null; then
-    printf '基线:  %s\n' "$(basename "$(baseline_path)")"
+    printf '备份:  %s\n' "$(basename "$(baseline_path)")"
   else
-    printf '基线:  %s尚未创建%s（首次应用时自动生成干净原件）\n' "$DIM" "$NC"
+    printf '备份:  %s尚未创建%s — 按 [b] 备份当前 cli.js\n' "$DIM" "$NC"
   fi
 }
 
@@ -2375,9 +2416,9 @@ confirm_apply() {
   printf '\n即将【应用】: %s\n' "$(patch_name "$id")"
   printf '目标:  %s\n' "$CLI_PATH"
   if has_baseline; then
-    printf '备份:  已有干净基线，本次不再另存 (%s)\n' "$(basename "$bp")"
+    printf '备份:  已有 (%s)，本次不另存\n' "$(basename "$bp")"
   else
-    printf '备份:  将创建唯一干净基线 cli.js.cc-patch-baseline（仅首次）\n'
+    printf '备份:  尚无 — 应用前将自动备份当前 cli.js\n'
   fi
   printf '当前已应用:\n'
   while IFS= read -r x; do
@@ -2397,9 +2438,9 @@ confirm_restore() {
   printf '\n即将【还原】: %s\n' "$(patch_name "$id")"
   printf '目标:  %s\n' "$CLI_PATH"
   if has_baseline; then
-    printf '策略:  回干净基线后，自动重打其它已应用补丁\n'
+    printf '策略:  从备份还原后，自动重打其它已应用补丁\n'
   else
-    printf '策略:  无基线时回退旧式 cli.js.%s-* 备份\n' "$(patch_suffix "$id")"
+    printf '策略:  无备份时回退旧式 cli.js.%s-* 文件\n' "$(patch_suffix "$id")"
   fi
   if [[ "$n" -ge 2 ]]; then
     printf '\n%s说明%s\n' "$YELLOW" "$NC"
@@ -2429,9 +2470,9 @@ show_detail() {
     printf '详情: %s\n' "${MSG[$id]:-}"
     printf '补丁 id: %s\n' "$id"
     if has_baseline; then
-      printf '干净基线: %s\n\n' "$(basename "$(baseline_path)")"
+      printf '备份: %s\n\n' "$(basename "$(baseline_path)")"
     else
-      printf '干净基线: (尚未创建)\n\n'
+      printf '备份: (尚未创建)\n\n'
     fi
     printf '[a] 应用  [r] 还原本补丁  [c] 检测  [b] 返回\n'
     printf '请选择: '
@@ -2447,7 +2488,7 @@ show_detail() {
           if run_node_patch "$id" apply; then
             success "应用完成: ${MSG[$id]}"
             if has_baseline; then
-              info "干净基线: $(baseline_path)"
+              info "备份: $(baseline_path)"
             fi
             warning "请重启 Claude Code 使更改生效"
             # 只复检当前补丁，避免对 18MB cli.js 连跑四次 AST
@@ -2518,9 +2559,9 @@ apply_all_patches() {
   done
   printf '目标:  %s\n' "$CLI_PATH"
   if has_baseline; then
-    printf '备份:  已有干净基线，本次不另存\n'
+    printf '备份:  已有，本次不另存\n'
   else
-    printf '备份:  将创建唯一干净基线 cli.js.cc-patch-baseline\n'
+    printf '备份:  尚无 — 应用前将自动备份当前 cli.js\n'
   fi
   printf '\n确认执行？ [Y/n] '
   read -r ans || true
@@ -2570,6 +2611,10 @@ menu_loop() {
       q|Q) exit 0 ;;
       a|A)
         apply_all_patches
+        pause
+        ;;
+      b|B)
+        backup_current_cli
         pause
         ;;
       r|R)
