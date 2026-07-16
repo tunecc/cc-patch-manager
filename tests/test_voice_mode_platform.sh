@@ -54,3 +54,7 @@ script=$(write_patch_script voice-mode)
 grep -Fq 'COMETIX_ASR_VOICE_STREAM' "$script"
 rm -f "$script"
 printf 'PASS: voice-mode selects its AST engine\n'
+
+help=$("$ROOT/cc-patch-manager.sh" --help)
+[[ "$help" == *"打印五个补丁状态后退出"* ]]
+printf 'PASS: help reports five patch statuses\n'

@@ -137,7 +137,7 @@ Claude Code 补丁管理器 v${VERSION}
 用法:
   $(basename "$0")                  进入交互菜单
   $(basename "$0") /path/to/cli.js  指定目标后进入菜单
-  $(basename "$0") --check          打印四个补丁状态后退出
+  $(basename "$0") --check          打印五个补丁状态后退出
   $(basename "$0") --help           显示本帮助
 
 环境变量:
