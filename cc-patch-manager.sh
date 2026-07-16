@@ -541,9 +541,53 @@ write_patch_script() {
     keybindings) write_patch_script_keybindings "$tmp" ;;
     transcript-dialog) write_patch_script_transcript_dialog "$tmp" ;;
     ultracode) write_patch_script_ultracode "$tmp" ;;
+    voice-mode) write_patch_script_voice_mode "$tmp" ;;
     *) error "未知补丁 id: $id"; rm -f "$tmp"; return 1 ;;
   esac
   printf '%s\n' "$tmp"
+}
+
+write_patch_script_voice_mode() {
+  local out="$1"
+  local source
+  source="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/claude-code-enable-voice-mode-darwin-arm64/apply-claude-code-enable-voice-mode.sh"
+  if [[ ! -f "$source" ]]; then
+    error "缺少 VoiceMode AST 引擎: $source"
+    return 1
+  fi
+  if ! sed -n '/^cat > "\$PATCH_SCRIPT" << '\''PATCH_EOF'\''$/,/^PATCH_EOF$/p' "$source" | sed '1d;$d' >"$out"; then
+    error "提取 VoiceMode AST 引擎失败"
+    return 1
+  fi
+  if ! node - "$out" <<'NODE'
+const fs = require('fs');
+const scriptPath = process.argv[2];
+const legacy = `const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+const backupPath = cliPath + '.' + backupSuffix + '-' + timestamp;
+fs.copyFileSync(cliPath, backupPath);
+console.log('BACKUP:' + backupPath);`;
+const managed = `let backupPath = '';
+if (process.env.CC_PATCH_SKIP_BACKUP === '1') {
+  backupPath = process.env.CC_PATCH_BASELINE || (cliPath + '.cc-patch-baseline');
+  if (!fs.existsSync(backupPath)) {
+    fs.copyFileSync(cliPath, backupPath);
+    console.log('BASELINE_CREATED:' + backupPath);
+  }
+  console.log('BACKUP:' + backupPath);
+} else {
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  backupPath = cliPath + '.' + backupSuffix + '-' + timestamp;
+  fs.copyFileSync(cliPath, backupPath);
+  console.log('BACKUP:' + backupPath);
+}`;
+const code = fs.readFileSync(scriptPath, 'utf8');
+if (!code.includes(legacy)) process.exit(1);
+fs.writeFileSync(scriptPath, code.replace(legacy, managed));
+NODE
+  then
+    error "转换 VoiceMode 基线备份逻辑失败"
+    return 1
+  fi
 }
 
 # stubs — Task 4–7 replace with real heredocs
