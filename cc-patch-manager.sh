@@ -220,7 +220,7 @@ voice_mode_platform_error() {
 }
 
 voice_mode_source_dir() {
-  printf '%s/claude-code-enable-voice-mode-darwin-arm64/cometix-asr\n' \
+  printf '%s/original-scripts/claude-code-enable-voice-mode-darwin-arm64/cometix-asr\n' \
     "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 }
 
@@ -550,7 +550,7 @@ write_patch_script() {
 write_patch_script_voice_mode() {
   local out="$1"
   local source
-  source="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/claude-code-enable-voice-mode-darwin-arm64/apply-claude-code-enable-voice-mode.sh"
+  source="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/original-scripts/claude-code-enable-voice-mode-darwin-arm64/apply-claude-code-enable-voice-mode.sh"
   if [[ ! -f "$source" ]]; then
     error "缺少 VoiceMode AST 引擎: $source"
     return 1

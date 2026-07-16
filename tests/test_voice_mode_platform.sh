@@ -34,7 +34,6 @@ uname() {
   esac
 }
 
-real_voice_mode_source_dir=$(declare -f voice_mode_source_dir)
 voice_mode_source_dir() { printf '%s\n' "$tmp/missing-cometix-asr"; }
 before="$tmp/cli-before.js"
 cp "$CLI_PATH" "$before"
@@ -49,7 +48,10 @@ cmp -s "$before" "$CLI_PATH"
 [[ ! -e "$tmp/vendor/cometix-asr" ]]
 printf 'PASS: voice-mode blocks missing assets before mutation\n'
 
-eval "$real_voice_mode_source_dir"
+source "$ROOT/cc-patch-manager.sh"
+real_source=$(voice_mode_source_dir)
+[[ "$real_source" == "$ROOT/original-scripts/claude-code-enable-voice-mode-darwin-arm64/cometix-asr" ]]
+[[ -f "$real_source/index.js" ]]
 script=$(write_patch_script voice-mode)
 grep -Fq 'COMETIX_ASR_VOICE_STREAM' "$script"
 rm -f "$script"
