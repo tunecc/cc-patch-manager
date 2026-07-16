@@ -195,6 +195,15 @@ require_target_writable() {
   [[ -w "$CLI_PATH" && -w "$(dirname "$CLI_PATH")" ]]
 }
 
+voice_mode_supported() {
+  [[ "$(uname -s)" == "Darwin" && "$(uname -m)" == "arm64" ]]
+}
+
+voice_mode_platform_error() {
+  STATUS[voice-mode]=error
+  MSG[voice-mode]="当前平台不支持（仅支持 macOS Apple Silicon）"
+}
+
 # ---------- acorn + restore ----------
 ensure_node() {
   if ! command -v node >/dev/null 2>&1; then
@@ -2223,6 +2232,11 @@ run_node_patch() {
   local mode="$2"   # check|apply
   local script check_arg="" output ec=0
 
+  if [[ "$id" == "voice-mode" ]] && ! voice_mode_supported; then
+    voice_mode_platform_error
+    return 1
+  fi
+
   if ! require_target_readable; then
     STATUS[$id]=error
     MSG[$id]="目标不可读"
@@ -2685,4 +2699,6 @@ main() {
   menu_loop
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
