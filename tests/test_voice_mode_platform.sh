@@ -25,3 +25,25 @@ run_node_patch voice-mode check || true
 [[ "${MSG[voice-mode]:-}" == "当前平台不支持（仅支持 macOS Apple Silicon）" ]]
 [[ ! -e "$tmp/vendor/cometix-asr" ]]
 printf 'PASS: voice-mode blocks unsupported platforms before mutation\n'
+
+uname() {
+  case "${1:-}" in
+    -s) printf 'Darwin\n' ;;
+    -m) printf 'arm64\n' ;;
+    *) command uname "$@" ;;
+  esac
+}
+
+voice_mode_source_dir() { printf '%s\n' "$tmp/missing-cometix-asr"; }
+before="$tmp/cli-before.js"
+cp "$CLI_PATH" "$before"
+STATUS[voice-mode]=""
+MSG[voice-mode]=""
+
+run_node_patch voice-mode apply || true
+
+[[ "${STATUS[voice-mode]:-}" == "error" ]]
+[[ "${MSG[voice-mode]:-}" == *"缺少 VoiceMode 资源"* ]]
+cmp -s "$before" "$CLI_PATH"
+[[ ! -e "$tmp/vendor/cometix-asr" ]]
+printf 'PASS: voice-mode blocks missing assets before mutation\n'

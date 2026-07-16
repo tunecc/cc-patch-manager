@@ -26,7 +26,7 @@ error()   { printf '%s[错误]%s %s\n' "$RED" "$NC" "$*" >&2; }
 info()    { printf '%s[信息]%s %s\n' "$BLUE" "$NC" "$*"; }
 
 # ---------- registry (order fixed) ----------
-PATCH_IDS=(auto-mode keybindings transcript-dialog ultracode)
+PATCH_IDS=(auto-mode keybindings transcript-dialog ultracode voice-mode)
 
 patch_name() {
   case "$1" in
@@ -34,6 +34,7 @@ patch_name() {
     keybindings) echo "Ctrl+C 回滚" ;;
     transcript-dialog) echo "权限弹窗重放" ;;
     ultracode) echo "Ultracode 解锁" ;;
+    voice-mode) echo "语音模式解锁" ;;
     *) echo "$1" ;;
   esac
 }
@@ -44,6 +45,7 @@ patch_note() {
     keybindings) echo "2.1 起 Ctrl+C 直接打断 Agent；打回旧退出习惯" ;;
     transcript-dialog) echo "Ctrl+O 看会话时审批卡 Waiting… / 被中断" ;;
     ultracode) echo "在只支持 max、不支持 xhigh 的模型上启用" ;;
+    voice-mode) echo "解锁 VoiceMode，语音识别改用本地 Cometix ASR" ;;
     *) echo "" ;;
   esac
 }
@@ -54,6 +56,7 @@ patch_suffix() {
     keybindings) echo "backup-keybindings-enable" ;;
     transcript-dialog) echo "backup-transcript-dialog-replay" ;;
     ultracode) echo "backup-ultracode" ;;
+    voice-mode) echo "backup-cometix-asr" ;;
     *) echo "backup" ;;
   esac
 }
@@ -103,6 +106,18 @@ EOF
   (3) 激活检查把 max 也算作有效 ultracode 努力度
 EOF
       ;;
+    voice-mode)
+      cat <<'EOF'
+现象：VoiceMode 原本受 Claude.ai 登录与订阅门槛限制；部分环境没有入口，
+且官方流式语音识别依赖远端服务。
+
+改动：
+  (1) 解锁 VoiceMode 的入口、可用性与设置项
+  (2) 流式语音识别改用本地 Cometix ASR
+
+限制：仅支持 macOS Apple Silicon（Darwin/arm64）。应用后请重启 Claude Code。
+EOF
+      ;;
   esac
 }
 
@@ -117,7 +132,7 @@ LAST_BACKUP=""
 usage() {
   cat <<EOF
 Claude Code 补丁管理器 v${VERSION}
-四个社区常用 Claude Code 本地补丁的统一管理（中文交互）。
+五个社区常用 Claude Code 本地补丁的统一管理（中文交互）。
 
 用法:
   $(basename "$0")                  进入交互菜单
@@ -202,6 +217,55 @@ voice_mode_supported() {
 voice_mode_platform_error() {
   STATUS[voice-mode]=error
   MSG[voice-mode]="当前平台不支持（仅支持 macOS Apple Silicon）"
+}
+
+voice_mode_source_dir() {
+  printf '%s/claude-code-enable-voice-mode-darwin-arm64/cometix-asr\n' \
+    "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+}
+
+voice_mode_assets_ready() {
+  local source="${1:-$(voice_mode_source_dir)}"
+  [[ -f "$source/index.js" ]] && compgen -G "$source/libcometix-asr*.node" >/dev/null
+}
+
+voice_mode_assets_error() {
+  STATUS[voice-mode]=error
+  MSG[voice-mode]="缺少 VoiceMode 资源（需要 cometix-asr/index.js 和 libcometix-asr*.node）"
+}
+
+install_voice_mode_vendor() {
+  local source vendor native
+  source=$(voice_mode_source_dir)
+  vendor="$(dirname "$CLI_PATH")/vendor/cometix-asr"
+  if ! voice_mode_assets_ready "$source"; then
+    voice_mode_assets_error
+    return 1
+  fi
+  if ! mkdir -p "$vendor" || ! rm -f "$vendor"/*.node; then
+    STATUS[voice-mode]=error
+    MSG[voice-mode]="无法创建或清理 Cometix ASR 目录"
+    return 1
+  fi
+  for native in "$source"/libcometix-asr*.node; do
+    if ! cp -f "$native" "$vendor/"; then
+      STATUS[voice-mode]=error
+      MSG[voice-mode]="复制 Cometix ASR 原生模块失败"
+      return 1
+    fi
+  done
+  if ! cp -f "$source/index.js" "$vendor/index.js"; then
+    STATUS[voice-mode]=error
+    MSG[voice-mode]="复制 Cometix ASR 加载器失败"
+    return 1
+  fi
+  [[ -f "$source/index.d.ts" ]] && cp -f "$source/index.d.ts" "$vendor/"
+  [[ -f "$source/package.json" ]] && cp -f "$source/package.json" "$vendor/"
+  if ! node -e 'const m=require(process.argv[1]);if(typeof m.startSession!=="function")process.exit(2)' "$vendor/index.js"; then
+    STATUS[voice-mode]=error
+    MSG[voice-mode]="Cometix ASR 模块加载失败"
+    return 1
+  fi
 }
 
 # ---------- acorn + restore ----------
@@ -2236,6 +2300,10 @@ run_node_patch() {
     voice_mode_platform_error
     return 1
   fi
+  if [[ "$id" == "voice-mode" ]] && ! voice_mode_assets_ready; then
+    voice_mode_assets_error
+    return 1
+  fi
 
   if ! require_target_readable; then
     STATUS[$id]=error
@@ -2245,6 +2313,10 @@ run_node_patch() {
   if ! ensure_node || ! ensure_acorn; then
     STATUS[$id]=error
     MSG[$id]="缺少 node 或 acorn"
+    return 1
+  fi
+
+  if [[ "$id" == "voice-mode" && "$mode" == "apply" ]] && ! install_voice_mode_vendor; then
     return 1
   fi
 
@@ -2416,7 +2488,7 @@ draw_main() {
     idx=$((idx + 1))
   done
   printf '%s\n' '----------------------------------------'
-  printf '[1-4] 选择补丁   [a] 一键应用全部   [b] 备份当前   [r] 刷新全部   [p] 换路径   [q] 退出\n'
+  printf '[1-5] 选择补丁   [a] 一键应用全部   [b] 备份当前   [r] 刷新全部   [p] 换路径   [q] 退出\n'
   if has_baseline 2>/dev/null; then
     printf '备份:  %s\n' "$(basename "$(baseline_path)")"
   else
@@ -2636,7 +2708,7 @@ menu_loop() {
         refresh_all
         ;;
       p|P) set_path_interactive ;;
-      1|2|3|4)
+      1|2|3|4|5)
         id="${PATCH_IDS[$((choice - 1))]}"
         show_detail "$id"
         ;;
