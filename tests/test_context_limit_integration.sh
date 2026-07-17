@@ -34,4 +34,71 @@ help=$("$ROOT/cc-patch-manager.sh" --help)
 grep -Fq "[1-6] 选择补丁" "$ROOT/cc-patch-manager.sh" || fail "menu hint must accept 1-6"
 grep -Fq '1|2|3|4|5|6)' "$ROOT/cc-patch-manager.sh" || fail "menu dispatch must accept choice 6"
 
+source_script="$ROOT/original-scripts/apply-claude-code-context-limit-patch.sh"
+[[ -f "$source_script" ]] || fail "archived context-limit source is missing"
+grep -Fq 'CLAUDE_CODE_CONTEXT_LIMIT' "$source_script" || fail "archived source lost its env marker"
+
+engine=$(write_patch_script context-limit)
+grep -Fq 'CLAUDE_CODE_CONTEXT_LIMIT' "$engine" || fail "generated engine lost its env marker"
+grep -Fq 'ALREADY_PATCHED' "$engine" || fail "generated engine lacks idempotence marker"
+grep -Fq 'CC_PATCH_SKIP_BACKUP' "$engine" || fail "generated engine lacks baseline adapter"
+rm -f "$engine"
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+CLI_PATH="$tmp/cli.js"
+ACORN_PATH="$tmp/acorn.js"
+
+cat >"$CLI_PATH" <<'JS'
+#!/usr/bin/env node
+let hookLimit=200000,toolLimit=200000;
+function loadProjectEnv(env){for(const item of [])void item;Object.assign(process.env,env)}
+function loadFlagEnv(env){Object.assign(process.env,env)}
+function isLargeMessage(tokens){return tokens>200000}
+console.log(hookLimit,toolLimit,isLargeMessage(1));
+JS
+
+before="$tmp/cli-before.js"
+cp "$CLI_PATH" "$before"
+
+run_node_patch context-limit check
+assert_eq "${STATUS[context-limit]:-}" "idle" "initial context-limit status"
+assert_eq "${MSG[context-limit]:-}" "需修补 3 处" "initial patch count"
+
+run_node_patch context-limit apply
+assert_eq "${STATUS[context-limit]:-}" "applied" "status after apply"
+assert_eq "${MSG[context-limit]:-}" "已修补 5 处" "apply count includes two env loaders"
+
+baseline="$CLI_PATH.cc-patch-baseline"
+[[ -f "$baseline" ]] || fail "manager baseline was not created"
+cmp -s "$baseline" "$before" || fail "baseline must preserve the unpatched fixture"
+if compgen -G "$CLI_PATH.backup-ctxlimit-*" >/dev/null; then
+  fail "manager must not create timestamp context-limit backups"
+fi
+
+env_ref_count=$(grep -o 'process.env.CLAUDE_CODE_CONTEXT_LIMIT' "$CLI_PATH" | wc -l | tr -d ' ')
+assert_eq "$env_ref_count" "7" "patched env reference count"
+
+node - "$ACORN_PATH" "$CLI_PATH" <<'NODE'
+const fs = require('fs');
+const acorn = require(process.argv[2]);
+const code = fs.readFileSync(process.argv[3], 'utf8').replace(/^#![^\n]*\n/, '');
+acorn.parse(code, { ecmaVersion: 'latest', sourceType: 'module' });
+NODE
+
+run_node_patch context-limit check
+assert_eq "${STATUS[context-limit]:-}" "applied" "status after second check"
+[[ "$LAST_OUTPUT" == *"ALREADY_PATCHED"* ]] || fail "second check must report ALREADY_PATCHED"
+[[ "$LAST_OUTPUT" != *"NOT_FOUND"* ]] || fail "second check must not report NOT_FOUND"
+
+after_first_apply="$tmp/cli-after-first-apply.js"
+cp "$CLI_PATH" "$after_first_apply"
+run_node_patch context-limit apply
+assert_eq "${STATUS[context-limit]:-}" "applied" "status after second apply"
+cmp -s "$CLI_PATH" "$after_first_apply" || fail "second apply must not mutate the file"
+
+restore_patch context-limit
+cmp -s "$CLI_PATH" "$baseline" || fail "restore must return to the shared baseline"
+
 printf 'PASS: context-limit registry and UI contract\n'
+printf 'PASS: context-limit check/apply/idempotence/restore lifecycle\n'

@@ -557,9 +557,343 @@ write_patch_script() {
     transcript-dialog) write_patch_script_transcript_dialog "$tmp" ;;
     ultracode) write_patch_script_ultracode "$tmp" ;;
     voice-mode) write_patch_script_voice_mode "$tmp" ;;
+    context-limit) write_patch_script_context_limit "$tmp" ;;
     *) error "未知补丁 id: $id"; rm -f "$tmp"; return 1 ;;
   esac
   printf '%s\n' "$tmp"
+}
+
+write_patch_script_context_limit() {
+  local out="$1"
+  cat >"$out" <<'PATCH_EOF'
+const fs = require('fs');
+const acorn = require(process.argv[2]);
+const cliPath = process.argv[3];
+const checkOnly = process.argv[4] === '--check';
+const backupSuffix = process.env.BACKUP_SUFFIX || 'backup';
+
+let code = fs.readFileSync(cliPath, 'utf-8');
+
+// Preserve shebang
+let shebang = '';
+if (code.startsWith('#!')) {
+    const idx = code.indexOf('\n');
+    shebang = code.slice(0, idx + 1);
+    code = code.slice(idx + 1);
+}
+
+// Version info (informational) - check multiple patterns
+const versionMatch = code.slice(0, 1000).match(/Version:\s*([\d.]+)/)
+    || code.match(/VERSION:\s*"([\d.]+)"/)
+    || code.match(/"version"\s*:\s*"([\d.]+)"/);
+console.log('VERSION:' + (versionMatch ? versionMatch[1] : 'unknown'));
+
+// ============================================================
+// Parse AST
+// ============================================================
+let ast;
+try {
+    ast = acorn.parse(code, { ecmaVersion: 'latest', sourceType: 'module' });
+} catch (e) {
+    console.error('PARSE_ERROR:' + e.message);
+    process.exit(1);
+}
+
+// AST helpers
+function findNodes(node, predicate, results = []) {
+    if (!node || typeof node !== 'object') return results;
+    if (predicate(node)) results.push(node);
+    for (const key in node) {
+        if (key === 'start' || key === 'end' || key === 'type') continue;
+        if (node[key] && typeof node[key] === 'object') {
+            if (Array.isArray(node[key])) {
+                node[key].forEach(child => findNodes(child, predicate, results));
+            } else {
+                findNodes(node[key], predicate, results);
+            }
+        }
+    }
+    return results;
+}
+
+const src = (node) => code.slice(node.start, node.end);
+
+// ============================================================
+// Phase 1: Find 200000 numeric literals and classify
+// ============================================================
+
+console.log('STEP:1 - Finding 200000 numeric literals');
+
+const numericLiterals = findNodes(ast, n =>
+    n.type === 'Literal' && typeof n.value === 'number' && n.value === 200000
+);
+
+console.log('FOUND:' + numericLiterals.length + ' occurrences of numeric literal 200000');
+
+// Build parent map
+const parentMap = new Map();
+function buildParentMap(node, parent) {
+    if (!node || typeof node !== 'object') return;
+    if (node.type) parentMap.set(node, parent);
+    for (const key in node) {
+        if (key === 'start' || key === 'end' || key === 'type') continue;
+        if (node[key] && typeof node[key] === 'object') {
+            if (Array.isArray(node[key])) {
+                node[key].forEach(child => buildParentMap(child, node));
+            } else {
+                buildParentMap(node[key], node);
+            }
+        }
+    }
+}
+buildParentMap(ast, null);
+
+console.log('STEP:2 - Classifying literals by parent AST node');
+
+const replacements = [];
+const contextVarNames = [];  // collect var names for Phase 3 injection
+let patchedCount = 0;
+let skippedCount = 0;
+
+const replacement = '(+process.env.CLAUDE_CODE_CONTEXT_LIMIT||200000)';
+
+for (const lit of numericLiterals) {
+    const parent = parentMap.get(lit);
+    const grandparent = parent ? parentMap.get(parent) : null;
+    let context = 'unknown';
+    let shouldPatch = false;
+    let varName = null;
+
+    // Pattern 1: Top-level VariableDeclarator init
+    if (parent && parent.type === 'VariableDeclarator' && parent.init === lit) {
+        if (grandparent && grandparent.type === 'VariableDeclaration') {
+            const isTopLevel = ast.body.includes(grandparent);
+            if (isTopLevel) {
+                varName = parent.id.name;
+                context = 'top-level-var(' + varName + ')';
+                shouldPatch = true;
+                contextVarNames.push(varName);
+            }
+        }
+    }
+
+    // Pattern 2: BinaryExpression comparison operand
+    if (!shouldPatch && parent && parent.type === 'BinaryExpression' && parent.right === lit) {
+        const cmpOps = ['>', '<', '>=', '<=', '==', '!=', '===', '!=='];
+        if (cmpOps.includes(parent.operator)) {
+            context = 'comparison(' + parent.operator + ')';
+            shouldPatch = true;
+        }
+    }
+
+    // Pattern 3: LEFT operand of a comparison
+    if (!shouldPatch && parent && parent.type === 'BinaryExpression' && parent.left === lit) {
+        const cmpOps = ['>', '<', '>=', '<=', '==', '!=', '===', '!=='];
+        if (cmpOps.includes(parent.operator)) {
+            context = 'comparison-left(' + parent.operator + ')';
+            shouldPatch = true;
+        }
+    }
+
+    if (shouldPatch) {
+        const label = varName || context;
+        console.log('  [PATCH] ' + label + ' at offset ' + lit.start);
+        replacements.push({
+            start: lit.start,
+            end: lit.end,
+            replacement,
+            context,
+            varName
+        });
+        patchedCount++;
+    } else {
+        skippedCount++;
+        const preview = code.slice(Math.max(0, lit.start - 30), lit.end + 20).replace(/\n/g, '\\n');
+        console.log('  [SKIP]  unknown context at offset ' + lit.start + ': ...' + preview + '...');
+    }
+}
+
+console.log('VAR_NAMES_FOR_REASSIGN:' + JSON.stringify(contextVarNames));
+console.log(`\nSUMMARY: ${patchedCount} will be patched, ${skippedCount} skipped`);
+
+const existingContextLimitRefs = findNodes(ast, n =>
+    n.type === 'MemberExpression' &&
+    n.object?.type === 'MemberExpression' &&
+    n.object.object?.name === 'process' &&
+    n.object.property?.name === 'env' &&
+    n.property?.name === 'CLAUDE_CODE_CONTEXT_LIMIT'
+);
+
+if (patchedCount === 0) {
+    if (existingContextLimitRefs.length > 0) {
+        console.log('ALREADY_PATCHED');
+        process.exit(2);
+    }
+    console.error('NOT_FOUND:No patchable 200000 literals found');
+    process.exit(1);
+}
+
+// ============================================================
+// Phase 2: Find env-loading functions (Ay8 and Ui analogues)
+//
+// Detection strategy (AST structure, name-agnostic):
+//   1) Find all FunctionDeclarations whose body contains
+//      Object.assign(process.env, ...)
+//   2) Ay8 = the one with ForOfStatement (has for...of loops)
+//   3) Ui  = the one without ForOfStatement (just assign + call chain)
+// ============================================================
+
+console.log('STEP:3 - Finding env-loading functions');
+
+function hasProcessEnvAssign(funcNode) {
+    const assignCalls = findNodes(funcNode, n =>
+        n.type === 'CallExpression' &&
+        n.callee?.type === 'MemberExpression' &&
+        n.callee.object?.name === 'Object' &&
+        n.callee.property?.name === 'assign' &&
+        n.arguments?.length >= 2 &&
+        n.arguments[0]?.type === 'MemberExpression' &&
+        n.arguments[0].object?.name === 'process' &&
+        n.arguments[0].property?.name === 'env'
+    );
+    return assignCalls.length > 0;
+}
+
+const allFuncDecls = findNodes(ast, n => n.type === 'FunctionDeclaration');
+
+const envLoaderFuncs = allFuncDecls.filter(fn => hasProcessEnvAssign(fn));
+
+if (envLoaderFuncs.length < 2) {
+    console.error('NOT_FOUND:Cannot find env-loading functions (found ' + envLoaderFuncs.length + ', need >= 2)');
+    process.exit(1);
+}
+
+for (const fn of envLoaderFuncs) {
+    console.log('FOUND:env-loader = ' + fn.id.name + ' at offset ' + fn.start + ' [' + (fn.end - fn.start) + ' bytes]');
+}
+
+// ============================================================
+// Check-only mode
+// ============================================================
+if (checkOnly) {
+    console.log('NEEDS_PATCH');
+    console.log('PATCH_COUNT:' + patchedCount);
+    console.log('ENV_LOADERS:' + envLoaderFuncs.map(fn => fn.id.name).join(','));
+    console.log('VAR_NAMES:' + JSON.stringify(contextVarNames));
+    process.exit(1);
+}
+
+// ============================================================
+// Phase 3: Apply patches
+//
+// 3a: Replace 200000 literals (reverse order to preserve positions)
+// 3b: Inject re-assignment code at end of Ay8 and Ui
+// ============================================================
+
+let newCode = code;
+
+function replaceAt(str, start, end, replacement) {
+    return str.slice(0, start) + replacement + str.slice(end);
+}
+
+// 3b: Collect env-loader injection points (AST body.end - 1 = before closing brace)
+const reassignExpr = '(+process.env.CLAUDE_CODE_CONTEXT_LIMIT||';
+const reassignStmts = contextVarNames
+    .map(name => name + '=' + reassignExpr + name + ')')
+    .join(';');
+
+for (const fn of envLoaderFuncs) {
+    // body.end points to the char AFTER '}', so body.end - 1 = the '}' itself
+    const insertAt = fn.body.end - 1;
+    replacements.push({
+        start: insertAt,
+        end: insertAt,
+        replacement: ';' + reassignStmts + ';',
+        context: 'env-inject(' + fn.id.name + ')',
+        varName: null
+    });
+    patchedCount++;
+    console.log('PATCH:inject:' + fn.id.name + ' - Will inject at AST body.end-1 (offset ' + insertAt + ')');
+}
+
+// 3c: Apply ALL replacements (literals + injections) in one pass, reverse order
+replacements.sort((a, b) => b.start - a.start);
+for (const r of replacements) {
+    newCode = replaceAt(newCode, r.start, r.end, r.replacement);
+    console.log('PATCH:' + r.context + (r.varName ? ' (' + r.varName + ')' : '') + ' at offset ' + r.start);
+}
+
+// ============================================================
+// Phase 4: Verify via AST re-parse
+// ============================================================
+
+let newAst;
+try {
+    newAst = acorn.parse(newCode, { ecmaVersion: 'latest', sourceType: 'module' });
+    console.log('VERIFY:AST re-parse confirms valid syntax');
+} catch (e) {
+    console.error('VERIFY_FAILED:Patched code fails to parse: ' + e.message);
+    process.exit(1);
+}
+
+// 4b. Verify env-var expressions exist in AST (MemberExpression process.env.CLAUDE_CODE_CONTEXT_LIMIT)
+const envRefNodes = findNodes(newAst, n =>
+    n.type === 'MemberExpression' &&
+    n.object?.type === 'MemberExpression' &&
+    n.object.object?.name === 'process' &&
+    n.object.property?.name === 'env' &&
+    n.property?.name === 'CLAUDE_CODE_CONTEXT_LIMIT'
+);
+console.log('VERIFY:process.env.CLAUDE_CODE_CONTEXT_LIMIT refs in AST: ' + envRefNodes.length);
+if (envRefNodes.length < patchedCount) {
+    console.error('VERIFY_FAILED:Expected >= ' + patchedCount + ' env refs, found ' + envRefNodes.length);
+    process.exit(1);
+}
+
+// 4c. Verify each env-loader function now contains re-assignment
+for (const fn of envLoaderFuncs) {
+    const patchedFn = findNodes(newAst, n =>
+        n.type === 'FunctionDeclaration' && n.id?.name === fn.id.name
+    )[0];
+    if (!patchedFn) {
+        console.error('VERIFY_FAILED:' + fn.id.name + ' not found after patch');
+        process.exit(1);
+    }
+    const hasEnvRef = findNodes(patchedFn, n =>
+        n.type === 'MemberExpression' &&
+        n.object?.type === 'MemberExpression' &&
+        n.object.object?.name === 'process' &&
+        n.object.property?.name === 'env' &&
+        n.property?.name === 'CLAUDE_CODE_CONTEXT_LIMIT'
+    ).length > 0;
+    if (!hasEnvRef) {
+        console.error('VERIFY_FAILED:' + fn.id.name + ' missing CLAUDE_CODE_CONTEXT_LIMIT ref after patch');
+        process.exit(1);
+    }
+    console.log('VERIFY:' + fn.id.name + ' has CLAUDE_CODE_CONTEXT_LIMIT re-assignment');
+}
+
+// ============================================================
+// Backup and write
+// ============================================================
+let backupPath = '';
+if (process.env.CC_PATCH_SKIP_BACKUP === '1') {
+    backupPath = process.env.CC_PATCH_BASELINE || (cliPath + '.cc-patch-baseline');
+    if (!fs.existsSync(backupPath)) {
+        fs.copyFileSync(cliPath, backupPath);
+        console.log('BASELINE_CREATED:' + backupPath);
+    }
+    console.log('BACKUP:' + backupPath);
+} else {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    backupPath = cliPath + '.' + backupSuffix + '-' + timestamp;
+    fs.copyFileSync(cliPath, backupPath);
+    console.log('BACKUP:' + backupPath);
+}
+
+fs.writeFileSync(cliPath, shebang + newCode);
+console.log('SUCCESS:' + patchedCount);
+PATCH_EOF
 }
 
 write_patch_script_voice_mode() {
