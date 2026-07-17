@@ -2742,7 +2742,7 @@ refresh_one() {
   run_node_patch "$id" check || true
 }
 
-# 全量检测四个补丁；quiet=1 时不打印进度（给 --check 用）
+# 全量检测全部补丁；quiet=1 时不打印进度（给 --check 用）
 refresh_all() {
   local quiet="${1:-0}" id n=0 total=${#PATCH_IDS[@]}
   for id in "${PATCH_IDS[@]}"; do
@@ -2970,7 +2970,7 @@ show_detail() {
               info "备份: $(baseline_path)"
             fi
             warning "请重启 Claude Code 使更改生效"
-            # 只复检当前补丁，避免对 18MB cli.js 连跑四次 AST
+            # 只复检当前补丁，避免对 18MB cli.js 连跑全部 AST 引擎
             info "正在复检当前补丁..."
             refresh_one "$id"
           else

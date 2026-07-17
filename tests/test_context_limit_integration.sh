@@ -37,6 +37,18 @@ grep -Fq '1|2|3|4|5|6)' "$ROOT/cc-patch-manager.sh" || fail "menu dispatch must 
 source_script="$ROOT/original-scripts/apply-claude-code-context-limit-patch.sh"
 [[ -f "$source_script" ]] || fail "archived context-limit source is missing"
 grep -Fq 'CLAUDE_CODE_CONTEXT_LIMIT' "$source_script" || fail "archived source lost its env marker"
+if command -v shasum >/dev/null 2>&1; then
+  source_hash=$(shasum -a 256 "$source_script" | awk '{print $1}')
+elif command -v sha256sum >/dev/null 2>&1; then
+  source_hash=$(sha256sum "$source_script" | awk '{print $1}')
+else
+  fail "no SHA-256 command available"
+fi
+assert_eq "$source_hash" \
+  "3bd475fb9241704bfffc71523268fa7ab7afb7906abdd7d62ac03a19d41be9bc" \
+  "archived context-limit source hash"
+[[ ! -e "$ROOT/original-scripts/apply-claude-code-context-limit-patch.ps1" ]] || \
+  fail "PowerShell source must not be archived"
 
 engine=$(write_patch_script context-limit)
 grep -Fq 'CLAUDE_CODE_CONTEXT_LIMIT' "$engine" || fail "generated engine lost its env marker"
