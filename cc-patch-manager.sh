@@ -26,7 +26,7 @@ error()   { printf '%s[错误]%s %s\n' "$RED" "$NC" "$*" >&2; }
 info()    { printf '%s[信息]%s %s\n' "$BLUE" "$NC" "$*"; }
 
 # ---------- registry (order fixed) ----------
-PATCH_IDS=(auto-mode keybindings transcript-dialog ultracode voice-mode)
+PATCH_IDS=(auto-mode keybindings transcript-dialog ultracode voice-mode context-limit)
 
 patch_name() {
   case "$1" in
@@ -35,6 +35,7 @@ patch_name() {
     transcript-dialog) echo "权限弹窗重放" ;;
     ultracode) echo "Ultracode 解锁" ;;
     voice-mode) echo "语音模式解锁" ;;
+    context-limit) echo "上下文上限配置" ;;
     *) echo "$1" ;;
   esac
 }
@@ -46,6 +47,7 @@ patch_note() {
     transcript-dialog) echo "Ctrl+O 看会话时审批卡 Waiting… / 被中断" ;;
     ultracode) echo "在只支持 max、不支持 xhigh 的模型上启用" ;;
     voice-mode) echo "解锁 VoiceMode，语音识别改用本地 Cometix ASR" ;;
+    context-limit) echo "通过 CLAUDE_CODE_CONTEXT_LIMIT 覆盖默认 200K 上限" ;;
     *) echo "" ;;
   esac
 }
@@ -57,6 +59,7 @@ patch_suffix() {
     transcript-dialog) echo "backup-transcript-dialog-replay" ;;
     ultracode) echo "backup-ultracode" ;;
     voice-mode) echo "backup-cometix-asr" ;;
+    context-limit) echo "backup-ctxlimit" ;;
     *) echo "backup" ;;
   esac
 }
@@ -118,6 +121,18 @@ EOF
 限制：仅支持 macOS Apple Silicon（Darwin/arm64）。应用后请重启 Claude Code。
 EOF
       ;;
+    context-limit)
+      cat <<'EOF'
+现象：Claude Code 在多处把上下文窗口上限固定为 200000，无法通过设置覆盖。
+
+改动：
+  (1) 支持环境变量 CLAUDE_CODE_CONTEXT_LIMIT 覆盖客户端限制
+  (2) settings.json / --settings 中的 env 加载后会重新应用该值
+  (3) 未设置或设置为 0 时默认仍为 200000
+
+限制：这是客户端补丁，服务端可能拒绝过大的值；更大上下文也会增加费用、延迟和内存占用。
+EOF
+      ;;
   esac
 }
 
@@ -132,12 +147,12 @@ LAST_BACKUP=""
 usage() {
   cat <<EOF
 Claude Code 补丁管理器 v${VERSION}
-五个社区常用 Claude Code 本地补丁的统一管理（中文交互）。
+六个社区常用 Claude Code 本地补丁的统一管理（中文交互）。
 
 用法:
   $(basename "$0")                  进入交互菜单
   $(basename "$0") /path/to/cli.js  指定目标后进入菜单
-  $(basename "$0") --check          打印五个补丁状态后退出
+  $(basename "$0") --check          打印六个补丁状态后退出
   $(basename "$0") --help           显示本帮助
 
 环境变量:
@@ -2532,7 +2547,7 @@ draw_main() {
     idx=$((idx + 1))
   done
   printf '%s\n' '----------------------------------------'
-  printf '[1-5] 选择补丁   [a] 一键应用全部   [b] 备份当前   [r] 刷新全部   [p] 换路径   [q] 退出\n'
+  printf '[1-6] 选择补丁   [a] 一键应用全部   [b] 备份当前   [r] 刷新全部   [p] 换路径   [q] 退出\n'
   if has_baseline 2>/dev/null; then
     printf '备份:  %s\n' "$(basename "$(baseline_path)")"
   else
@@ -2752,7 +2767,7 @@ menu_loop() {
         refresh_all
         ;;
       p|P) set_path_interactive ;;
-      1|2|3|4|5)
+      1|2|3|4|5|6)
         id="${PATCH_IDS[$((choice - 1))]}"
         show_detail "$id"
         ;;

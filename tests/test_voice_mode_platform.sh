@@ -58,5 +58,5 @@ rm -f "$script"
 printf 'PASS: voice-mode selects its AST engine\n'
 
 help=$("$ROOT/cc-patch-manager.sh" --help)
-[[ "$help" == *"打印五个补丁状态后退出"* ]]
-printf 'PASS: help reports five patch statuses\n'
+[[ "$help" == *"打印六个补丁状态后退出"* ]]
+printf 'PASS: help reports six patch statuses\n'
