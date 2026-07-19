@@ -49,3 +49,82 @@ assert_eq "$source_hash" \
   "archived computer-use source hash"
 
 printf 'PASS: computer-use registry, UI contract, and source archive\n'
+
+engine=$(write_patch_script computer-use)
+grep -Fq 'CLAUDE_CODE_COMPUTER_USE' "$engine" || fail "generated engine lost its env marker"
+grep -Fq 'computerUseEnabled' "$engine" || fail "generated engine lost its settings marker"
+grep -Fq 'computerUseConfig' "$engine" || fail "generated engine lost its config marker"
+grep -Fq 'ALREADY_PATCHED' "$engine" || fail "generated engine lacks idempotence marker"
+grep -Fq 'CC_PATCH_SKIP_BACKUP' "$engine" || fail "generated engine lacks baseline adapter"
+rm -f "$engine"
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+CLI_PATH="$tmp/cli.js"
+ACORN_PATH="$tmp/acorn.js"
+
+cat >"$CLI_PATH" <<'JS'
+#!/usr/bin/env node
+const z={boolean(){return this},optional(){return this},describe(){return this},object(){return this},enum(){return this}};
+const settingsSchema={
+  p01:0,p02:0,p03:0,p04:0,p05:0,p06:0,p07:0,p08:0,p09:0,p10:0,
+  p11:0,p12:0,p13:0,p14:0,p15:0,p16:0,p17:0,p18:0,p19:0,p20:0,
+  p21:0,p22:0,p23:0,p24:0,p25:0,p26:0,p27:0,p28:0,p29:0,p30:0,
+  p31:0,p32:0,p33:0,p34:0,p35:0,p36:0,p37:0,p38:0,p39:0,p40:0,
+  p41:0,p42:0,p43:0,p44:0,p45:0,p46:0,p47:0,p48:0,p49:0,p50:0,
+  autoCompactEnabled:z.boolean().optional().describe("compact conversation setting")
+};
+function envTruthy(value){return value==="1"}
+function readSetting(name,fallback){return{source:"default",value:fallback}}
+function readCompact(){return envTruthy(process.env.DISABLE_AUTO_COMPACT)||readSetting("autoCompactEnabled",void 0).value}
+const computerDefaults={enabled:false,mouseAnimation:true};
+function featureConfig(name,defaults){return{}}
+function computerConfig(){return{...computerDefaults,...featureConfig("tengu_malort_pedway",computerDefaults)}}
+function hasSubscription(){return true}
+function computerEnabled(){return hasSubscription()&&computerConfig().enabled}
+console.log(settingsSchema,readCompact(),computerEnabled());
+JS
+
+before="$tmp/cli-before.js"
+cp "$CLI_PATH" "$before"
+
+run_node_patch computer-use check
+assert_eq "${STATUS[computer-use]:-}" "idle" "initial computer-use status"
+assert_eq "${MSG[computer-use]:-}" "需修补 3 处" "initial computer-use patch count"
+
+run_node_patch computer-use apply
+assert_eq "${STATUS[computer-use]:-}" "applied" "status after computer-use apply"
+assert_eq "${MSG[computer-use]:-}" "已修补 3 处" "computer-use apply count"
+
+baseline="$CLI_PATH.cc-patch-baseline"
+[[ -f "$baseline" ]] || fail "manager baseline was not created"
+cmp -s "$baseline" "$before" || fail "baseline must preserve the unpatched fixture"
+if compgen -G "$CLI_PATH.backup-computer-use-*" >/dev/null; then
+  fail "manager must not create timestamp computer-use backups"
+fi
+
+grep -Fq 'CLAUDE_CODE_COMPUTER_USE' "$CLI_PATH" || fail "patched cli lost env gate"
+grep -Fq 'computerUseEnabled' "$CLI_PATH" || fail "patched cli lost settings gate"
+grep -Fq 'computerUseConfig' "$CLI_PATH" || fail "patched cli lost config merge"
+
+node - "$ACORN_PATH" "$CLI_PATH" <<'NODE'
+const fs = require('fs');
+const acorn = require(process.argv[2]);
+const code = fs.readFileSync(process.argv[3], 'utf8').replace(/^#![^\n]*\n/, '');
+acorn.parse(code, { ecmaVersion: 'latest', sourceType: 'module' });
+NODE
+
+run_node_patch computer-use check
+assert_eq "${STATUS[computer-use]:-}" "applied" "status after second computer-use check"
+[[ "$LAST_OUTPUT" == *"ALREADY_PATCHED"* ]] || fail "second check must report ALREADY_PATCHED"
+
+after_first_apply="$tmp/cli-after-first-apply.js"
+cp "$CLI_PATH" "$after_first_apply"
+run_node_patch computer-use apply
+assert_eq "${STATUS[computer-use]:-}" "applied" "status after second computer-use apply"
+cmp -s "$CLI_PATH" "$after_first_apply" || fail "second apply must not mutate the file"
+
+restore_patch computer-use
+cmp -s "$CLI_PATH" "$baseline" || fail "restore must return to the shared baseline"
+
+printf 'PASS: computer-use check/apply/idempotence/restore lifecycle\n'
