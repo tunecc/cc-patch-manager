@@ -37,6 +37,7 @@ grep -Fq '1|2|3|4|5|6|7)' "$ROOT/cc-patch-manager.sh" || fail "menu dispatch mus
 
 source_script="$ROOT/original-scripts/apply-claude-code-computer-use-fix.sh"
 [[ -f "$source_script" ]] || fail "archived computer-use source is missing"
+[[ -x "$source_script" ]] || fail "archived computer-use source must remain executable"
 if command -v shasum >/dev/null 2>&1; then
   source_hash=$(shasum -a 256 "$source_script" | awk '{print $1}')
 elif command -v sha256sum >/dev/null 2>&1; then
