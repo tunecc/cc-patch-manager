@@ -2933,16 +2933,17 @@ walk(ast, (node) => {
 // ============================================================
 if (code.includes(SENTINEL_T0N))    { fixes.t0n.found = true;    fixes.t0n.patched = true;    console.log('FOUND:t0n — already patched (sentinel)'); }
 if (code.includes(SENTINEL_S7R))    { fixes.s7r.found = true;    fixes.s7r.patched = true;    console.log('FOUND:s7r — already patched (sentinel)'); }
-// Schema sentinel: check if computerUseEnabled already exists as a Property key in schema
-let schemaAlreadyPatched = false;
-walk(ast, (node, parent) => {
-    if (schemaAlreadyPatched) return;
-    if (node.type === 'Property' && node.key?.name === 'computerUseEnabled'
-        && parent?.type === 'ObjectExpression' && parent.properties.length >= 50) {
-        schemaAlreadyPatched = true;
-    }
-});
-if (schemaAlreadyPatched) { fixes.schema.found = true; fixes.schema.patched = true; console.log('FOUND:schema — already patched (sentinel)'); }
+// Schema sentinel: both settings keys must exist in the same schema object.
+const schemaProperties = fixes.schema.parentNode?.properties || [];
+const schemaHasKey = (name) => schemaProperties.some((property) =>
+    property.type === 'Property' && (property.key?.name === name || property.key?.value === name)
+);
+const schemaHasEnabled = schemaHasKey('computerUseEnabled');
+const schemaHasConfig = schemaHasKey('computerUseConfig');
+if (schemaHasEnabled && schemaHasConfig) {
+    fixes.schema.patched = true;
+    console.log('FOUND:schema — already patched (sentinel)');
+}
 
 const allAlreadyPatched = Object.values(fixes).every(f => f.found && f.patched);
 if (allAlreadyPatched) {
@@ -2977,13 +2978,17 @@ if (fixes.schema.found && !fixes.schema.patched && fixes.schema.node) {
     }
     const z = zodVar;
     const insertAfter = fixes.schema.node.end;
-    const insertion =
-        ',computerUseEnabled:' + z + '.boolean().optional().describe("Enable computer use MCP server for desktop control (macOS only, default off)")' +
-        ',computerUseConfig:' + z + '.object({mouseAnimation:' + z + '.boolean().optional(),' +
-        'hideBeforeAction:' + z + '.boolean().optional(),' +
-        'clipboardGuard:' + z + '.boolean().optional(),' +
-        'coordinateMode:' + z + '.enum(["pixels","normalized_0_100"]).optional()' +
-        '}).optional().describe("Computer use sub-configuration overrides")';
+    let insertion = '';
+    if (!schemaHasEnabled) {
+        insertion += ',computerUseEnabled:' + z + '.boolean().optional().describe("Enable computer use MCP server for desktop control (macOS only, default off)")';
+    }
+    if (!schemaHasConfig) {
+        insertion += ',computerUseConfig:' + z + '.object({mouseAnimation:' + z + '.boolean().optional(),' +
+            'hideBeforeAction:' + z + '.boolean().optional(),' +
+            'clipboardGuard:' + z + '.boolean().optional(),' +
+            'coordinateMode:' + z + '.enum(["pixels","normalized_0_100"]).optional()' +
+            '}).optional().describe("Computer use sub-configuration overrides")';
+    }
     replacements.push({
         start: insertAfter,
         end: insertAfter,

@@ -49,8 +49,6 @@ assert_eq "$source_hash" \
   "ea146c487fa094bc4ec3cb06f6fb9b0ddab1b60abd2525f7eb524df57706ab9b" \
   "archived computer-use source hash"
 
-printf 'PASS: computer-use registry, UI contract, and source archive\n'
-
 engine=$(write_patch_script computer-use)
 grep -Fq 'CLAUDE_CODE_COMPUTER_USE' "$engine" || fail "generated engine lost its env marker"
 grep -Fq 'computerUseEnabled' "$engine" || fail "generated engine lost its settings marker"
@@ -128,4 +126,29 @@ cmp -s "$CLI_PATH" "$after_first_apply" || fail "second apply must not mutate th
 restore_patch computer-use
 cmp -s "$CLI_PATH" "$baseline" || fail "restore must return to the shared baseline"
 
+run_node_patch computer-use apply
+node - "$CLI_PATH" <<'NODE'
+const fs = require('fs');
+const path = process.argv[2];
+const code = fs.readFileSync(path, 'utf8');
+const configProperty = ',computerUseConfig:z.object({mouseAnimation:z.boolean().optional(),hideBeforeAction:z.boolean().optional(),clipboardGuard:z.boolean().optional(),coordinateMode:z.enum(["pixels","normalized_0_100"]).optional()}).optional().describe("Computer use sub-configuration overrides")';
+if (!code.includes(configProperty)) process.exit(2);
+fs.writeFileSync(path, code.replace(configProperty, ''));
+NODE
+
+run_node_patch computer-use check
+assert_eq "${STATUS[computer-use]:-}" "idle" "partial computer-use schema status"
+assert_eq "${MSG[computer-use]:-}" "需修补 1 处" "partial computer-use schema patch count"
+
+run_node_patch computer-use apply
+enabled_count=$(grep -o 'computerUseEnabled:' "$CLI_PATH" | wc -l | tr -d ' ')
+config_count=$(grep -o 'computerUseConfig:' "$CLI_PATH" | wc -l | tr -d ' ')
+assert_eq "$enabled_count" "1" "partial repair must not duplicate computerUseEnabled"
+assert_eq "$config_count" "1" "partial repair must restore computerUseConfig"
+
+restore_patch computer-use
+cmp -s "$CLI_PATH" "$baseline" || fail "partial repair restore must return to baseline"
+
+printf 'PASS: computer-use registry, UI contract, and source archive\n'
 printf 'PASS: computer-use check/apply/idempotence/restore lifecycle\n'
+printf 'PASS: computer-use repairs partial schema state without duplicates\n'
