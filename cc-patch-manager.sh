@@ -26,7 +26,7 @@ error()   { printf '%s[错误]%s %s\n' "$RED" "$NC" "$*" >&2; }
 info()    { printf '%s[信息]%s %s\n' "$BLUE" "$NC" "$*"; }
 
 # ---------- registry (order fixed) ----------
-PATCH_IDS=(auto-mode keybindings transcript-dialog ultracode voice-mode context-limit)
+PATCH_IDS=(auto-mode keybindings transcript-dialog ultracode voice-mode context-limit computer-use)
 
 patch_name() {
   case "$1" in
@@ -36,6 +36,7 @@ patch_name() {
     ultracode) echo "Ultracode 解锁" ;;
     voice-mode) echo "语音模式解锁" ;;
     context-limit) echo "上下文上限配置" ;;
+    computer-use) echo "Computer Use 解锁" ;;
     *) echo "$1" ;;
   esac
 }
@@ -48,6 +49,7 @@ patch_note() {
     ultracode) echo "在只支持 max、不支持 xhigh 的模型上启用" ;;
     voice-mode) echo "解锁 VoiceMode，语音识别改用本地 Cometix ASR" ;;
     context-limit) echo "通过 CLAUDE_CODE_CONTEXT_LIMIT 覆盖默认 200K 上限" ;;
+    computer-use) echo "通过设置或环境变量启用 Computer Use MCP，默认关闭" ;;
     *) echo "" ;;
   esac
 }
@@ -60,6 +62,7 @@ patch_suffix() {
     ultracode) echo "backup-ultracode" ;;
     voice-mode) echo "backup-cometix-asr" ;;
     context-limit) echo "backup-ctxlimit" ;;
+    computer-use) echo "backup-computer-use" ;;
     *) echo "backup" ;;
   esac
 }
@@ -133,6 +136,19 @@ EOF
 限制：这是客户端补丁，服务端可能拒绝过大的值；更大上下文也会增加费用、延迟和内存占用。
 EOF
       ;;
+    computer-use)
+      cat <<'EOF'
+现象：Computer Use MCP 默认受订阅与服务端功能开关限制，无法只通过本地
+settings.json 决定是否启用，也不能覆盖鼠标动画等子配置。
+
+改动：
+  (1) 支持 settings.json 中的 computerUseEnabled 开关
+  (2) 支持 CLAUDE_CODE_COMPUTER_USE=1 环境变量强制启用
+  (3) 支持 computerUseConfig 覆盖鼠标动画、动作前隐藏、剪贴板保护和坐标模式
+
+限制：补丁默认关闭；启用后仍需要 macOS 辅助功能和屏幕录制权限。
+EOF
+      ;;
   esac
 }
 
@@ -147,12 +163,12 @@ LAST_BACKUP=""
 usage() {
   cat <<EOF
 Claude Code 补丁管理器 v${VERSION}
-六个社区常用 Claude Code 本地补丁的统一管理（中文交互）。
+七个社区常用 Claude Code 本地补丁的统一管理（中文交互）。
 
 用法:
   $(basename "$0")                  进入交互菜单
   $(basename "$0") /path/to/cli.js  指定目标后进入菜单
-  $(basename "$0") --check          打印六个补丁状态后退出
+  $(basename "$0") --check          打印七个补丁状态后退出
   $(basename "$0") --help           显示本帮助
 
 环境变量:
@@ -2881,7 +2897,7 @@ draw_main() {
     idx=$((idx + 1))
   done
   printf '%s\n' '----------------------------------------'
-  printf '[1-6] 选择补丁   [a] 一键应用全部   [b] 备份当前   [r] 刷新全部   [p] 换路径   [q] 退出\n'
+  printf '[1-7] 选择补丁   [a] 一键应用全部   [b] 备份当前   [r] 刷新全部   [p] 换路径   [q] 退出\n'
   if has_baseline 2>/dev/null; then
     printf '备份:  %s\n' "$(basename "$(baseline_path)")"
   else
@@ -3101,7 +3117,7 @@ menu_loop() {
         refresh_all
         ;;
       p|P) set_path_interactive ;;
-      1|2|3|4|5|6)
+      1|2|3|4|5|6|7)
         id="${PATCH_IDS[$((choice - 1))]}"
         show_detail "$id"
         ;;

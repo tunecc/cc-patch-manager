@@ -16,8 +16,8 @@ assert_eq() {
 source "$ROOT/cc-patch-manager.sh"
 
 assert_eq "${PATCH_IDS[*]}" \
-  "auto-mode keybindings transcript-dialog ultracode voice-mode context-limit" \
-  "context-limit must be appended as patch six"
+  "auto-mode keybindings transcript-dialog ultracode voice-mode context-limit computer-use" \
+  "context-limit must remain patch six and computer-use must be patch seven"
 assert_eq "$(patch_name context-limit)" "上下文上限配置" "context-limit name"
 assert_eq "$(patch_note context-limit)" \
   "通过 CLAUDE_CODE_CONTEXT_LIMIT 覆盖默认 200K 上限" \
@@ -30,9 +30,9 @@ purpose=$(patch_purpose context-limit)
 [[ "$purpose" == *"服务端"* ]] || fail "purpose must document the server-side limit risk"
 
 help=$("$ROOT/cc-patch-manager.sh" --help)
-[[ "$help" == *"打印六个补丁状态后退出"* ]] || fail "help must report six patch statuses"
-grep -Fq "[1-6] 选择补丁" "$ROOT/cc-patch-manager.sh" || fail "menu hint must accept 1-6"
-grep -Fq '1|2|3|4|5|6)' "$ROOT/cc-patch-manager.sh" || fail "menu dispatch must accept choice 6"
+[[ "$help" == *"打印七个补丁状态后退出"* ]] || fail "help must report seven patch statuses"
+grep -Fq "[1-7] 选择补丁" "$ROOT/cc-patch-manager.sh" || fail "menu hint must accept 1-7"
+grep -Fq '1|2|3|4|5|6|7)' "$ROOT/cc-patch-manager.sh" || fail "menu dispatch must accept choice 7"
 
 source_script="$ROOT/original-scripts/apply-claude-code-context-limit-patch.sh"
 [[ -f "$source_script" ]] || fail "archived context-limit source is missing"
