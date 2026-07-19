@@ -149,6 +149,105 @@ assert_eq "$config_count" "1" "partial repair must restore computerUseConfig"
 restore_patch computer-use
 cmp -s "$CLI_PATH" "$baseline" || fail "partial repair restore must return to baseline"
 
+# Claude Code 2.1.211+ wraps the enable gate with an early HIPAA return and a
+# separate subscription helper. The engine must still locate and wrap that body.
+cat >"$CLI_PATH" <<'JS'
+#!/usr/bin/env node
+const z={boolean(){return this},optional(){return this},describe(){return this},object(){return this},enum(){return this}};
+const settingsSchema={
+  p01:0,p02:0,p03:0,p04:0,p05:0,p06:0,p07:0,p08:0,p09:0,p10:0,
+  p11:0,p12:0,p13:0,p14:0,p15:0,p16:0,p17:0,p18:0,p19:0,p20:0,
+  p21:0,p22:0,p23:0,p24:0,p25:0,p26:0,p27:0,p28:0,p29:0,p30:0,
+  p31:0,p32:0,p33:0,p34:0,p35:0,p36:0,p37:0,p38:0,p39:0,p40:0,
+  p41:0,p42:0,p43:0,p44:0,p45:0,p46:0,p47:0,p48:0,p49:0,p50:0,
+  autoCompactEnabled:z.boolean().optional().describe("compact conversation setting")
+};
+function envTruthy(value){return value==="1"}
+function readSetting(name,fallback){return{source:"default",value:fallback}}
+function readCompact(){return envTruthy(process.env.DISABLE_AUTO_COMPACT)||readSetting("autoCompactEnabled",void 0).value}
+const computerDefaults={enabled:false,mouseAnimation:true};
+function featureConfig(name,defaults){return{}}
+function computerConfig(){return{...computerDefaults,...featureConfig("tengu_malort_pedway",computerDefaults)}}
+function hasSubscription(){let e="max";return e==="max"||e==="pro"}
+function isHipaa(flag){return flag==="hipaa"&&!1}
+function computerEnabled(){if(isHipaa("hipaa"))return!1;return hasSubscription()&&computerConfig().enabled}
+console.log(settingsSchema,readCompact(),computerEnabled());
+JS
+
+before_hipaa="$tmp/cli-before-hipaa.js"
+cp "$CLI_PATH" "$before_hipaa"
+rm -f "$CLI_PATH.cc-patch-baseline"
+
+run_node_patch computer-use check
+assert_eq "${STATUS[computer-use]:-}" "idle" "hipaa-gate computer-use status"
+assert_eq "${MSG[computer-use]:-}" "需修补 3 处" "hipaa-gate computer-use patch count"
+
+run_node_patch computer-use apply
+assert_eq "${STATUS[computer-use]:-}" "applied" "status after hipaa-gate apply"
+assert_eq "${MSG[computer-use]:-}" "已修补 3 处" "hipaa-gate apply count"
+
+grep -Fq 'CLAUDE_CODE_COMPUTER_USE' "$CLI_PATH" || fail "hipaa-gate patch lost env gate"
+grep -Fq 'if(isHipaa("hipaa"))return!1' "$CLI_PATH" || fail "hipaa-gate patch must preserve original early return"
+grep -Fq 'return hasSubscription()&&computerConfig().enabled' "$CLI_PATH" || fail "hipaa-gate patch must preserve original fallback"
+
+node - "$ACORN_PATH" "$CLI_PATH" <<'NODE'
+const fs = require('fs');
+const acorn = require(process.argv[2]);
+const code = fs.readFileSync(process.argv[3], 'utf8').replace(/^#![^\n]*\n/, '');
+acorn.parse(code, { ecmaVersion: 'latest', sourceType: 'module' });
+NODE
+
+run_node_patch computer-use check
+assert_eq "${STATUS[computer-use]:-}" "applied" "status after hipaa-gate recheck"
+[[ "$LAST_OUTPUT" == *"ALREADY_PATCHED"* ]] || fail "hipaa-gate recheck must report ALREADY_PATCHED"
+
+# Partial state seen in the wild: schema + config merge already applied, enable
+# gate still on the 2.1.211 hipaa-wrapped form and missing the env/settings tier.
+cat >"$CLI_PATH" <<'JS'
+#!/usr/bin/env node
+const z={boolean(){return this},optional(){return this},describe(){return this},object(){return this},enum(){return this}};
+const settingsSchema={
+  p01:0,p02:0,p03:0,p04:0,p05:0,p06:0,p07:0,p08:0,p09:0,p10:0,
+  p11:0,p12:0,p13:0,p14:0,p15:0,p16:0,p17:0,p18:0,p19:0,p20:0,
+  p21:0,p22:0,p23:0,p24:0,p25:0,p26:0,p27:0,p28:0,p29:0,p30:0,
+  p31:0,p32:0,p33:0,p34:0,p35:0,p36:0,p37:0,p38:0,p39:0,p40:0,
+  p41:0,p42:0,p43:0,p44:0,p45:0,p46:0,p47:0,p48:0,p49:0,p50:0,
+  autoCompactEnabled:z.boolean().optional().describe("compact conversation setting"),
+  computerUseEnabled:z.boolean().optional().describe("Enable computer use MCP server for desktop control (macOS only, default off)"),
+  computerUseConfig:z.object({mouseAnimation:z.boolean().optional(),hideBeforeAction:z.boolean().optional(),clipboardGuard:z.boolean().optional(),coordinateMode:z.enum(["pixels","normalized_0_100"]).optional()}).optional().describe("Computer use sub-configuration overrides")
+};
+function envTruthy(value){return value==="1"}
+function readSetting(name,fallback){return{source:"default",value:fallback}}
+function readCompact(){return envTruthy(process.env.DISABLE_AUTO_COMPACT)||readSetting("autoCompactEnabled",void 0).value}
+const computerDefaults={enabled:false,mouseAnimation:true};
+function featureConfig(name,defaults){return{}}
+function computerConfig(){var _b={...computerDefaults,...featureConfig("tengu_malort_pedway",computerDefaults)};var _uo=readSetting("computerUseConfig",void 0);if(_uo.source!=="default"&&typeof _uo.value==="object"&&_uo.value!==null)return{..._b,..._uo.value};return _b}
+function hasSubscription(){let e="max";return e==="max"||e==="pro"}
+function isHipaa(flag){return flag==="hipaa"&&!1}
+function computerEnabled(){if(isHipaa("hipaa"))return!1;return hasSubscription()&&computerConfig().enabled}
+console.log(settingsSchema,readCompact(),computerEnabled());
+JS
+
+rm -f "$CLI_PATH.cc-patch-baseline"
+run_node_patch computer-use check
+assert_eq "${STATUS[computer-use]:-}" "idle" "partial hipaa-gate status"
+assert_eq "${MSG[computer-use]:-}" "需修补 1 处" "partial hipaa-gate should only need enable gate"
+
+run_node_patch computer-use apply
+assert_eq "${STATUS[computer-use]:-}" "applied" "status after partial hipaa-gate apply"
+grep -Fq 'CLAUDE_CODE_COMPUTER_USE' "$CLI_PATH" || fail "partial hipaa-gate apply lost env gate"
+grep -Fq 'if(isHipaa("hipaa"))return!1' "$CLI_PATH" || fail "partial hipaa-gate apply must preserve hipaa early return"
+enabled_count=$(grep -o 'computerUseEnabled:' "$CLI_PATH" | wc -l | tr -d ' ')
+config_count=$(grep -o 'computerUseConfig:' "$CLI_PATH" | wc -l | tr -d ' ')
+assert_eq "$enabled_count" "1" "partial hipaa-gate must not duplicate computerUseEnabled"
+assert_eq "$config_count" "1" "partial hipaa-gate must not duplicate computerUseConfig schema key"
+grep -Fq 'readSetting("computerUseConfig"' "$CLI_PATH" || fail "partial hipaa-gate must keep config settings merge"
+
+run_node_patch computer-use check
+assert_eq "${STATUS[computer-use]:-}" "applied" "status after partial hipaa-gate recheck"
+[[ "$LAST_OUTPUT" == *"ALREADY_PATCHED"* ]] || fail "partial hipaa-gate recheck must report ALREADY_PATCHED"
+
 printf 'PASS: computer-use registry, UI contract, and source archive\n'
 printf 'PASS: computer-use check/apply/idempotence/restore lifecycle\n'
 printf 'PASS: computer-use repairs partial schema state without duplicates\n'
+printf 'PASS: computer-use supports hipaa-wrapped enable gate and partial 2.1.211 state\n'

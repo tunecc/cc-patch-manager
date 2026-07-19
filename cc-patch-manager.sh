@@ -2891,41 +2891,71 @@ walk(ast, (node) => {
 // ============================================================
 // Patch 2 — Locate t0n-equivalent FunctionDeclaration
 //
-// Name-independent structural match:
-//   FunctionDeclaration {
-//     body.body = [ReturnStatement {
-//       argument: LogicalExpression {
-//         operator: "&&",
-//         left: CallExpression { callee: Identifier },        (the t5d-equiv)
-//         right: MemberExpression {
-//           object: CallExpression { callee: Identifier },    (MUST be s7r-equiv name)
-//           property: Identifier { name: "enabled" }
-//         }
-//       }
-//     }]
+// Supports two observed shapes:
+//
+// 1) Legacy single-return gate:
+//   function t0n(){ return t5d() && s7r().enabled }
+//
+// 2) Claude Code 2.1.211+ hipaa-wrapped gate:
+//   function Ppo(){
+//     if (Jse("hipaa")) return !1;
+//     return fiy() && xps().enabled
 //   }
+//
+// Matching rule (name-independent):
+//   - last statement is return <subGate>() && <configFn>().enabled
+//   - configFn must be the s7r-equivalent when that was found
+//   - optional leading if(...)return false/!1 statements are allowed
 // ============================================================
+function isEnabledGateReturn(arg) {
+    if (arg?.type !== 'LogicalExpression' || arg.operator !== '&&') return null;
+    if (arg.left?.type !== 'CallExpression' || arg.left.callee?.type !== 'Identifier') return null;
+    if (arg.right?.type !== 'MemberExpression') return null;
+    if (arg.right.object?.type !== 'CallExpression' || arg.right.object.callee?.type !== 'Identifier') return null;
+    if (arg.right.property?.name !== 'enabled') return null;
+    const configFn = arg.right.object.callee.name;
+    if (s7rFnName && configFn !== s7rFnName) return null;
+    return {
+        subGate: arg.left.callee.name,
+        configFn
+    };
+}
+
+function isFalseyReturn(stmt) {
+    if (stmt?.type !== 'ReturnStatement') return false;
+    const arg = stmt.argument;
+    if (!arg) return false;
+    if (arg.type === 'Literal' && (arg.value === false || arg.value === 0)) return true;
+    if (arg.type === 'UnaryExpression' && arg.operator === '!' &&
+        arg.argument?.type === 'Literal' && arg.argument.value === 1) return true;
+    return false;
+}
+
 walk(ast, (node) => {
     if (fixes.t0n.found) return;
     if (node.type !== 'FunctionDeclaration') return;
     const stmts = node.body?.body;
-    if (!stmts || stmts.length !== 1) return;
-    const ret = stmts[0];
+    if (!stmts || stmts.length < 1 || stmts.length > 4) return;
+
+    // Optional leading if (...) return false / !1 guards (e.g. hipaa).
+    for (let i = 0; i < stmts.length - 1; i++) {
+        const stmt = stmts[i];
+        if (stmt.type !== 'IfStatement') return;
+        if (stmt.alternate) return;
+        if (!isFalseyReturn(stmt.consequent?.type === 'BlockStatement'
+            ? stmt.consequent.body?.[0]
+            : stmt.consequent)) return;
+    }
+
+    const ret = stmts[stmts.length - 1];
     if (ret.type !== 'ReturnStatement') return;
-    const arg = ret.argument;
-    if (arg?.type !== 'LogicalExpression' || arg.operator !== '&&') return;
-    if (arg.left?.type !== 'CallExpression' || arg.left.callee?.type !== 'Identifier') return;
-    if (arg.right?.type !== 'MemberExpression') return;
-    if (arg.right.object?.type !== 'CallExpression' || arg.right.object.callee?.type !== 'Identifier') return;
-    if (arg.right.property?.name !== 'enabled') return;
-    // Cross-check: right-side callee must be the s7r-equivalent we found above
-    if (s7rFnName && arg.right.object.callee.name !== s7rFnName) return;
+    const gate = isEnabledGateReturn(ret.argument);
+    if (!gate) return;
 
     fixes.t0n.found = true;
     fixes.t0n.node = node;
-    const t5dName = arg.left.callee.name;
     console.log('FOUND:t0n — ' + node.id?.name + '() at ' + node.start +
-        ' [return ' + t5dName + '()&&' + arg.right.object.callee.name + '().enabled]');
+        ' [stmts=' + stmts.length + ' return ' + gate.subGate + '()&&' + gate.configFn + '().enabled]');
 });
 
 // ============================================================
@@ -3001,19 +3031,17 @@ if (fixes.schema.found && !fixes.schema.patched && fixes.schema.node) {
 
 // --- Patch 2: replace entire t0n FunctionDeclaration ---
 //     Uses dynamically extracted stFn (st-equiv) and ScFn (Sc-equiv)
+//     Preserves the original body (including hipaa early returns) as fallback.
 if (fixes.t0n.found && !fixes.t0n.patched && fixes.t0n.node) {
     const fn = fixes.t0n.node;
     const fnName = fn.id.name;
-    // Recover t5d/s7r callee names from original AST node
-    const ret = fn.body.body[0].argument;
-    const t5dName = ret.left.callee.name;
-    const s7rName = ret.right.object.callee.name;
+    const originalBody = src(fn.body).replace(/^\{/, '').replace(/\}$/, '');
     const replacement =
         'function ' + fnName + '(){' +
             'if(' + stFn + '(process.env.CLAUDE_CODE_COMPUTER_USE))return!0;' +
             'var _cu=' + ScFn + '("computerUseEnabled",void 0);' +
             'if(_cu.source!=="default")return!!_cu.value;' +
-            'return ' + t5dName + '()&&' + s7rName + '().enabled' +
+            originalBody +
         '}';
     replacements.push({
         start: fn.start,
@@ -3022,7 +3050,7 @@ if (fixes.t0n.found && !fixes.t0n.patched && fixes.t0n.node) {
         name: 't0n'
     });
     fixes.t0n.patched = true;
-    console.log('PATCH:t0n — env(' + stFn + ') → settings(' + ScFn + ') → original 3-tier gate');
+    console.log('PATCH:t0n — env(' + stFn + ') → settings(' + ScFn + ') → original body fallback');
 }
 
 // --- Patch 4: replace entire s7r FunctionDeclaration ---
