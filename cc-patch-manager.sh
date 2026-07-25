@@ -3462,48 +3462,63 @@ show_detail() {
   done
 }
 
-# 一键应用全部未应用补丁（已应用跳过）
+# 一键应用结束后的汇总：信任 apply 写入的 STATUS/MSG，不再 refresh_all
+# 分类：applied +「已打补丁」→ 跳过；其它 applied → 成功；其余 → 失败
+print_apply_all_summary() {
+  local id st msg n_ok=0 n_skip=0 n_fail=0
+  for id in "${PATCH_IDS[@]}"; do
+    st="${STATUS[$id]:-}"
+    msg="${MSG[$id]:-}"
+    if [[ "$st" == "applied" && "$msg" == "已打补丁" ]]; then
+      n_skip=$((n_skip + 1))
+    elif [[ "$st" == "applied" ]]; then
+      n_ok=$((n_ok + 1))
+    else
+      n_fail=$((n_fail + 1))
+    fi
+  done
+  success "一键应用结束：${n_ok} 成功 · ${n_skip} 跳过 · ${n_fail} 失败"
+  for id in "${PATCH_IDS[@]}"; do
+    st="${STATUS[$id]:-}"
+    msg="${MSG[$id]:-}"
+    if [[ "$st" == "applied" && "$msg" == "已打补丁" ]]; then
+      printf '  %s✓%s %s  %s\n' "$GREEN" "$NC" "$(patch_name "$id")" "$msg"
+    elif [[ "$st" == "applied" ]]; then
+      printf '  %s✓%s %s  %s\n' "$GREEN" "$NC" "$(patch_name "$id")" "$msg"
+    else
+      printf '  %s!%s %s  %s\n' "$RED" "$NC" "$(patch_name "$id")" "${msg:-未知错误}"
+    fi
+  done
+}
+
+# 一键应用全部补丁（极速路径：不预检、不复检；引擎幂等跳过已应用）
 apply_all_patches() {
-  local id ans need=() n
+  local id ans n
   if ! require_target_writable; then
     error "目标不存在或不可写"
     return 1
   fi
-  # 若尚未检测，先快速检测
-  if [[ $(count_status applied) -eq 0 && $(count_status idle) -eq 0 && $(count_status error) -eq 0 ]]; then
-    info "尚未检测，先刷新状态..."
-    refresh_all
-  fi
+
+  n=${#PATCH_IDS[@]}
+  printf '\n即将【一键应用】全部 %s 个补丁:\n' "$n"
   for id in "${PATCH_IDS[@]}"; do
-    case "${STATUS[$id]:-}" in
-      applied) ;;
-      *) need+=("$id") ;;
-    esac
-  done
-  n=${#need[@]}
-  if [[ "$n" -eq 0 ]]; then
-    success "全部补丁均已应用，无需操作"
-    return 0
-  fi
-  printf '\n即将【一键应用】以下 %s 个补丁:\n' "$n"
-  for id in "${need[@]}"; do
-    printf '  · %s  (当前: ' "$(patch_name "$id")"
-    status_label "${STATUS[$id]:-unknown}"
-    printf ')\n'
+    printf '  · %s\n' "$(patch_name "$id")"
   done
   printf '目标:  %s\n' "$CLI_PATH"
   if has_baseline; then
     printf '备份:  已有，本次不另存\n'
   else
-    printf '备份:  尚无 — 应用前将自动备份当前 cli.js\n'
+    printf '备份:  尚无 — 首次成功写入前自动建 baseline\n'
   fi
+  printf '说明:  已应用的补丁会自动跳过，无需先按 [r] 检测\n'
   printf '\n确认执行？ [Y/n] '
   read -r ans || true
   if [[ -n "$ans" && "$ans" != "y" && "$ans" != "Y" ]]; then
     info "已取消"
     return 0
   fi
-  for id in "${need[@]}"; do
+
+  for id in "${PATCH_IDS[@]}"; do
     info "应用: $(patch_name "$id")..."
     if run_node_patch "$id" apply; then
       success "  → ${MSG[$id]}"
@@ -3511,8 +3526,8 @@ apply_all_patches() {
       error "  → 失败: ${MSG[$id]:-}"
     fi
   done
-  info "正在复检全部补丁..."
-  refresh_all
+
+  print_apply_all_summary
   warning "请重启 Claude Code 使更改生效"
 }
 
