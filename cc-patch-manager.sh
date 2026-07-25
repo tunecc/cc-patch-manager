@@ -1066,8 +1066,12 @@ const oQqCandidatesLegacy = allFuncDecls.filter(fn => {
     return true;
 });
 
-// Shape B: 2.1.204+ TBe(e) flat model denylist
-// function TBe(e){let t=lo(e),r=wn();if(!Z6t(r))return!1;if(t.includes("claude-3-")||...)return!1;...;return!0}
+// Shape B: 2.1.204+ flat model denylist (TBe / w6e-style)
+// 2.1.204 example:
+//   function TBe(e){let t=lo(e),r=wn();if(!Z6t(r))return!1;if(t.includes("claude-3-")||...)return!1;...;return!0}
+// 2.1.213 example (no anthropicAws token in body; still firstParty + denylist):
+//   function w6e(e){let t=so(e),r=En();if(!D7t(r))return!1;if(t.includes("claude-3-")||...)return!1;if(r!=="firstParty"&&...)return!1;return!0}
+// Call sites: supportsAutoMode / verifyAutoModeGateAccess.modelSupported
 const oQqCandidatesFlat = allFuncDecls.filter(fn => {
     const body = fn.body;
     if (body.type !== 'BlockStatement') return false;
@@ -1085,10 +1089,10 @@ const oQqCandidatesFlat = allFuncDecls.filter(fn => {
     if (rets1.length < 2) return false;
 
     const bodySrc = code.slice(fn.body.start, fn.body.end);
-    // Must look like the auto-mode model denylist + provider gate (TBe in 2.1.204)
+    // Must look like the auto-mode model denylist + provider gate.
+    // anthropicAws is optional: present in 2.1.204 TBe, absent in 2.1.213 w6e.
     if (!bodySrc.includes('claude-3-')) return false;
     if (!bodySrc.includes('firstParty')) return false;
-    if (!bodySrc.includes('anthropicAws')) return false;
     if (!bodySrc.includes('claude-opus-4-') && !bodySrc.includes('claude-sonnet-4-')) return false;
     return true;
 });
