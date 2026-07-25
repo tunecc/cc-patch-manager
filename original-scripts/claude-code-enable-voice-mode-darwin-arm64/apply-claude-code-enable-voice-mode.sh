@@ -382,7 +382,8 @@ function collectPropNames(node, out = new Set()) {
 // --- Gate 1: voice UI gate (name-agnostic) ---
 // Pattern A: get isHidden(){ return !Gate() } near voice command object
 //   (argumentHint hold|tap|off, availability claude-ai, isEnabled)
-// Gate function body: return A() && B() && C()  (exactly 3 zero-arg calls)
+// Gate function body historically: return A() && B() && C()  (exactly 3 zero-arg calls)
+// Claude Code 2.1.217+: return AuthProbe() && FeatureFlag()  (2 zero-arg calls; Wpr-style)
 {
   const getters = findNodes(
     ast,
@@ -436,20 +437,23 @@ function collectPropNames(node, out = new Set()) {
     const calls = parts.filter(
       (p) => p.type === 'CallExpression' && isId(p.callee) && (!p.arguments || p.arguments.length === 0),
     );
-    if (calls.length === 3) {
+    // 2-call (2.1.217 Wpr) or legacy 3-call gate
+    if (calls.length === 2 || calls.length === 3) {
       fixes.voiceGateVmr.found = true;
       fixes.voiceGateVmr.node = gateFn;
       fixes.voiceGateVmr.name = gateName;
       console.log(
         'FOUND:voiceGateVmr -> AST ' +
           gateName +
-          '() 3-call &&-chain via isHidden near voice',
+          '() ' +
+          calls.length +
+          '-call &&-chain via isHidden near voice',
       );
       break;
     }
   }
-  // Pattern B fallback: any 0-arg FunctionDeclaration return X()&&Y()&&Z() where
-  // one callee's body contains Literal "allow_voice_mode" (c1o/kxo pattern)
+  // Pattern B fallback: any 0-arg FunctionDeclaration return X()&&Y()[&&Z()] where
+  // one callee's body contains Literal "allow_voice_mode" (c1o/kxo / qDo pattern)
   if (!fixes.voiceGateVmr.found) {
     const fns = findNodes(
       ast,
@@ -463,8 +467,8 @@ function collectPropNames(node, out = new Set()) {
         (p) =>
           p.type === 'CallExpression' && isId(p.callee) && (!p.arguments || p.arguments.length === 0),
       );
-      if (calls.length !== 3) continue;
-      // one of the three should resolve to allow_voice_mode feature check
+      if (calls.length !== 2 && calls.length !== 3) continue;
+      // one of the callees should resolve to allow_voice_mode feature check
       let hasAllowVoice = false;
       for (const c of calls) {
         const callees = findNodes(
@@ -486,7 +490,9 @@ function collectPropNames(node, out = new Set()) {
         console.log(
           'FOUND:voiceGateVmr -> AST ' +
             fn.id.name +
-            '() 3-call chain + allow_voice_mode callee',
+            '() ' +
+            calls.length +
+            '-call chain + allow_voice_mode callee',
         );
         break;
       }
