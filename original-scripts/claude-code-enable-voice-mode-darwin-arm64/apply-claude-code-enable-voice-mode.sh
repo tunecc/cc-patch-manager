@@ -15,6 +15,8 @@
 #
 # FIX POINTS (all pure AST; names renamable):
 # 1) Voice UI gate Gate() used by get isHidden(){return!Gate()} near name:"voice"
+#      Gate body: return A()&&B()&&C()  (pre-2.1.212, 3-call)
+#               or return A()&&B()      (2.1.212+, e.g. Jyr = wUo && CUo)
 # 2) isVoiceStreamAvailable target (accessToken body)
 # 3) name:"voice" availability:["claude-ai"] → void 0 (empty arrays are still rejected)
 # 4) Add Voice mode (off / hold / tap) to the main /config settings array
@@ -382,9 +384,22 @@ function collectPropNames(node, out = new Set()) {
 // --- Gate 1: voice UI gate (name-agnostic) ---
 // Pattern A: get isHidden(){ return !Gate() } near voice command object
 //   (argumentHint hold|tap|off, availability claude-ai, isEnabled)
-// Gate function body historically: return A() && B() && C()  (exactly 3 zero-arg calls)
-// Claude Code 2.1.217+: return AuthProbe() && FeatureFlag()  (2 zero-arg calls; Wpr-style)
+// Gate function body:
+//   pre-2.1.212: return A() && B() && C()   (3 zero-arg calls)
+//   2.1.212+:    return A() && B()          (2 zero-arg calls, e.g. Jyr=wUo&&CUo)
 {
+  // Accept 2-call (2.1.212+) and 3-call (older) AND-chains of zero-arg calls.
+  function isVoiceGateAndChain(retArg) {
+    const parts = collectAnd(retArg);
+    const calls = parts.filter(
+      (p) => p.type === 'CallExpression' && isId(p.callee) && (!p.arguments || p.arguments.length === 0),
+    );
+    // every leaf must be a zero-arg call; length 2 or 3
+    if (calls.length !== parts.length) return null;
+    if (calls.length !== 2 && calls.length !== 3) return null;
+    return calls;
+  }
+
   const getters = findNodes(
     ast,
     (n) =>
@@ -433,12 +448,8 @@ function collectPropNames(node, out = new Set()) {
       console.log('FOUND:voiceGateVmr -> already patched ' + gateName);
       break;
     }
-    const parts = collectAnd(body[0].argument);
-    const calls = parts.filter(
-      (p) => p.type === 'CallExpression' && isId(p.callee) && (!p.arguments || p.arguments.length === 0),
-    );
-    // 2-call (2.1.217 Wpr) or legacy 3-call gate
-    if (calls.length === 2 || calls.length === 3) {
+    const calls = isVoiceGateAndChain(body[0].argument);
+    if (calls) {
       fixes.voiceGateVmr.found = true;
       fixes.voiceGateVmr.node = gateFn;
       fixes.voiceGateVmr.name = gateName;
@@ -452,8 +463,8 @@ function collectPropNames(node, out = new Set()) {
       break;
     }
   }
-  // Pattern B fallback: any 0-arg FunctionDeclaration return X()&&Y()[&&Z()] where
-  // one callee's body contains Literal "allow_voice_mode" (c1o/kxo / qDo pattern)
+  // Pattern B fallback: 0-arg FunctionDeclaration return A()&&B()[&&C()] where
+  // one callee's body contains Literal "allow_voice_mode" (CUo/kxo pattern)
   if (!fixes.voiceGateVmr.found) {
     const fns = findNodes(
       ast,
@@ -462,13 +473,9 @@ function collectPropNames(node, out = new Set()) {
     for (const fn of fns) {
       const body = fn.body && fn.body.body;
       if (!body || body.length !== 1 || body[0].type !== 'ReturnStatement') continue;
-      const parts = collectAnd(body[0].argument);
-      const calls = parts.filter(
-        (p) =>
-          p.type === 'CallExpression' && isId(p.callee) && (!p.arguments || p.arguments.length === 0),
-      );
-      if (calls.length !== 2 && calls.length !== 3) continue;
-      // one of the callees should resolve to allow_voice_mode feature check
+      const calls = isVoiceGateAndChain(body[0].argument);
+      if (!calls) continue;
+      // one of the AND leaves should resolve to allow_voice_mode feature check
       let hasAllowVoice = false;
       for (const c of calls) {
         const callees = findNodes(
