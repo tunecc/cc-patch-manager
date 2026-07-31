@@ -92,10 +92,11 @@ assert_voice_check() {
 assert_voice_check "$tmp/voice-2call.js" "FOUND:voiceGateVmr"
 assert_voice_check "$tmp/voice-3call.js" "FOUND:voiceGateVmr"
 
-# Source engine must document 2-call support and not hard-require exactly 3 calls only.
+# Upstream engine must expose isVoiceGateAndChain and accept 2- or 3-call zero-arg AND gates.
 engine=$(write_patch_script voice-mode)
-grep -Fq 'calls.length === 2' "$engine" || grep -Eq 'calls\.length (===|==) 2|calls\.length >= 2' "$engine" || fail "engine must accept 2-call voice gates"
-if grep -Fq 'if (calls.length === 3)' "$engine" && ! grep -Eq 'calls\.length === 2|calls\.length >= 2|calls\.length == 2' "$engine"; then
+grep -Fq 'function isVoiceGateAndChain' "$engine" || fail "engine must define isVoiceGateAndChain"
+grep -Fq 'calls.length !== 2 && calls.length !== 3' "$engine" || fail "engine must accept 2-call and 3-call voice gates via isVoiceGateAndChain"
+if grep -Fq 'if (calls.length === 3)' "$engine" && ! grep -Fq 'isVoiceGateAndChain' "$engine"; then
   fail "engine still only accepts exactly 3-call voice gates"
 fi
 rm -f "$engine"
