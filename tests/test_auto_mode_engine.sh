@@ -75,4 +75,59 @@ assert_detector "$tmp/legacy.js" "FOUND:using legacy nested-block model eligibil
 assert_detector "$tmp/flat.js" "FOUND:using flat TBe-style model eligibility detector"
 assert_detector "$tmp/flat-no-aws.js" "FOUND:using flat TBe-style model eligibility detector"
 
+# Claude Code 2.1.224 emits two "classifier unavailable" anchors, but only the
+# "denying with retry guidance" path is fail-closed (behavior:"deny"). The sibling
+# "falling back to the question dialog" path returns the question-dialog object with
+# no behavior property. The engine must patch only the deny object — patching the
+# wrong comma (the old +300-char heuristic reached the NEXT function's deny objects)
+# corrupted the file. This locks the structural ReturnStatement/SequenceExpression
+# decision-object lookup.
+cat >"$tmp/failclosed.js" <<'JS'
+function so(e){return e}
+function En(){return "firstParty"}
+function D7t(r){return true}
+function w6e(e){let t=so(e),r=En();if(!D7t(r))return!1;if(t.includes("claude-3-")||t==="claude-opus-4-0"||t==="claude-sonnet-4-0")return!1;if(r!=="firstParty")return!1;return!0}
+function E(m,o){return m}
+function L(n,o){return n}
+function run(U,H,a){
+  if(U.unavailable){
+    if(H)return E("Auto mode classifier unavailable for AskUserQuestion, falling back to the question dialog",{level:"warn"}),L("tengu_auto_mode_fallback_to_ask",{reason:"x"}),a;
+    return E("Auto mode classifier unavailable, denying with retry guidance (fail closed)",{level:"warn"}),{behavior:"deny",decisionReason:{type:"classifier",classifier:"auto-mode",reason:"l1t"},message:"m"}
+  }
+  return w6e("model")
+}
+JS
+
+generated=$(write_patch_script auto-mode)
+set +e
+CC_PATCH_SKIP_BACKUP=1 CC_PATCH_BASELINE="$tmp/failclosed.js.cc-patch-baseline" \
+  node "$generated" "$ACORN_PATH" "$tmp/failclosed.js" >/tmp/failclosed-out.txt 2>&1
+ec=$?
+set -e
+rm -f "$generated"
+
+[[ $ec -eq 0 ]] || fail "fail-closed apply must exit 0 (output: $(cat /tmp/failclosed-out.txt))"
+[[ "$(grep -c 'behavior:"deny"' "$tmp/failclosed.js")" -eq 0 ]] || \
+  fail "fail-closed apply must convert the deny object to ask"
+grep -Fq 'behavior:"ask"' "$tmp/failclosed.js" || fail "fail-closed apply must insert ask"
+grep -Fq 'falling back to the question dialog' "$tmp/failclosed.js" || \
+  fail "fail-closed apply must preserve the fall-back path"
+node - "$ACORN_PATH" "$tmp/failclosed.js" <<'NODE' || fail "fail-closed patched file must parse"
+const fs = require('fs');
+const acorn = require(process.argv[2]);
+const code = fs.readFileSync(process.argv[3], 'utf8');
+acorn.parse(code, { ecmaVersion: 'latest', sourceType: 'module' });
+NODE
+
+# Recheck: model gate + deny both handled, classifier model absent → ALREADY_PATCHED.
+generated=$(write_patch_script auto-mode)
+set +e
+node "$generated" "$ACORN_PATH" "$tmp/failclosed.js" --check >/tmp/failclosed-recheck.txt 2>&1
+ec=$?
+set -e
+rm -f "$generated"
+[[ "$(cat /tmp/failclosed-recheck.txt)" == *"ALREADY_PATCHED"* ]] || \
+  fail "fail-closed recheck must report ALREADY_PATCHED (output: $(cat /tmp/failclosed-recheck.txt))"
+
 printf 'PASS: auto-mode retains legacy and flat model-gate detectors\n'
+printf 'PASS: auto-mode patches only the fail-closed deny path, never the fall-back\n'

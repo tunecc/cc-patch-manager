@@ -1025,6 +1025,20 @@ function replaceAt(str, s, e, repl) {
     return str.slice(0, s) + repl + str.slice(e);
 }
 
+// Find the nearest enclosing ReturnStatement for a node. acorn nodes do not
+// carry parent pointers, so we collect every ReturnStatement and pick the
+// innermost one whose [start,end) range contains the target.
+function findEnclosingReturn(ast, target) {
+    const all = findNodes(ast, n => n.type === 'ReturnStatement');
+    let best = null;
+    for (const r of all) {
+        if (r.start <= target.start && target.end <= r.end) {
+            if (!best || r.start > best.start) best = r;
+        }
+    }
+    return best;
+}
+
 // Collect all replacements; apply from end to start to preserve offsets
 let replacements = [];
 let patchCount = 0;
@@ -1203,66 +1217,74 @@ if (code.includes(UNAVAIL_ANCHOR)) {
 
     console.log('FOUND:' + anchorLiterals.length + ' "classifier unavailable" anchor(s)');
 
-    // Walk up: the anchor is inside a CallExpression (T("Auto mode...", {level:"warn"}))
-    // which is part of a SequenceExpression (comma operator): T(...), {behavior:"deny",...}
-    // which is the argument of a ReturnStatement.
-    // We need to find the ObjectExpression with behavior:"deny" near the anchor.
-
-    // Search for ObjectExpression nodes with behavior:"deny" that are close to the anchor
-    // (within ~300 chars in source position)
+    // Find the behavior:{deny|ask} decision object paired with each unavailable anchor.
+    //
+    // An anchor lives inside the leading log call of a ReturnStatement whose
+    // argument is a SequenceExpression (comma operator):
+    //   return T("Auto mode classifier unavailable, ...",{level:"warn"}),{behavior:"deny",...}
+    // The fail-closed object is the SequenceExpression's LAST expression. Locating it
+    // structurally (not by a fixed char window) avoids the brittle +300 offset that, on
+    // recent builds, reached the NEXT function's deny objects and rewrote the wrong commas
+    // — corrupting the file. Some anchors share the same decision object (the fall-back
+    // path returns the question-dialog object `a` instead, with no behavior property);
+    // those are skipped, and a dedup set guards against double-patching a shared object.
     let failClosedPatched = 0;
+    const denyMarked = new Set();  // behavior value offsets already converted
     for (const anchor of anchorLiterals) {
-        // Find all behavior:"deny" ObjectExpressions after the anchor (within 300 chars)
-        const denyObjects = findNodes(ast, n =>
-            n.type === 'ObjectExpression' &&
-            n.start > anchor.start &&
-            n.start < anchor.end + 300 &&
-            n.properties && n.properties.some(p =>
-                p.key && (p.key.name === 'behavior' || p.key.value === 'behavior') &&
-                p.value && p.value.type === 'Literal' && p.value.value === 'deny'
-            )
-        );
-
-        if (denyObjects.length === 0) {
-            // Check if already patched to "ask"
-            const askObjects = findNodes(ast, n =>
-                n.type === 'ObjectExpression' &&
-                n.start > anchor.start &&
-                n.start < anchor.end + 300 &&
-                n.properties && n.properties.some(p =>
-                    p.key && (p.key.name === 'behavior' || p.key.value === 'behavior') &&
-                    p.value && p.value.type === 'Literal' && p.value.value === 'ask'
-                )
-            );
-            if (askObjects.length > 0) {
-                console.log('FOUND:classifier unavailable already patched to behavior:"ask"');
-                failClosedPatched++;
-                continue;
-            }
-            console.log('FOUND:no behavior:"deny" found near anchor at offset ' + anchor.start);
+        const ret = findEnclosingReturn(ast, anchor);
+        if (!ret) {
+            console.log('FOUND:no ReturnStatement wrapping anchor at offset ' + anchor.start);
             continue;
         }
-
-        // Patch the first matching deny → ask
-        const denyObj = denyObjects[0];
-        const behaviorProp = denyObj.properties.find(p =>
-            (p.key.name === 'behavior' || p.key.value === 'behavior') &&
-            p.value.type === 'Literal' && p.value.value === 'deny'
-        );
-
+        // Decision object: last expr of a SequenceExpression, else the return arg itself.
+        let decObj = null;
+        const arg = ret.argument;
+        if (arg?.type === 'SequenceExpression') {
+            const exprs = arg.expressions;
+            decObj = exprs[exprs.length - 1];
+        } else if (arg?.type === 'ObjectExpression') {
+            decObj = arg;
+        }
+        if (!decObj || decObj.type !== 'ObjectExpression' ||
+            !decObj.properties || decObj.properties.length === 0) {
+            console.log('FOUND:no decision object in the unavailable ReturnStatement near offset ' + anchor.start);
+            continue;
+        }
+        const behaviorProp = decObj.properties.find(p =>
+            p.key && (p.key.name === 'behavior' || p.key.value === 'behavior'));
+        if (!behaviorProp) {
+            // Fall-back path: returns the question-dialog object (no behavior prop) — not fail-closed.
+            console.log('FOUND:decision object has no behavior property near offset ' + anchor.start);
+            continue;
+        }
+        const bv = behaviorProp.value;
+        if (bv?.type === 'Literal' && bv.value === 'ask') {
+            console.log('FOUND:classifier unavailable already patched to behavior:"ask" (anchor ' + anchor.start + ')');
+            failClosedPatched++;
+            continue;
+        }
+        if (bv?.type !== 'Literal' || bv.value !== 'deny') {
+            console.log('FOUND:decision behavior is not "deny" near offset ' + anchor.start +
+                ' (got ' + (bv ? src(bv) : 'none') + ') — skipping');
+            continue;
+        }
+        if (denyMarked.has(bv.start)) {
+            // Same object co-referenced by multiple anchors — already handled.
+            failClosedPatched++;
+            continue;
+        }
+        denyMarked.add(bv.start);
         replacements.push({
-            start: behaviorProp.value.start,
-            end: behaviorProp.value.end,
+            start: bv.start,
+            end: bv.end,
             replacement: '"ask"',
-            label: 'classifier unavailable: behavior:"deny" → behavior:"ask" (near offset ' + anchor.start + ')'
+            label: 'classifier unavailable: behavior:"deny" → behavior:"ask" (anchor ' + anchor.start + ')'
         });
         patchCount++;
         failClosedPatched++;
     }
 
-    if (failClosedPatched === anchorLiterals.length) {
-        // All anchors handled
-    } else {
+    if (failClosedPatched < anchorLiterals.length) {
         console.log('FOUND:patched ' + failClosedPatched + '/' + anchorLiterals.length + ' unavailable sites');
     }
 } else if (code.includes('tengu_iron_gate_closed')) {
@@ -1468,15 +1490,24 @@ if (!ironGatePatched) {
             n.value.includes(UNAVAIL_ANCHOR)
         );
         for (const anchor of anchorLiterals) {
-            const stillDeny = findNodes(newAst, n =>
-                n.type === 'ObjectExpression' &&
-                n.start > anchor.start && n.start < anchor.end + 300 &&
-                n.properties && n.properties.some(p =>
-                    (p.key.name === 'behavior' || p.key.value === 'behavior') &&
-                    p.value && p.value.type === 'Literal' && p.value.value === 'deny'
-                )
-            );
-            if (stillDeny.length > 0) {
+            // Reuse the same structural decision-object lookup as the patcher so the
+            // check matches what was actually patched, not every behavior:"deny" in a
+            // 300-char window (some belong to unrelated fall-back paths).
+            const ret = findEnclosingReturn(newAst, anchor);
+            if (!ret) continue;
+            let decObj = null;
+            const arg = ret.argument;
+            if (arg?.type === 'SequenceExpression') {
+                const exprs = arg.expressions;
+                decObj = exprs[exprs.length - 1];
+            } else if (arg?.type === 'ObjectExpression') {
+                decObj = arg;
+            }
+            if (!decObj || decObj.type !== 'ObjectExpression') continue;
+            const bp = decObj.properties.find(p =>
+                p.key && (p.key.name === 'behavior' || p.key.value === 'behavior'));
+            if (!bp) continue;  // fall-back path: no behavior property
+            if (bp.value?.type === 'Literal' && bp.value.value === 'deny') {
                 console.error('VERIFY_FAILED:classifier unavailable path still has behavior:"deny" after patch');
                 process.exit(1);
             }
@@ -2758,8 +2789,13 @@ let fixes = {
     s7r:    { found: false, patched: false, node: null },
 };
 
-// Dynamically extracted variable/function names (differ across minified versions)
-let zodVar = null;   // Zod builder: b, v, k, ...
+// Settings schema values follow one of two Zod conventions; resolve the
+// builders dynamically so the inserted computerUse* properties reuse the
+// exact builders the build trusts. See resolveZodBuilders() in the schema walk.
+let zodDirect = false;  // direct ZodRoot form (z.boolean()) vs wrapped factories (Lt())
+let zodBool = null;   // boolean builder ref  (z | Lt)
+let zodObj  = null;   // object  builder ref  (z | Te)
+let zodEnum = null;   // enum    builder ref  (z | xr)
 let stFn = null;     // truthy env-var parser: st, A6, ...
 let ScFn = null;     // settings reader: Sc, K4, ...
 
@@ -2799,52 +2835,98 @@ if (!stFn || !ScFn) {
 }
 
 // ============================================================
-// Helper: extract Zod root variable from a CallExpression chain
-//   e.g. b.boolean().optional().describe(...)
-//   walks callee.object until hitting an Identifier → returns its name
+// Helper: unwrap a Zod chain to its leftmost node.
+//   A schema Property value may be wrapped in a SequenceExpression — e.g.
+//   `(0,Lt().boolean().optional().describe(...))` — or a ParenthesizedExpression.
+//   unwrapZodExpr() peels those wrappers so the chain itself is visible.
+//
+// chainRoot() then walks the CallExpression chain (Lt().optional().describe())
+// leftward until it reaches the node that reveals the convention:
+//   - Identifier            → direct ZodRoot form (z.boolean()): one builder for all types
+//   - CallExpression(callee=Identifier) → wrapped factory form (Lt()): one factory per type
 // ============================================================
-function extractZodVar(callExpr) {
-    let cur = callExpr;
-    while (cur?.type === 'CallExpression' && cur.callee?.type === 'MemberExpression') {
-        cur = cur.callee.object;
+function unwrapZodExpr(expr) {
+    let cur = expr;
+    while (cur) {
+        if (cur.type === 'SequenceExpression') {
+            cur = cur.expressions?.[cur.expressions.length - 1] || null;
+            continue;
+        }
+        if (cur.type === 'ParenthesizedExpression') {
+            cur = cur.expression;
+            continue;
+        }
+        break;
     }
-    return cur?.type === 'Identifier' ? cur.name : null;
+    return cur;
+}
+
+function chainRoot(expr) {
+    let cur = unwrapZodExpr(expr);
+    while (cur?.type === 'CallExpression' && cur.callee?.type === 'MemberExpression') {
+        cur = unwrapZodExpr(cur.callee.object);
+    }
+    return cur;
 }
 
 // ============================================================
 // Patch 1 — Locate autoCompactEnabled Property in settings schema
 //
-// AST shape:
-//   Property {
-//     key: Identifier { name: "autoCompactEnabled" },
-//     value: CallExpression  (the <zod>.boolean().optional().describe(...) chain)
-//   }
-//   inside an ObjectExpression with 100+ properties (the settings schema)
+// The settings schema is an ObjectExpression with 100+ properties. The
+// autoCompactEnabled Property value is a Zod chain like
+//   z.boolean().optional().describe("...compact conversation...")      (direct)
+//   Lt().optional().describe("...compact conversation...")            (wrapped)
+// possibly wrapped in a SequenceExpression/ParenthesizedExpression.
 //
-// Also extracts the Zod variable name (b, v, k, etc.) from the value chain
+// The chain root determines the builder convention used build-wide; from it
+// we resolve boolean/object/enum builder references for the insertion below.
 // ============================================================
 walk(ast, (node, parent) => {
     if (fixes.schema.found) return;
     if (node.type !== 'Property') return;
     if (node.key?.type !== 'Identifier' || node.key.name !== 'autoCompactEnabled') return;
-    if (node.value?.type !== 'CallExpression') return;
+    const zodExpr = unwrapZodExpr(node.value);
+    if (zodExpr?.type !== 'CallExpression') return;
     if (parent?.type !== 'ObjectExpression' || parent.properties.length < 50) return;
-    const valSrc = src(node.value);
+    const valSrc = src(zodExpr);
     if (!valSrc.includes('compact conversation')) return;
 
-    // Extract Zod variable name from the value CallExpression chain
-    const extracted = extractZodVar(node.value);
-    if (!extracted) {
-        console.error('NOT_FOUND:Could not extract Zod variable name from autoCompactEnabled value');
+    // Resolve Zod builder convention from autoCompactEnabled's chain root.
+    //   direct  : root is an Identifier (a ZodRoot like z/b/v) — one builder
+    //             serves boolean/object/enum via its .boolean()/.object()/.enum() methods.
+    //   wrapped : root is a typed factory CallExpression (e.g. Lt()) — each type has its
+    //             own minified factory, discovered from sibling schema properties below.
+    const root = chainRoot(node.value);
+    if (root?.type === 'Identifier') {
+        zodDirect = true;
+        zodBool = zodObj = zodEnum = root.name;
+    } else if (root?.type === 'CallExpression' && root.callee?.type === 'Identifier') {
+        zodDirect = false;
+        zodBool = root.callee.name;   // boolean factory from autoCompactEnabled's chain
+        // Discover object/enum factories by shape from the live schema so the inserted
+        // computerUse* properties reuse the exact builders the build trusts.
+        for (const p of parent.properties) {
+            if (p.type !== 'Property' || !p.value) continue;
+            const r = chainRoot(p.value);
+            if (r?.type !== 'CallExpression' || r.callee?.type !== 'Identifier') continue;
+            const a0 = r.arguments?.[0];
+            if (!zodObj  && a0?.type === 'ObjectExpression') zodObj  = r.callee.name;
+            if (!zodEnum && a0?.type === 'ArrayExpression')  zodEnum = r.callee.name;
+            if (zodObj && zodEnum) break;
+        }
+    }
+    if (!zodBool || (!zodDirect && (!zodObj || !zodEnum))) {
+        console.error('NOT_FOUND:Could not resolve Zod builder(s) from autoCompactEnabled value (bool=' +
+            zodBool + ', obj=' + zodObj + ', enum=' + zodEnum + ')');
         process.exit(1);
     }
-    zodVar = extracted;
 
     fixes.schema.found = true;
     fixes.schema.node = node;
     fixes.schema.parentNode = parent;
     console.log('FOUND:schema — Property[autoCompactEnabled] at ' + node.start +
-        ' (parent ObjectExpression has ' + parent.properties.length + ' props, zod=' + zodVar + ')');
+        ' (parent ObjectExpression has ' + parent.properties.length + ' props, ' +
+        (zodDirect ? ('direct zod=' + zodBool) : ('wrapped bool=' + zodBool + '()/obj=' + zodObj + '()/enum=' + zodEnum + '()')) + ')');
 });
 
 // ============================================================
@@ -3006,22 +3088,33 @@ let replacements = [];
 
 // --- Patch 1: insert after autoCompactEnabled Property.end ---
 if (fixes.schema.found && !fixes.schema.patched && fixes.schema.node) {
-    if (!zodVar) {
-        console.error('VERIFY_FAILED:Zod variable name not extracted — cannot generate schema insertion');
+    if (!zodBool || (!zodDirect && (!zodObj || !zodEnum))) {
+        console.error('VERIFY_FAILED:Zod builders not resolved — cannot generate schema insertion');
         process.exit(1);
     }
-    const z = zodVar;
     const insertAfter = fixes.schema.node.end;
+    // Boolean base: direct → <root>.boolean(); wrapped → <boolFactory>() (already typed).
+    const boolBase = zodDirect ? zodBool + '.boolean()' : zodBool + '()';
     let insertion = '';
     if (!schemaHasEnabled) {
-        insertion += ',computerUseEnabled:' + z + '.boolean().optional().describe("Enable computer use MCP server for desktop control (macOS only, default off)")';
+        insertion += ',computerUseEnabled:' + boolBase + '.optional().describe("Enable computer use MCP server for desktop control (macOS only, default off)")';
     }
     if (!schemaHasConfig) {
-        insertion += ',computerUseConfig:' + z + '.object({mouseAnimation:' + z + '.boolean().optional(),' +
-            'hideBeforeAction:' + z + '.boolean().optional(),' +
-            'clipboardGuard:' + z + '.boolean().optional(),' +
-            'coordinateMode:' + z + '.enum(["pixels","normalized_0_100"]).optional()' +
-            '}).optional().describe("Computer use sub-configuration overrides")';
+        if (zodDirect) {
+            insertion += ',computerUseConfig:' + zodObj + '.object({mouseAnimation:' + zodObj + '.boolean().optional(),' +
+                'hideBeforeAction:' + zodObj + '.boolean().optional(),' +
+                'clipboardGuard:' + zodObj + '.boolean().optional(),' +
+                'coordinateMode:' + zodObj + '.enum(["pixels","normalized_0_100"]).optional()' +
+                '}).optional().describe("Computer use sub-configuration overrides")';
+        } else {
+            // Wrapped: each field uses its typed factory directly (Lt()/xr()); the object
+            // factory takes the shape as its first argument (Te({...})).
+            insertion += ',computerUseConfig:' + zodObj + '({mouseAnimation:' + zodBool + '().optional(),' +
+                'hideBeforeAction:' + zodBool + '().optional(),' +
+                'clipboardGuard:' + zodBool + '().optional(),' +
+                'coordinateMode:' + zodEnum + '(["pixels","normalized_0_100"]).optional()' +
+                '}).optional().describe("Computer use sub-configuration overrides")';
+        }
     }
     replacements.push({
         start: insertAfter,
@@ -3030,7 +3123,8 @@ if (fixes.schema.found && !fixes.schema.patched && fixes.schema.node) {
         name: 'schema'
     });
     fixes.schema.patched = true;
-    console.log('PATCH:schema — inserted computerUseEnabled + computerUseConfig (zod=' + z + ')');
+    console.log('PATCH:schema — inserted computerUseEnabled + computerUseConfig (' +
+        (zodDirect ? ('direct zod=' + zodBool) : ('wrapped ' + zodBool + '()/' + zodObj + '()/' + zodEnum + '()')) + ')');
 }
 
 // --- Patch 2: replace entire t0n FunctionDeclaration ---
