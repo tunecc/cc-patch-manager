@@ -580,6 +580,8 @@ const command = process.argv[3];
 const requestedEntry = process.argv[4];
 const runtimeArgs = process.argv.slice(5);
 const supportedPackages = new Set(['@cometix/claude-code', '@cometix/anthropic-cc']);
+const astCache = new Map();
+let tracePackageRoot = '';
 
 function fail(message) {
   console.error(`TARGET_ERROR:${JSON.stringify(message)}`);
@@ -607,8 +609,16 @@ function findPackageRoot(entryPath) {
 
 function parseProgram(file, sourceType) {
   const text = fs.readFileSync(file, 'utf8');
+  const cacheKey = `${file}:${sourceType}:${sha256(text)}`;
+  if (astCache.has(cacheKey)) return astCache.get(cacheKey);
   try {
-    return {text, ast: acorn.parse(text, {ecmaVersion: 'latest', sourceType, allowHashBang: true})};
+    const record = {text, ast: acorn.parse(text, {ecmaVersion: 'latest', sourceType, allowHashBang: true})};
+    astCache.set(cacheKey, record);
+    if (process.env.CC_PATCH_TRACE_PARSE === '1') {
+      const display = tracePackageRoot && insideRoot(tracePackageRoot, file) ? path.relative(tracePackageRoot, file) : file;
+      console.log(`PARSE_FILE:${JSON.stringify(display)}:${sourceType}`);
+    }
+    return record;
   } catch (error) {
     fail(`cannot parse ${file} as ${sourceType}: ${error.message}`);
   }
@@ -807,10 +817,24 @@ class ModuleIndex {
   }
 }
 
+function markerGroups(value) {
+  if (!value) fail('marker is required');
+  try {
+    const parsed = JSON.parse(value);
+    if (Array.isArray(parsed) && parsed.every(group => Array.isArray(group) && group.every(marker => typeof marker === 'string'))) {
+      return parsed;
+    }
+  } catch {}
+  return [[value]];
+}
+
 function scanMarkerCandidates(target, marker) {
-  if (!marker) fail('marker is required');
+  const groups = markerGroups(marker);
   return packageModulePaths(target.packageRoot)
-    .filter(relativePath => fs.readFileSync(path.join(target.packageRoot, relativePath), 'utf8').includes(marker));
+    .filter(relativePath => {
+      const text = fs.readFileSync(path.join(target.packageRoot, relativePath), 'utf8');
+      return groups.some(group => group.some(value => text.includes(value)));
+    });
 }
 
 function inspectTarget(entry) {
@@ -824,6 +848,7 @@ function inspectTarget(entry) {
   if (!fs.statSync(entryPath).isFile()) fail(`entry is not a file: ${entryPath}`);
 
   const packageRoot = fs.realpathSync(findPackageRoot(entryPath));
+  tracePackageRoot = packageRoot;
   if (!insideRoot(packageRoot, entryPath)) fail(`entry escapes package root: ${entryPath}`);
   const manifestPath = path.join(packageRoot, 'package.json');
   const manifestText = fs.readFileSync(manifestPath, 'utf8');

@@ -22,7 +22,7 @@ fixture_add_module "$package" node_modules/ignored.js 'export const policy="deny
 fixture_add_module "$package" vendor/cometix-asr/ignored.js 'export const policy="deny"'
 fixture_add_module "$package" .cc-patch-manager-transaction-stale/ignored.js 'export const policy="deny"'
 fixture_add_module "$package" cli.js '#!/usr/bin/env node
-import "./chunks/entry.js"'
+import {policy as entryPolicy} from "./chunks/source.js"'
 
 set +e
 output=$(runtime_exec index "$(fixture_entry "$package")" chunks/entry.js localPolicy deny 2>&1)
@@ -38,6 +38,15 @@ grep -F 'chunks/unrelated.js' <<<"$output" >/dev/null && fail 'unrelated marker 
 if runtime_exec index "$(fixture_entry "$package")" chunks/entry.js fs deny >/dev/null 2>&1; then
   fail 'external bare-import binding was treated as an internal module binding'
 fi
+
+set +e
+trace_output=$(CC_PATCH_TRACE_PARSE=1 runtime_exec index "$(fixture_entry "$package")" cli.js entryPolicy '[["allow","deny"],["missing","deny"]]' 2>&1)
+trace_status=$?
+set -e
+[[ "$trace_status" -eq 0 ]] || fail "marker-group cache probe failed: $trace_output"
+grep -Fx 'TARGET_FILE:"chunks/source.js"' <<<"$trace_output" >/dev/null || fail 'marker group did not select its OR candidate'
+[[ "$(grep -Fc 'PARSE_FILE:"cli.js":module' <<<"$trace_output")" -eq 1 ]] || fail 'entry module AST was not cached by content'
+grep -F 'PARSE_FILE:"chunks/unrelated.js"' <<<"$trace_output" >/dev/null && fail 'unrelated chunk entered AST parsing'
 
 fixture_add_module "$package" chunks/external-reexport.js 'export {externalThing} from "external-package";export * from "another-package";import {policy as internalPolicy} from "./source.js";export{internalPolicy}'
 set +e

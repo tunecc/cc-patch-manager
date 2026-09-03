@@ -198,7 +198,7 @@ git commit -m "feat: index split esm patch candidates"
 
 **Interfaces:** Produces `AnalysisContext.readAst(relativePath, sourceType)` with content-hash cache.
 
-- [ ] **Step 1: 写失败断言**
+- [x] **Step 1: 写失败断言**
 
 ```bash
 out=$(CC_PATCH_TRACE_PARSE=1 runtime_exec check "$(fixture_entry "$tmp/new")" keybindings || true)
@@ -206,13 +206,13 @@ grep -F 'TARGET_FILE:chunks/keymap.js' <<<"$out"
 grep -F 'TARGET_FILE:chunks/unrelated.js' <<<"$out" && fail 'unrelated chunk parsed'
 ```
 
-- [ ] **Step 2: 确认红灯**
+- [x] **Step 2: 确认红灯**
 
 Run: `bash tests/test_module_index.sh`
 
 Expected: FAIL；没有 marker-first 共同分析路径。
 
-- [ ] **Step 3: 实施缓存**
+- [x] **Step 3: 实施缓存**
 
 ```javascript
 readAst(relativePath, sourceType) {
@@ -222,13 +222,13 @@ readAst(relativePath, sourceType) {
 }
 ```
 
-- [ ] **Step 4: 复跑**
+- [x] **Step 4: 复跑**
 
 Run: `bash tests/test_module_index.sh && CC_PATCH_TRACE_PARSE=1 ./cc-patch-manager.sh /opt/homebrew/lib/node_modules/@cometix/anthropic-cc/cli.js --check`
 
 Expected: PASS；真实检查不写入且只报告 marker 命中的模块。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add cc-patch-manager.sh tests/test_module_index.sh
