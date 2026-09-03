@@ -821,20 +821,29 @@ function markerGroups(value) {
   if (!value) fail('marker is required');
   try {
     const parsed = JSON.parse(value);
-    if (Array.isArray(parsed) && parsed.every(group => Array.isArray(group) && group.every(marker => typeof marker === 'string'))) {
+    if (Array.isArray(parsed) && parsed.length > 0 &&
+        parsed.every(group => Array.isArray(group) && group.length > 0 &&
+          group.every(marker => typeof marker === 'string' && marker.length > 0))) {
       return parsed;
     }
+    if (Array.isArray(parsed)) fail('marker groups must be non-empty');
   } catch {}
   return [[value]];
 }
 
-function scanMarkerCandidates(target, marker) {
+function scanMarkerCandidateGroups(target, marker) {
   const groups = markerGroups(marker);
-  return packageModulePaths(target.packageRoot)
-    .filter(relativePath => {
-      const text = fs.readFileSync(path.join(target.packageRoot, relativePath), 'utf8');
-      return groups.some(group => group.some(value => text.includes(value)));
-    });
+  const sources = packageModulePaths(target.packageRoot).map(relativePath => ({
+    relativePath,
+    text: fs.readFileSync(path.join(target.packageRoot, relativePath), 'utf8'),
+  }));
+  return groups.map(group => sources
+    .filter(source => group.some(value => source.text.includes(value)))
+    .map(source => source.relativePath));
+}
+
+function scanMarkerCandidates(target, marker) {
+  return [...new Set(scanMarkerCandidateGroups(target, marker).flat())];
 }
 
 function tokenMatches(text, token, relativePath, state) {
@@ -884,12 +893,26 @@ function analyzeContractFixture(target) {
       file.replacements[0].text += '"';
     }
   }
+  const entryText = fs.readFileSync(target.entryPath, 'utf8');
+  const resources = [...entryText.matchAll(/CC_CONTRACT_RESOURCE:([^\s*]+)/g)]
+    .map(match => ({kind: 'copy', destination: match[1], expectedBefore: 'absent-or-baselined'}));
   return {
     patchId: '__contract__',
     state: states.every(state => state === 'after') ? 'already-patched' : 'needs-patch',
     semanticTargets,
     files: [...files.values()],
-    resources: [],
+    resources,
+    attribution: {
+      transformations: definitions.flatMap((definition, index) =>
+        semanticTargets[index].matches.map(match => ({
+          semanticId: definition.id,
+          relativePath: match.relativePath,
+          start: match.start,
+          state: match.state,
+          before: definition.before,
+          after: definition.after,
+        }))),
+    },
     diagnostics: [],
   };
 }
@@ -951,6 +974,49 @@ function baselineDirectory(target) {
   return path.join(target.packageRoot, '.cc-patch-manager-baseline');
 }
 
+function lstatIfPresent(candidate) {
+  try {
+    return fs.lstatSync(candidate);
+  } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+function assertManagedPathSafe(packageRoot, candidate) {
+  const absolute = path.resolve(candidate);
+  if (!insideRoot(packageRoot, absolute)) throw new Error(`managed path escapes package root: ${candidate}`);
+  const relative = path.relative(packageRoot, absolute);
+  let cursor = packageRoot;
+  for (const part of relative.split(path.sep).filter(Boolean)) {
+    cursor = path.join(cursor, part);
+    const stat = lstatIfPresent(cursor);
+    if (!stat) continue;
+    if (stat.isSymbolicLink()) throw new Error(`managed path contains symlink: ${cursor}`);
+    if (!insideRoot(packageRoot, fs.realpathSync(cursor))) throw new Error(`managed path resolves outside package root: ${cursor}`);
+  }
+  return absolute;
+}
+
+function ensureManagedDirectory(packageRoot, directory) {
+  assertManagedPathSafe(packageRoot, directory);
+  fs.mkdirSync(directory, {recursive: true});
+  assertManagedPathSafe(packageRoot, directory);
+  if (!fs.statSync(directory).isDirectory()) throw new Error(`managed directory is not a directory: ${directory}`);
+}
+
+function writeManagedFileAtomic(packageRoot, destination, bytes, mode) {
+  const directory = path.dirname(destination);
+  ensureManagedDirectory(packageRoot, directory);
+  assertManagedPathSafe(packageRoot, destination);
+  if (lstatIfPresent(destination)) throw new Error(`untracked baseline mirror already exists: ${destination}`);
+  const temporary = path.join(directory, `.write-${process.pid}-${crypto.randomBytes(6).toString('hex')}.tmp`);
+  assertManagedPathSafe(packageRoot, temporary);
+  fs.writeFileSync(temporary, bytes, {mode, flag: 'wx'});
+  fs.renameSync(temporary, destination);
+  assertManagedPathSafe(packageRoot, destination);
+}
+
 function readBaselineManifest(target) {
   const manifestPath = path.join(baselineDirectory(target), 'manifest.json');
   if (!fs.existsSync(manifestPath)) return null;
@@ -963,14 +1029,16 @@ function readBaselineManifest(target) {
 
 function assertBaselineIdentity(manifest, target) {
   const expected = manifest.package || {};
+  const entryPath = path.relative(target.packageRoot, target.entryPath);
   if (expected.name !== target.packageName || expected.version !== target.packageVersion ||
-      expected.layout !== target.layout || expected.identityFingerprint !== target.identityFingerprint) {
+      expected.layout !== target.layout || expected.identityFingerprint !== target.identityFingerprint ||
+      expected.entryPath !== entryPath || !/^[a-f0-9]{64}$/.test(expected.entrySha256 || '') ||
+      manifest.files?.[entryPath]?.sha256 !== expected.entrySha256) {
     throw new Error('stale baseline package identity');
   }
 }
 
-function assertBaselineMirrors(manifest, target) {
-  const root = baselineDirectory(target);
+function assertBaselineMirrors(manifest, target, root = baselineDirectory(target)) {
   for (const [relativePath, item] of Object.entries(manifest.files || {})) {
     if (!item.existed) continue;
     const mirror = packageFile(root, item.mirror);
@@ -979,25 +1047,103 @@ function assertBaselineMirrors(manifest, target) {
   }
 }
 
-function writeManifestAtomic(target, manifest) {
+const knownPatchSentinels = [
+  {patchId: 'auto-mode', value: 'CLAUDE_CLASSIFIER_MODEL'},
+  {patchId: 'keybindings', value: '"ctrl+c":"app:exit"'},
+  {patchId: 'voice-mode', value: 'COMETIX_ASR_'},
+  {patchId: 'voice-mode', value: 'COMETIX_VOICE_'},
+  {patchId: 'voice-mode', value: 'cometix-asr voice adapter'},
+  {patchId: 'context-limit', value: 'CLAUDE_CODE_CONTEXT_LIMIT'},
+  {patchId: 'computer-use', value: 'computerUseEnabled'},
+  {patchId: 'transcript-dialog', value: 'CC_DIALOG_FIX_'},
+];
+
+function findUntrustedPatchSentinel(target) {
+  for (const relativePath of packageModulePaths(target.packageRoot)) {
+    const text = fs.readFileSync(path.join(target.packageRoot, relativePath), 'utf8');
+    for (const sentinel of knownPatchSentinels) {
+      if (text.includes(sentinel.value)) return {...sentinel, relativePath};
+    }
+    const unknown = text.match(/\bCC_[A-Z0-9_]*(?:PATCH|PATCHED)\b/);
+    if (unknown) return {patchId: 'unknown', value: unknown[0], relativePath};
+  }
+  return null;
+}
+
+function normalizeKnownPatchState(text, plan, relativePath) {
+  let normalized = text;
+  const transformations = (plan.attribution?.transformations || [])
+    .filter(transformation => transformation.relativePath === relativePath && transformation.state === 'after')
+    .sort((left, right) => right.start - left.start);
+  let previousStart = text.length;
+  for (const transformation of transformations) {
+    if (!transformation.before || !transformation.after || transformation.before === transformation.after ||
+        !Number.isInteger(transformation.start) || transformation.start < 0 ||
+        transformation.start + transformation.after.length > text.length ||
+        transformation.start + transformation.after.length > previousStart ||
+        text.slice(transformation.start, transformation.start + transformation.after.length) !== transformation.after) {
+      throw new Error(`invalid attribution transformation: ${transformation.semanticId || 'unknown'}`);
+    }
+    normalized = normalized.slice(0, transformation.start) + transformation.before +
+      normalized.slice(transformation.start + transformation.after.length);
+    previousStart = transformation.start;
+  }
+  return normalized;
+}
+
+function assertManagedFilesAttributable(manifest, target, plan) {
   const root = baselineDirectory(target);
-  fs.mkdirSync(root, {recursive: true});
+  for (const [relativePath, item] of Object.entries(manifest.files || {})) {
+    const absolute = path.resolve(target.packageRoot, relativePath);
+    if (!insideRoot(target.packageRoot, absolute) || relativePath.startsWith('..') || path.isAbsolute(relativePath)) {
+      throw new Error(`baseline path escapes package root: ${relativePath}`);
+    }
+    assertManagedPathSafe(target.packageRoot, absolute);
+    const stat = lstatIfPresent(absolute);
+    if (!item.existed) {
+      if (stat) throw new Error(`managed path cannot be attributed to baseline: ${relativePath}`);
+      continue;
+    }
+    if (!stat || !stat.isFile()) throw new Error(`managed file no longer matches baseline: ${relativePath}`);
+    assertManagedPathSafe(target.packageRoot, absolute);
+    const current = fs.readFileSync(absolute);
+    if (sha256(current) === item.sha256) continue;
+    const mirror = fs.readFileSync(packageFile(root, item.mirror));
+    const normalized = normalizeKnownPatchState(current.toString('utf8'), plan, relativePath);
+    if (sha256(Buffer.from(normalized)) !== sha256(mirror)) {
+      throw new Error(`managed file cannot be attributed to baseline or known patch state: ${relativePath}`);
+    }
+  }
+}
+
+function writeManifestAtomic(target, manifest, root = baselineDirectory(target)) {
+  ensureManagedDirectory(target.packageRoot, root);
   const manifestPath = path.join(root, 'manifest.json');
   const temporary = path.join(root, `.manifest-${process.pid}-${crypto.randomBytes(6).toString('hex')}.tmp`);
-  fs.writeFileSync(temporary, `${JSON.stringify(manifest, null, 2)}\n`, {mode: 0o600});
+  assertManagedPathSafe(target.packageRoot, manifestPath);
+  assertManagedPathSafe(target.packageRoot, temporary);
+  fs.writeFileSync(temporary, `${JSON.stringify(manifest, null, 2)}\n`, {mode: 0o600, flag: 'wx'});
   fs.renameSync(temporary, manifestPath);
+  assertManagedPathSafe(target.packageRoot, manifestPath);
   return manifestPath;
 }
 
 function ensureBaselineForPlan(target, plan) {
   let manifest = readBaselineManifest(target);
+  const creating = !manifest;
+  const entryPath = path.relative(target.packageRoot, target.entryPath);
   if (!manifest) {
     const hasManagedState = plan.semanticTargets.some(semanticTarget =>
       semanticTarget.matches.some(match => match.state === 'after'));
     if (hasManagedState) throw new Error('patched or unknown state has no trusted baseline');
+    const sentinel = findUntrustedPatchSentinel(target);
+    if (sentinel) {
+      throw new Error(`untrusted patch sentinel ${sentinel.value} in ${sentinel.relativePath}`);
+    }
     manifest = {
       schemaVersion: 1,
-      package: {name: target.packageName, version: target.packageVersion, layout: target.layout, identityFingerprint: target.identityFingerprint},
+      package: {name: target.packageName, version: target.packageVersion, layout: target.layout,
+        identityFingerprint: target.identityFingerprint, entryPath, entrySha256: null},
       createdAt: new Date().toISOString(),
       managerVersion: '1.0.0',
       files: {},
@@ -1007,23 +1153,69 @@ function ensureBaselineForPlan(target, plan) {
     if (manifest.schemaVersion !== 1) throw new Error(`unsupported baseline schema: ${manifest.schemaVersion}`);
     assertBaselineIdentity(manifest, target);
     assertBaselineMirrors(manifest, target);
+    assertManagedFilesAttributable(manifest, target, plan);
   }
 
-  const root = baselineDirectory(target);
-  for (const file of plan.files) {
-    if (manifest.files[file.relativePath]) continue;
-    const absolute = packageFile(target.packageRoot, file.relativePath);
+  const finalRoot = baselineDirectory(target);
+  let stagingRoot = null;
+  const root = creating
+    ? (stagingRoot = path.join(target.packageRoot, `.cc-patch-manager-baseline.stage-${process.pid}-${crypto.randomBytes(6).toString('hex')}`))
+    : finalRoot;
+  const recordPath = (relativePath, requireExisting) => {
+    if (manifest.files[relativePath]) return;
+    const absolute = path.resolve(target.packageRoot, relativePath);
+    if (!insideRoot(target.packageRoot, absolute) || relativePath.startsWith('..') || path.isAbsolute(relativePath)) {
+      throw new Error(`baseline path escapes package root: ${relativePath}`);
+    }
+    assertManagedPathSafe(target.packageRoot, absolute);
+    const stat = lstatIfPresent(absolute);
+    if (!stat) {
+      if (requireExisting) throw new Error(`managed source does not exist: ${relativePath}`);
+      let parent = path.dirname(relativePath);
+      const missing = [];
+      while (parent && parent !== '.') {
+        const parentAbsolute = path.join(target.packageRoot, parent);
+        if (lstatIfPresent(parentAbsolute)) break;
+        missing.push(parent);
+        parent = path.dirname(parent);
+      }
+      for (const directory of missing.reverse()) {
+        if (!manifest.createdDirectories.includes(directory)) manifest.createdDirectories.push(directory);
+      }
+      manifest.files[relativePath] = {type: 'file', existed: false, sha256: null, mode: null, mirror: null};
+      return;
+    }
+    if (!stat.isFile()) throw new Error(`managed path is not a file: ${relativePath}`);
     const bytes = fs.readFileSync(absolute);
-    const mode = fs.statSync(absolute).mode & 0o777;
-    const mirrorRelative = path.join('files', file.relativePath);
+    const mode = stat.mode & 0o777;
+    const mirrorRelative = path.join('files', relativePath);
     const mirror = path.join(root, mirrorRelative);
-    fs.mkdirSync(path.dirname(mirror), {recursive: true});
-    fs.writeFileSync(mirror, bytes, {mode});
-    manifest.files[file.relativePath] = {type: 'file', existed: true, sha256: sha256(bytes), mode, mirror: mirrorRelative};
+    writeManagedFileAtomic(target.packageRoot, mirror, bytes, mode);
+    manifest.files[relativePath] = {type: 'file', existed: true, sha256: sha256(bytes), mode, mirror: mirrorRelative};
+  };
+  try {
+    recordPath(entryPath, true);
+    for (const file of plan.files) recordPath(file.relativePath, true);
+    for (const resource of plan.resources || []) recordPath(resource.destination, false);
+    if (!manifest.package.entrySha256) manifest.package.entrySha256 = manifest.files[entryPath].sha256;
+    manifest.createdDirectories.sort();
+    writeManifestAtomic(target, manifest, root);
+    assertBaselineMirrors(manifest, target, root);
+    if (creating && process.env.CC_PATCH_TESTING === '1' && process.env.CC_PATCH_FAIL_BASELINE_AFTER_MIRROR === '1') {
+      throw new Error('injected baseline publication failure');
+    }
+    if (creating) {
+      assertManagedPathSafe(target.packageRoot, finalRoot);
+      if (lstatIfPresent(finalRoot)) throw new Error(`untrusted baseline path already exists: ${finalRoot}`);
+      fs.renameSync(root, finalRoot);
+      stagingRoot = null;
+      assertManagedPathSafe(target.packageRoot, finalRoot);
+    }
+    return path.join(finalRoot, 'manifest.json');
+  } catch (error) {
+    if (stagingRoot) fs.rmSync(stagingRoot, {recursive: true, force: true});
+    throw error;
   }
-  const manifestPath = writeManifestAtomic(target, manifest);
-  assertBaselineMirrors(manifest, target);
-  return manifestPath;
 }
 
 function inspectTarget(entry) {
@@ -1082,7 +1274,15 @@ if (command === 'inspect') {
   for (const file of target.resolvedModules) console.log(`TARGET_FILE:${JSON.stringify(path.relative(target.packageRoot, file))}`);
 } else if (command === 'index') {
   const [relativeFile, localName, marker] = runtimeArgs;
-  const candidates = scanMarkerCandidates(target, marker);
+  const candidateGroups = scanMarkerCandidateGroups(target, marker);
+  for (const [index, group] of candidateGroups.entries()) {
+    if (group.length === 0) {
+      console.error(`MISSING_MARKER_GROUP:${index}`);
+      fail(`required marker group is empty: ${index}`);
+    }
+    for (const file of group) console.log(`TARGET_GROUP:${index}:${JSON.stringify(file)}`);
+  }
+  const candidates = [...new Set(candidateGroups.flat())];
   for (const file of candidates) console.log(`TARGET_FILE:${JSON.stringify(file)}`);
   let binding;
   try {

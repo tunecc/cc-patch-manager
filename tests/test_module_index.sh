@@ -48,6 +48,24 @@ grep -Fx 'TARGET_FILE:"chunks/source.js"' <<<"$trace_output" >/dev/null || fail 
 [[ "$(grep -Fc 'PARSE_FILE:"cli.js":module' <<<"$trace_output")" -eq 1 ]] || fail 'entry module AST was not cached by content'
 grep -F 'PARSE_FILE:"chunks/unrelated.js"' <<<"$trace_output" >/dev/null && fail 'unrelated chunk entered AST parsing'
 
+fixture_add_module "$package" chunks/group-one.js 'export const one="marker-group-one"'
+fixture_add_module "$package" chunks/group-two.js 'export const two="marker-group-two"'
+group_output=$(runtime_exec index "$(fixture_entry "$package")" cli.js entryPolicy '[["marker-group-one"],["marker-group-two"]]')
+grep -Fx 'TARGET_GROUP:0:"chunks/group-one.js"' <<<"$group_output" >/dev/null || fail 'first marker group lost its candidate identity'
+grep -Fx 'TARGET_GROUP:1:"chunks/group-two.js"' <<<"$group_output" >/dev/null || fail 'second marker group lost its candidate identity'
+set +e
+missing_group_output=$(runtime_exec index "$(fixture_entry "$package")" cli.js entryPolicy '[["marker-group-one"],["marker-group-absent"]]' 2>&1)
+missing_group_status=$?
+set -e
+[[ "$missing_group_status" -ne 0 ]] || fail 'empty required marker group was accepted'
+grep -Fx 'MISSING_MARKER_GROUP:1' <<<"$missing_group_output" >/dev/null || fail 'empty marker group diagnostic was not structured'
+
+for empty_groups in '[]' '[[]]'; do
+  if runtime_exec index "$(fixture_entry "$package")" cli.js entryPolicy "$empty_groups" >/dev/null 2>&1; then
+    fail "empty marker groups were accepted: $empty_groups"
+  fi
+done
+
 fixture_add_module "$package" chunks/external-reexport.js 'export {externalThing} from "external-package";export * from "another-package";import {policy as internalPolicy} from "./source.js";export{internalPolicy}'
 set +e
 reexport_output=$(runtime_exec index "$(fixture_entry "$package")" chunks/external-reexport.js internalPolicy deny 2>&1)
