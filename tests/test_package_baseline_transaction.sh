@@ -520,6 +520,87 @@ fi
 [[ "$(fixture_hash_tree "$unmanaged_journal")" == "$unmanaged_before" ]] || fail 'unmanaged transaction operation mutated the package'
 [[ -d "$unmanaged_journal/.cc-patch-manager-transaction-unmanaged" ]] || fail 'unmanaged transaction journal was removed'
 
+restore_delete_race="$tmp/restore-delete-race"
+make_contract_package "$restore_delete_race"
+fixture_add_module "$restore_delete_race" assets/model.bin 'voice-resource'
+printf '\n// CC_CONTRACT_RESOURCE:assets/model.bin->vendor/cometix-asr/model.bin\n' >>"$restore_delete_race/cli.js"
+CC_PATCH_TESTING=1 runtime_exec apply "$(fixture_entry "$restore_delete_race")" __contract-resource__ >/dev/null 2>&1 || fail 'restore-delete-race fixture could not apply resource patch'
+if CC_PATCH_TESTING=1 CC_PATCH_TEST_MUTATE_AFTER_PREFLIGHT=vendor/cometix-asr/model.bin runtime_exec restore "$(fixture_entry "$restore_delete_race")" __contract-resource__ >/dev/null 2>&1; then
+  fail 'restore accepted a delete destination change between preflight and snapshot'
+fi
+grep -Fq 'CC_TEST_EXTERNAL_MUTATION' "$restore_delete_race/vendor/cometix-asr/model.bin" || fail 'restore-delete-race overwrote the external resource change'
+[[ -z "$(find "$restore_delete_race" -maxdepth 1 -name '.cc-patch-manager-transaction-*' -print -quit)" ]] || fail 'restore-delete-race rejection left a transaction directory'
+
+restore_combo="$tmp/restore-combo"
+make_contract_package "$restore_combo"
+fixture_add_module "$restore_combo" assets/model.bin 'voice-resource'
+printf '\n// CC_CONTRACT_RESOURCE:assets/model.bin->vendor/cometix-asr/model.bin\n' >>"$restore_combo/cli.js"
+CC_PATCH_TESTING=1 runtime_exec apply "$(fixture_entry "$restore_combo")" __contract-alpha__ >/dev/null 2>&1 || fail 'restore fixture could not apply the retained patch'
+CC_PATCH_TESTING=1 runtime_exec apply "$(fixture_entry "$restore_combo")" __contract-resource__ >/dev/null 2>&1 || fail 'restore fixture could not apply the removable patch'
+CC_PATCH_TESTING=1 runtime_exec check "$(fixture_entry "$restore_combo")" __contract-alpha__ | grep -Fxq 'ALREADY_PATCHED' || fail 'retained patch was not applied before restore'
+CC_PATCH_TESTING=1 runtime_exec check "$(fixture_entry "$restore_combo")" __contract-resource__ | grep -Fxq 'ALREADY_PATCHED' || fail 'resource patch was not applied before restore'
+CC_PATCH_TESTING=1 runtime_exec restore "$(fixture_entry "$restore_combo")" __contract-resource__ >/dev/null 2>&1 || fail 'single resource patch restore failed'
+CC_PATCH_TESTING=1 runtime_exec check "$(fixture_entry "$restore_combo")" __contract-resource__ | grep -Fxq 'NEEDS_PATCH' || fail 'removed resource patch still reports applied'
+CC_PATCH_TESTING=1 runtime_exec check "$(fixture_entry "$restore_combo")" __contract-alpha__ | grep -Fxq 'ALREADY_PATCHED' || fail 'single patch restore lost the retained patch'
+grep -Fq 'CC_BEFORE_BETA' "$restore_combo/chunks/beta.js" || fail 'resource patch JS was not restored to baseline'
+[[ ! -e "$restore_combo/vendor/cometix-asr" ]] || fail 'originally absent resource directory survived patch restore'
+restore_once=$(fixture_hash_tree "$restore_combo")
+CC_PATCH_TESTING=1 runtime_exec restore "$(fixture_entry "$restore_combo")" __contract-resource__ >/dev/null 2>&1 || fail 'idempotent single patch restore failed'
+[[ "$(fixture_hash_tree "$restore_combo")" == "$restore_once" ]] || fail 'idempotent single patch restore changed the package tree'
+CC_PATCH_TESTING=1 runtime_exec apply "$(fixture_entry "$restore_combo")" __contract-resource__ >/dev/null 2>&1 || fail 'resource patch could not be reapplied'
+CC_PATCH_TESTING=1 runtime_exec restore "$(fixture_entry "$restore_combo")" __contract-alpha__ >/dev/null 2>&1 || fail 'inverse single patch restore failed'
+CC_PATCH_TESTING=1 runtime_exec check "$(fixture_entry "$restore_combo")" __contract-alpha__ | grep -Fxq 'NEEDS_PATCH' || fail 'removed alpha patch still reports applied'
+CC_PATCH_TESTING=1 runtime_exec check "$(fixture_entry "$restore_combo")" __contract-resource__ | grep -Fxq 'ALREADY_PATCHED' || fail 'inverse restore lost the resource patch'
+cmp -s "$restore_combo/assets/model.bin" "$restore_combo/vendor/cometix-asr/model.bin" || fail 'inverse restore did not retain the resource patch'
+
+restore_shared="$tmp/restore-shared"
+fixture_make_package "$restore_shared" split-esm '@cometix/anthropic-cc' 2.1.259
+fixture_add_module "$restore_shared" chunks/shared.js 'export const alpha="CC_BEFORE_ALPHA",beta="CC_BEFORE_BETA",gamma="CC_BEFORE_GAMMA"'
+fixture_add_module "$restore_shared" cli.js '#!/usr/bin/env node
+import "./chunks/shared.js"'
+fixture_add_module "$restore_shared" assets/model.bin 'voice-resource'
+printf '\n// CC_CONTRACT_RESOURCE:assets/model.bin->vendor/cometix-asr/model.bin\n' >>"$restore_shared/cli.js"
+CC_PATCH_TESTING=1 CC_PATCH_TEST_PRODUCTION_IDS=1 runtime_exec apply "$(fixture_entry "$restore_shared")" auto-mode >/dev/null 2>&1 || fail 'production-id fixture could not apply auto-mode'
+CC_PATCH_TESTING=1 CC_PATCH_TEST_PRODUCTION_IDS=1 runtime_exec apply "$(fixture_entry "$restore_shared")" voice-mode >/dev/null 2>&1 || fail 'production-id fixture could not apply voice-mode on the shared file'
+CC_PATCH_TESTING=1 CC_PATCH_TEST_PRODUCTION_IDS=1 runtime_exec restore "$(fixture_entry "$restore_shared")" voice-mode >/dev/null 2>&1 || fail 'production-id restore could not reapply a shared-file patch'
+CC_PATCH_TESTING=1 CC_PATCH_TEST_PRODUCTION_IDS=1 runtime_exec check "$(fixture_entry "$restore_shared")" auto-mode | grep -Fxq 'ALREADY_PATCHED' || fail 'production-id restore lost auto-mode on the shared file'
+CC_PATCH_TESTING=1 CC_PATCH_TEST_PRODUCTION_IDS=1 runtime_exec check "$(fixture_entry "$restore_shared")" voice-mode | grep -Fxq 'NEEDS_PATCH' || fail 'production-id restore retained voice-mode on the shared file'
+grep -Fq 'CC_AFTER_ALPHA' "$restore_shared/chunks/shared.js" || fail 'shared-file retained transformation was not reapplied'
+grep -Fq 'CC_BEFORE_BETA' "$restore_shared/chunks/shared.js" || fail 'shared-file removed transformation was reapplied'
+[[ ! -e "$restore_shared/vendor/cometix-asr" ]] || fail 'production-id restore retained an absent-baseline resource directory'
+
+restore_reapply="$tmp/restore-reapply"
+fixture_make_package "$restore_reapply" split-esm '@cometix/anthropic-cc' 2.1.259
+fixture_add_module "$restore_reapply" chunks/shared.js 'export const alpha="CC_BEFORE_ALPHA",beta="CC_BEFORE_BETA",gamma="CC_BEFORE_GAMMA"'
+fixture_add_module "$restore_reapply" cli.js '#!/usr/bin/env node
+import "./chunks/shared.js"'
+fixture_add_module "$restore_reapply" assets/model.bin 'voice-resource'
+printf '\n// CC_CONTRACT_RESOURCE:assets/model.bin->vendor/cometix-asr/model.bin\n' >>"$restore_reapply/cli.js"
+CC_PATCH_TESTING=1 CC_PATCH_TEST_PRODUCTION_IDS=1 runtime_exec apply "$(fixture_entry "$restore_reapply")" auto-mode >/dev/null 2>&1 || fail 'reapply fixture could not apply auto-mode'
+CC_PATCH_TESTING=1 CC_PATCH_TEST_PRODUCTION_IDS=1 runtime_exec apply "$(fixture_entry "$restore_reapply")" keybindings >/dev/null 2>&1 || fail 'reapply fixture could not apply keybindings'
+CC_PATCH_TESTING=1 CC_PATCH_TEST_PRODUCTION_IDS=1 runtime_exec apply "$(fixture_entry "$restore_reapply")" voice-mode >/dev/null 2>&1 || fail 'reapply fixture could not apply voice-mode'
+set +e
+reapply_failure=$(CC_PATCH_TESTING=1 CC_PATCH_TEST_PRODUCTION_IDS=1 CC_PATCH_TEST_FAIL_REAPPLY=keybindings runtime_exec restore "$(fixture_entry "$restore_reapply")" voice-mode 2>&1)
+reapply_status=$?
+set -e
+[[ "$reapply_status" -ne 0 ]] || fail 'retained patch reapply failure injection did not interrupt restore'
+grep -Fq 'RESTORE_REAPPLIED:auto-mode' <<<"$reapply_failure" || fail 'restore failure did not report already reapplied patches'
+grep -Fq 'RESTORE_PENDING:keybindings' <<<"$reapply_failure" || fail 'restore failure did not report pending patches'
+[[ -f "$restore_reapply/.cc-patch-manager-baseline/restore.json" ]] || fail 'restore failure did not retain orchestration state'
+grep -Fq 'CC_AFTER_ALPHA' "$restore_reapply/chunks/shared.js" || fail 'restore failure lost the first retained patch'
+grep -Fq 'CC_BEFORE_GAMMA' "$restore_reapply/chunks/shared.js" || fail 'restore failure partially applied the failing patch'
+grep -Fq 'CC_BEFORE_BETA' "$restore_reapply/chunks/shared.js" || fail 'restore failure reapplied the removed patch'
+pending_restore_hash=$(fixture_hash_tree "$restore_reapply")
+if CC_PATCH_TESTING=1 CC_PATCH_TEST_PRODUCTION_IDS=1 runtime_exec check "$(fixture_entry "$restore_reapply")" auto-mode >/dev/null 2>&1; then
+  fail 'check reported patch state while restore orchestration was pending'
+fi
+[[ "$(fixture_hash_tree "$restore_reapply")" == "$pending_restore_hash" ]] || fail 'check mutated pending restore orchestration state'
+CC_PATCH_TESTING=1 CC_PATCH_TEST_PRODUCTION_IDS=1 runtime_exec restore "$(fixture_entry "$restore_reapply")" voice-mode >/dev/null 2>&1 || fail 'restore orchestration was not retryable'
+[[ ! -e "$restore_reapply/.cc-patch-manager-baseline/restore.json" ]] || fail 'successful restore retry left orchestration state'
+grep -Fq 'CC_AFTER_ALPHA' "$restore_reapply/chunks/shared.js" || fail 'restore retry lost auto-mode'
+grep -Fq 'CC_AFTER_GAMMA' "$restore_reapply/chunks/shared.js" || fail 'restore retry did not reapply keybindings'
+grep -Fq 'CC_BEFORE_BETA' "$restore_reapply/chunks/shared.js" || fail 'restore retry reapplied voice-mode'
+
 printf 'corrupt\n' >>"$package/.cc-patch-manager-baseline/files/chunks/alpha.js"
 if CC_PATCH_TESTING=1 runtime_exec baseline "$(fixture_entry "$package")" __contract__ >/dev/null 2>&1; then
   fail 'corrupt baseline mirror was accepted'

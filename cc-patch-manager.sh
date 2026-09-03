@@ -580,6 +580,7 @@ const command = process.argv[3];
 const requestedEntry = process.argv[4];
 const runtimeArgs = process.argv.slice(5);
 const supportedPackages = new Set(['@cometix/claude-code', '@cometix/anthropic-cc']);
+const patchIds = ['auto-mode', 'keybindings', 'transcript-dialog', 'ultracode', 'voice-mode', 'context-limit', 'computer-use'];
 const astCache = new Map();
 let tracePackageRoot = '';
 
@@ -857,12 +858,20 @@ function tokenMatches(text, token, relativePath, state) {
   return matches;
 }
 
-function analyzeContractFixture(target) {
+function analyzeContractFixture(target, patchId = '__contract__') {
   if (process.env.CC_PATCH_TESTING !== '1') throw new Error('internal contract analyzer is disabled');
-  const definitions = [
+  const allDefinitions = [
     {id: 'alpha', before: 'CC_BEFORE_ALPHA', after: 'CC_AFTER_ALPHA'},
     {id: 'beta', before: 'CC_BEFORE_BETA', after: 'CC_AFTER_BETA'},
+    {id: 'gamma', before: 'CC_BEFORE_GAMMA', after: 'CC_AFTER_GAMMA'},
   ];
+  const alphaOnly = patchId === '__contract-alpha__' ||
+    (process.env.CC_PATCH_TEST_PRODUCTION_IDS === '1' && patchId === 'auto-mode');
+  const resourceOnly = patchId === '__contract-resource__' ||
+    (process.env.CC_PATCH_TEST_PRODUCTION_IDS === '1' && patchId === 'voice-mode');
+  const gammaOnly = process.env.CC_PATCH_TEST_PRODUCTION_IDS === '1' && patchId === 'keybindings';
+  const definitions = alphaOnly ? allDefinitions.slice(0, 1) : resourceOnly ? allDefinitions.slice(1, 2) :
+    gammaOnly ? allDefinitions.slice(2) : allDefinitions.slice(0, 2);
   const sourceType = target.layout === 'split-esm' ? 'module' : 'script';
   const files = new Map();
   const semanticTargets = definitions.map(definition => {
@@ -895,13 +904,13 @@ function analyzeContractFixture(target) {
     }
   }
   const entryText = fs.readFileSync(target.entryPath, 'utf8');
-  const resources = [...entryText.matchAll(/CC_CONTRACT_RESOURCE:([^\s*]+)/g)]
+  const resources = (alphaOnly || gammaOnly ? [] : [...entryText.matchAll(/CC_CONTRACT_RESOURCE:([^\s*]+)/g)])
     .map(match => {
       const [source, destination] = match[1].includes('->') ? match[1].split('->', 2) : [null, match[1]];
       return {kind: 'copy', source, destination, expectedBefore: 'absent-or-baselined'};
     });
   return {
-    patchId: '__contract__',
+    patchId,
     state: states.every(state => state === 'after') ? 'already-patched' : 'needs-patch',
     semanticTargets,
     files: [...files.values()],
@@ -969,8 +978,27 @@ function validatePlan(target, plan) {
   return renderedFiles;
 }
 
+function analyzerForPatch(patchId) {
+  if (process.env.CC_PATCH_TESTING === '1' &&
+      ['__contract__', '__contract-alpha__', '__contract-resource__'].includes(patchId)) {
+    return target => analyzeContractFixture(target, patchId);
+  }
+  if (process.env.CC_PATCH_TESTING === '1' && process.env.CC_PATCH_TEST_PRODUCTION_IDS === '1' &&
+      ['auto-mode', 'keybindings', 'voice-mode'].includes(patchId)) {
+    return target => analyzeContractFixture(target, patchId);
+  }
+  return null;
+}
+
+function registeredPatchIdsFor(patchId) {
+  const internalPatchIds = ['__contract-alpha__', '__contract-resource__'];
+  const candidates = internalPatchIds.includes(patchId) ? internalPatchIds : patchIds;
+  return candidates.filter(candidate => analyzerForPatch(candidate));
+}
+
 function analyzePatch(target, patchId) {
-  if (patchId === '__contract__') return analyzeContractFixture(target);
+  const analyzer = analyzerForPatch(patchId);
+  if (analyzer) return analyzer(target);
   throw new Error(`unsupported patch id: ${patchId}`);
 }
 
@@ -1135,7 +1163,18 @@ function assertManagedFilesAttributable(manifest, target, plan) {
     assertManagedPathSafe(target.packageRoot, absolute);
     const stat = lstatIfPresent(absolute);
     if (!item.existed) {
-      if (stat) throw new Error(`managed path cannot be attributed to baseline: ${relativePath}`);
+      if (!stat) continue;
+      const resource = (plan.resources || []).find(candidate => candidate.destination === relativePath && candidate.source);
+      if (!resource || !stat.isFile() || stat.isSymbolicLink()) {
+        throw new Error(`managed path cannot be attributed to baseline: ${relativePath}`);
+      }
+      const source = managedDestination(target, resource.source);
+      const sourceStat = lstatIfPresent(source);
+      if (!sourceStat || !sourceStat.isFile() || sourceStat.isSymbolicLink() ||
+          sha256(fs.readFileSync(absolute)) !== sha256(fs.readFileSync(source)) ||
+          (stat.mode & 0o777) !== (sourceStat.mode & 0o777)) {
+        throw new Error(`managed resource cannot be attributed to known patch state: ${relativePath}`);
+      }
       continue;
     }
     if (!stat || !stat.isFile()) throw new Error(`managed file no longer matches baseline: ${relativePath}`);
@@ -1148,6 +1187,18 @@ function assertManagedFilesAttributable(manifest, target, plan) {
       throw new Error(`managed file cannot be attributed to baseline or known patch state: ${relativePath}`);
     }
   }
+}
+
+function attributionPlanForTarget(target, plan) {
+  const relatedPatchIds = registeredPatchIdsFor(plan.patchId);
+  if (relatedPatchIds.length < 2) return plan;
+  const relatedPlans = relatedPatchIds.map(patchId => analyzePatch(target, patchId));
+  return {
+    attribution: {
+      transformations: relatedPlans.flatMap(relatedPlan => relatedPlan.attribution?.transformations || []),
+    },
+    resources: relatedPlans.flatMap(relatedPlan => relatedPlan.resources || []),
+  };
 }
 
 function writeManifestAtomic(target, manifest, root = baselineDirectory(target)) {
@@ -1341,14 +1392,18 @@ function transactionTargetIdentity(target, manifest) {
 
 function classifyPreparedTransactionState(state) {
   const current = lstatIfPresent(state.destination);
-  if (!current) return state.operation.existed ? 'unknown' : 'before';
+  if (!current) {
+    if (!state.operation.existed) return 'before';
+    return state.operation.afterExisted === false ? 'after' : 'unknown';
+  }
   if (!current.isFile() || current.isSymbolicLink()) return 'unknown';
   const currentHash = sha256(fs.readFileSync(state.destination));
   const currentMode = current.mode & 0o777;
   if (state.operation.existed && currentHash === state.operation.sha256 && currentMode === state.operation.mode) {
     return 'before';
   }
-  if (currentHash === state.operation.afterSha256 && currentMode === state.operation.afterMode) return 'after';
+  if (state.operation.afterExisted !== false &&
+      currentHash === state.operation.afterSha256 && currentMode === state.operation.afterMode) return 'after';
   return 'unknown';
 }
 
@@ -1415,8 +1470,9 @@ function restoreTransactionDirectory(target, txRoot) {
 
   const seenPaths = new Set();
   const states = journal.operations.map((operation, index) => {
+    const afterExisted = operation?.afterExisted !== false;
     if (!operation || typeof operation.relativePath !== 'string' || typeof operation.existed !== 'boolean' ||
-        !/^[a-f0-9]{64}$/.test(operation.afterSha256 || '') || !Number.isInteger(operation.afterMode)) {
+        (afterExisted && (!/^[a-f0-9]{64}$/.test(operation.afterSha256 || '') || !Number.isInteger(operation.afterMode)))) {
       throw new Error(`invalid transaction operation ${index}: ${path.basename(txRoot)}`);
     }
     if (!Object.prototype.hasOwnProperty.call(manifest.files || {}, operation.relativePath) || seenPaths.has(operation.relativePath)) {
@@ -1446,8 +1502,10 @@ function restoreTransactionDirectory(target, txRoot) {
   if (journal.state === 'committed') {
     for (const state of states) {
       const current = lstatIfPresent(state.destination);
-      if (!current || !current.isFile() || sha256(fs.readFileSync(state.destination)) !== state.operation.afterSha256 ||
-          (current.mode & 0o777) !== state.operation.afterMode) {
+      const valid = state.operation.afterExisted === false ? !current :
+        current && current.isFile() && sha256(fs.readFileSync(state.destination)) === state.operation.afterSha256 &&
+          (current.mode & 0o777) === state.operation.afterMode;
+      if (!valid) {
         throw new Error(`committed transaction verification failed: ${state.operation.relativePath}`);
       }
     }
@@ -1522,9 +1580,14 @@ function commitTransaction(target, operations) {
           throw new Error(`resource destination changed after analysis: ${operation.relativePath}`);
         }
       }
-      if (operation.expectedBeforeHash &&
-          sha256(fs.readFileSync(operation.destination)) !== operation.expectedBeforeHash) {
-        throw new Error(`transaction source changed after analysis: ${operation.relativePath}`);
+      if (operation.expectedBeforeHash) {
+        const beforeStat = lstatIfPresent(operation.destination);
+        if (!beforeStat || !beforeStat.isFile() ||
+            sha256(fs.readFileSync(operation.destination)) !== operation.expectedBeforeHash ||
+            (Number.isInteger(operation.expectedBeforeMode) &&
+              (beforeStat.mode & 0o777) !== operation.expectedBeforeMode)) {
+          throw new Error(`transaction source changed after analysis: ${operation.relativePath}`);
+        }
       }
     }
     if (process.env.CC_PATCH_TESTING === '1' && process.env.CC_PATCH_TEST_MUTATE_AFTER_PREFLIGHT) {
@@ -1547,6 +1610,12 @@ function commitTransaction(target, operations) {
         operation.mode = sourceStat.mode & 0o777;
       }
       const stat = lstatIfPresent(operation.destination);
+      if (operation.expectedBeforeHash &&
+          (!stat || !stat.isFile() || sha256(fs.readFileSync(operation.destination)) !== operation.expectedBeforeHash ||
+            (Number.isInteger(operation.expectedBeforeMode) &&
+              (stat.mode & 0o777) !== operation.expectedBeforeMode))) {
+        throw new Error(`transaction source changed after analysis: ${operation.relativePath}`);
+      }
       if (operation.kind === 'copy' &&
           (Boolean(stat) !== operation.expectedDestinationExisted ||
             (stat && (!stat.isFile() ||
@@ -1578,7 +1647,9 @@ function commitTransaction(target, operations) {
       target: transactionTargetIdentity(target, manifest),
       operations: snapshots.map(snapshot => ({relativePath: snapshot.operation.relativePath,
         existed: snapshot.existed, mode: snapshot.mode, sha256: snapshot.sha256,
-        afterMode: snapshot.operation.mode, afterSha256: sha256(snapshot.operation.bytes)})),
+        afterExisted: snapshot.operation.kind !== 'delete',
+        afterMode: snapshot.operation.kind === 'delete' ? null : snapshot.operation.mode,
+        afterSha256: snapshot.operation.kind === 'delete' ? null : sha256(snapshot.operation.bytes)})),
       createdDirectories: createdDirectories.map(directory => path.relative(target.packageRoot, directory)),
     };
     fs.writeFileSync(journalPath, `${JSON.stringify(journal, null, 2)}\n`, {mode: 0o600, flag: 'wx'});
@@ -1594,6 +1665,7 @@ function commitTransaction(target, operations) {
     }
 
     for (const [index, snapshot] of snapshots.entries()) {
+      if (snapshot.operation.kind === 'delete') continue;
       const staged = path.join(txRoot, 'after', String(index));
       writeManagedFileAtomic(target.packageRoot, staged, snapshot.operation.bytes, snapshot.operation.mode);
       snapshot.stagedPath = staged;
@@ -1609,21 +1681,26 @@ function commitTransaction(target, operations) {
       if (classifyPreparedTransactionState(state) !== 'before') {
         throw new Error(`transaction destination changed before rename: ${snapshot.operation.relativePath}`);
       }
-      fs.mkdirSync(path.dirname(snapshot.operation.destination), {recursive: true});
-      assertManagedPathSafe(target.packageRoot, path.dirname(snapshot.operation.destination));
-      for (const directory of createdDirectories) {
-        if (fs.existsSync(directory)) {
-          fsyncDirectory(directory);
-          fsyncDirectory(path.dirname(directory));
+      if (snapshot.operation.kind === 'delete') {
+        fs.unlinkSync(snapshot.operation.destination);
+        fsyncDirectory(path.dirname(snapshot.operation.destination));
+      } else {
+        fs.mkdirSync(path.dirname(snapshot.operation.destination), {recursive: true});
+        assertManagedPathSafe(target.packageRoot, path.dirname(snapshot.operation.destination));
+        for (const directory of createdDirectories) {
+          if (fs.existsSync(directory)) {
+            fsyncDirectory(directory);
+            fsyncDirectory(path.dirname(directory));
+          }
         }
+        fs.renameSync(snapshot.stagedPath, snapshot.operation.destination);
+        if (process.env.CC_PATCH_TESTING === '1' && process.env.CC_PATCH_TEST_FAIL_AFTER_RENAME === '1' && committed === 0) {
+          throw new Error('injected transaction failure after destination rename');
+        }
+        fs.chmodSync(snapshot.operation.destination, snapshot.operation.mode);
+        fsyncFile(snapshot.operation.destination);
+        fsyncDirectory(path.dirname(snapshot.operation.destination));
       }
-      fs.renameSync(snapshot.stagedPath, snapshot.operation.destination);
-      if (process.env.CC_PATCH_TESTING === '1' && process.env.CC_PATCH_TEST_FAIL_AFTER_RENAME === '1' && committed === 0) {
-        throw new Error('injected transaction failure after destination rename');
-      }
-      fs.chmodSync(snapshot.operation.destination, snapshot.operation.mode);
-      fsyncFile(snapshot.operation.destination);
-      fsyncDirectory(path.dirname(snapshot.operation.destination));
       committed += 1;
       if (process.env.CC_PATCH_TESTING === '1' && process.env.CC_PATCH_TEST_LEAVE_TRANSACTION === '1' && committed === 1) {
         console.error(`INCOMPLETE_TRANSACTION:${path.basename(txRoot)}`);
@@ -1635,9 +1712,11 @@ function commitTransaction(target, operations) {
     }
 
     for (const snapshot of snapshots) {
-      const stat = fs.statSync(snapshot.operation.destination);
-      if (sha256(fs.readFileSync(snapshot.operation.destination)) !== sha256(snapshot.operation.bytes) ||
-          (stat.mode & 0o777) !== snapshot.operation.mode) {
+      const stat = lstatIfPresent(snapshot.operation.destination);
+      const valid = snapshot.operation.kind === 'delete' ? !stat :
+        stat && stat.isFile() && sha256(fs.readFileSync(snapshot.operation.destination)) === sha256(snapshot.operation.bytes) &&
+          (stat.mode & 0o777) === snapshot.operation.mode;
+      if (!valid) {
         throw new Error(`transaction verification failed: ${snapshot.operation.relativePath}`);
       }
     }
@@ -1699,7 +1778,7 @@ function ensureBaselineForPlan(target, plan) {
     if (manifest.schemaVersion !== 1) throw new Error(`unsupported baseline schema: ${manifest.schemaVersion}`);
     assertBaselineIdentity(manifest, target);
     assertBaselineMirrors(manifest, target);
-    assertManagedFilesAttributable(manifest, target, plan);
+    assertManagedFilesAttributable(manifest, target, attributionPlanForTarget(target, plan));
   }
 
   const finalRoot = baselineDirectory(target);
@@ -1826,6 +1905,153 @@ function ensureBaselineForPlan(target, plan) {
   }
 }
 
+function restoreOperationsFromBaseline(target, manifest) {
+  const operations = [];
+  for (const [relativePath, item] of Object.entries(manifest.files || {})) {
+    const destination = managedDestination(target, relativePath);
+    const stat = lstatIfPresent(destination);
+    if (item.existed) {
+      if (!stat || !stat.isFile() || stat.isSymbolicLink()) {
+        throw new Error(`managed file cannot be restored safely: ${relativePath}`);
+      }
+      const beforeBytes = fs.readFileSync(destination);
+      const baselineBytes = fs.readFileSync(packageFile(baselineDirectory(target), item.mirror));
+      if (sha256(beforeBytes) === item.sha256 && (stat.mode & 0o777) === item.mode) continue;
+      operations.push({
+        kind: 'write', relativePath, destination, bytes: baselineBytes, mode: item.mode,
+        expectedBeforeHash: sha256(beforeBytes), expectedBeforeMode: stat.mode & 0o777,
+      });
+    } else if (stat) {
+      if (!stat.isFile() || stat.isSymbolicLink()) {
+        throw new Error(`managed created path cannot be restored safely: ${relativePath}`);
+      }
+      operations.push({
+        kind: 'delete', relativePath, destination,
+        expectedBeforeHash: sha256(fs.readFileSync(destination)), expectedBeforeMode: stat.mode & 0o777,
+      });
+    }
+  }
+  return operations;
+}
+
+function removeBaselineCreatedDirectories(target, manifest) {
+  const directories = (manifest.createdDirectories || [])
+    .map(relativePath => ({relativePath, absolute: managedDestination(target, relativePath)}))
+    .sort((left, right) => right.absolute.length - left.absolute.length);
+  for (const directory of directories) {
+    const stat = lstatIfPresent(directory.absolute);
+    if (!stat) continue;
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+      throw new Error(`managed created directory is not safe: ${directory.relativePath}`);
+    }
+    try {
+      fs.rmdirSync(directory.absolute);
+      fsyncDirectory(path.dirname(directory.absolute));
+    } catch (error) {
+      if (error.code !== 'ENOTEMPTY') throw error;
+    }
+  }
+}
+
+function applyRuntimePatch(target, patchId) {
+  const plan = analyzePatch(target, patchId);
+  const renderedFiles = validatePlan(target, plan);
+  if (plan.state === 'already-patched') return false;
+  const operations = transactionOperations(target, plan, renderedFiles);
+  ensureBaselineForPlan(target, plan);
+  commitTransaction(target, operations);
+  return true;
+}
+
+function restoreOrchestrationPath(target) {
+  return path.join(baselineDirectory(target), 'restore.json');
+}
+
+function readRestoreOrchestration(target) {
+  const journalPath = restoreOrchestrationPath(target);
+  const stat = lstatIfPresent(journalPath);
+  if (!stat) return null;
+  assertManagedPathSafe(target.packageRoot, journalPath);
+  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('restore orchestration state is not a regular file');
+  try {
+    return JSON.parse(fs.readFileSync(journalPath, 'utf8'));
+  } catch (error) {
+    throw new Error(`invalid restore orchestration state: ${error.message}`);
+  }
+}
+
+function writeRestoreOrchestration(target, journal) {
+  const journalPath = restoreOrchestrationPath(target);
+  writeManagedFileAtomic(target.packageRoot, journalPath,
+    Buffer.from(`${JSON.stringify(journal, null, 2)}\n`), 0o600);
+  return journalPath;
+}
+
+function validateRestoreOrchestration(journal, target, manifest, removeId, candidates) {
+  if (!journal || journal.schemaVersion !== 1 || journal.removeId !== removeId ||
+      !journal.target || !Array.isArray(journal.retained)) {
+    throw new Error('restore orchestration state does not match the requested patch');
+  }
+  const expectedTarget = transactionTargetIdentity(target, manifest);
+  if (Object.keys(expectedTarget).some(key => journal.target[key] !== expectedTarget[key])) {
+    throw new Error('restore orchestration target identity mismatch');
+  }
+  let previousIndex = -1;
+  for (const patchId of journal.retained) {
+    const index = candidates.indexOf(patchId);
+    if (index <= previousIndex || patchId === removeId) {
+      throw new Error(`invalid retained patch in restore orchestration: ${patchId}`);
+    }
+    previousIndex = index;
+  }
+  return journal;
+}
+
+function restorePatchFromBaseline(target, removeId) {
+  const candidates = registeredPatchIdsFor(removeId);
+  if (!candidates.includes(removeId)) {
+    throw new Error(`unsupported restore patch id: ${removeId}`);
+  }
+  const plans = candidates.map(patchId => ({patchId, plan: analyzePatch(target, patchId)}));
+  for (const {plan} of plans) validatePlan(target, plan);
+  const manifest = readBaselineManifest(target);
+  if (!manifest) throw new Error('patch restore requires a trusted baseline');
+  assertBaselineIdentity(manifest, target);
+  assertBaselineMirrors(manifest, target);
+  assertManagedFilesAttributable(manifest, target, attributionPlanForTarget(target, plans[0].plan));
+
+  let orchestration = readRestoreOrchestration(target);
+  if (orchestration) {
+    orchestration = validateRestoreOrchestration(orchestration, target, manifest, removeId, candidates);
+  } else {
+    const retained = plans.filter(item => item.patchId !== removeId && item.plan.state === 'already-patched')
+      .map(item => item.patchId);
+    orchestration = {schemaVersion: 1, target: transactionTargetIdentity(target, manifest), removeId, retained};
+    writeRestoreOrchestration(target, orchestration);
+  }
+
+  const operations = restoreOperationsFromBaseline(target, manifest);
+  if (operations.length > 0) commitTransaction(target, operations);
+  removeBaselineCreatedDirectories(target, manifest);
+  const reapplied = [];
+  for (const [index, patchId] of orchestration.retained.entries()) {
+    try {
+      if (process.env.CC_PATCH_TESTING === '1' && process.env.CC_PATCH_TEST_FAIL_REAPPLY === patchId) {
+        throw new Error('injected retained patch reapply failure');
+      }
+      applyRuntimePatch(target, patchId);
+      reapplied.push(patchId);
+    } catch (error) {
+      console.error(`RESTORE_REAPPLIED:${reapplied.join(',')}`);
+      console.error(`RESTORE_PENDING:${orchestration.retained.slice(index).join(',')}`);
+      throw new Error(`retained patch reapply failed at ${patchId}: ${error.message}; retry the same restore operation`);
+    }
+  }
+  fs.unlinkSync(restoreOrchestrationPath(target));
+  fsyncDirectory(baselineDirectory(target));
+  return {removed: removeId, reapplied};
+}
+
 function inspectTarget(entry) {
   if (!entry) fail('entry path is required');
   let entryPath;
@@ -1872,10 +2098,13 @@ function inspectTarget(entry) {
 }
 
 const target = inspectTarget(requestedEntry);
+if (!['inspect', 'restore'].includes(command) && lstatIfPresent(restoreOrchestrationPath(target))) {
+  fail('incomplete patch restore exists; retry the same restore operation first');
+}
 if (command === 'check' && incompleteTransactionEntries(target).length > 0) {
   fail('incomplete patch transaction exists; run an apply, baseline, or backup operation to recover it first');
 }
-if (command === 'backup' || command === 'baseline' ||
+if (command === 'backup' || command === 'baseline' || command === 'restore' ||
     (command === 'apply' && process.env.CC_PATCH_VALIDATE_ONLY !== '1')) {
   try {
     cleanupBaselineStagingDirectories(target);
@@ -1928,6 +2157,14 @@ if (command === 'inspect') {
     fail(error.message);
   }
   console.log(`BASELINE:${JSON.stringify(manifestPath)}`);
+} else if (command === 'restore') {
+  try {
+    const result = restorePatchFromBaseline(target, runtimeArgs[0]);
+    console.log(`RESTORED:${result.removed}`);
+    for (const patchId of result.reapplied) console.log(`REAPPLIED:${patchId}`);
+  } catch (error) {
+    fail(error.message);
+  }
 } else if (command === 'check' || command === 'apply' || command === 'baseline') {
   const patchId = runtimeArgs[0];
   let plan, renderedFiles;

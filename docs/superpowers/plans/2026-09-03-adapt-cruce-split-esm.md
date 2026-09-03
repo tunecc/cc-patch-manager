@@ -460,7 +460,7 @@ git commit -m "fix: recover interrupted patch transactions"
 
 **Interfaces:** Produces `restorePatch(target, removeId)`; consumes `PATCH_IDS`, manifest and `checkPatch`.
 
-- [ ] **Step 1: 写组合状态测试**
+- [x] **Step 1: 写组合状态测试**
 
 ```bash
 runtime_exec apply "$(fixture_entry "$tmp/new")" auto-mode
@@ -471,13 +471,13 @@ runtime_exec check "$(fixture_entry "$tmp/new")" auto-mode | grep -Fx ALREADY_PA
 test ! -e "$tmp/new/vendor/cometix-asr"
 ```
 
-- [ ] **Step 2: 确认红灯**
+- [x] **Step 2: 确认红灯**
 
 Run: `bash tests/test_package_baseline_transaction.sh`
 
 Expected: FAIL；当前 restore 只能复制 cli.js。
 
-- [ ] **Step 3: 实施包级还原**
+- [x] **Step 3: 实施包级还原**
 
 ```javascript
 function restorePatch(target, removeId) {
@@ -487,13 +487,13 @@ function restorePatch(target, removeId) {
 }
 ```
 
-- [ ] **Step 4: 复跑**
+- [x] **Step 4: 复跑**
 
 Run: `bash tests/test_package_baseline_transaction.sh`
 
 Expected: PASS；目标 idle，保留项重打，VoiceMode 资源恢复原始不存在状态。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add cc-patch-manager.sh tests/test_package_baseline_transaction.sh
