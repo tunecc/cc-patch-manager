@@ -837,6 +837,116 @@ function scanMarkerCandidates(target, marker) {
     });
 }
 
+function tokenMatches(text, token, relativePath, state) {
+  const matches = [];
+  let offset = 0;
+  while ((offset = text.indexOf(token, offset)) !== -1) {
+    matches.push({relativePath, start: offset, end: offset + token.length, state});
+    offset += token.length;
+  }
+  return matches;
+}
+
+function analyzeContractFixture(target) {
+  if (process.env.CC_PATCH_TESTING !== '1') throw new Error('internal contract analyzer is disabled');
+  const definitions = [
+    {id: 'alpha', before: 'CC_BEFORE_ALPHA', after: 'CC_AFTER_ALPHA'},
+    {id: 'beta', before: 'CC_BEFORE_BETA', after: 'CC_AFTER_BETA'},
+  ];
+  const sourceType = target.layout === 'split-esm' ? 'module' : 'script';
+  const files = new Map();
+  const semanticTargets = definitions.map(definition => {
+    const matches = [];
+    for (const relativePath of packageModulePaths(target.packageRoot)) {
+      const text = fs.readFileSync(path.join(target.packageRoot, relativePath), 'utf8');
+      matches.push(...tokenMatches(text, definition.before, relativePath, 'before'));
+      matches.push(...tokenMatches(text, definition.after, relativePath, 'after'));
+    }
+    for (const match of matches.filter(item => item.state === 'before')) {
+      if (!files.has(match.relativePath)) {
+        const text = fs.readFileSync(path.join(target.packageRoot, match.relativePath), 'utf8');
+        files.set(match.relativePath, {relativePath: match.relativePath, sourceHash: sha256(text), sourceType, replacements: [], postconditions: []});
+      }
+      const file = files.get(match.relativePath);
+      file.replacements.push({start: match.start, end: match.end, text: definition.after, semanticId: definition.id});
+      file.postconditions.push({absent: definition.before, present: definition.after, semanticId: definition.id});
+    }
+    return {id: definition.id, expectedCardinality: 1, matches};
+  });
+  const states = semanticTargets.map(targetEntry => targetEntry.matches[0]?.state);
+  for (const file of files.values()) {
+    const source = fs.readFileSync(path.join(target.packageRoot, file.relativePath), 'utf8');
+    if (source.includes('CC_CONTRACT_OVERLAP') && file.replacements.length > 0) {
+      const original = file.replacements[0];
+      file.replacements.push({start: original.start + 1, end: original.end, text: 'CC_OVERLAP', semanticId: 'overlap-probe'});
+    }
+    if (source.includes('CC_CONTRACT_INVALID_AST') && file.replacements.length > 0) {
+      file.replacements[0].text += '"';
+    }
+  }
+  return {
+    patchId: '__contract__',
+    state: states.every(state => state === 'after') ? 'already-patched' : 'needs-patch',
+    semanticTargets,
+    files: [...files.values()],
+    resources: [],
+    diagnostics: [],
+  };
+}
+
+function renderReplacements(source, replacements) {
+  let previousStart = source.length;
+  let rendered = source;
+  for (const replacement of [...replacements].sort((a, b) => b.start - a.start)) {
+    if (!Number.isInteger(replacement.start) || !Number.isInteger(replacement.end) || replacement.start < 0 || replacement.end > source.length || replacement.start >= replacement.end) {
+      throw new Error(`invalid replacement range: ${replacement.start}:${replacement.end}`);
+    }
+    if (replacement.end > previousStart) throw new Error(`overlapping replacements at ${replacement.start}:${replacement.end}`);
+    rendered = rendered.slice(0, replacement.start) + replacement.text + rendered.slice(replacement.end);
+    previousStart = replacement.start;
+  }
+  return rendered;
+}
+
+function validatePlan(target, plan) {
+  for (const semanticTarget of plan.semanticTargets) {
+    const count = semanticTarget.matches.length;
+    if (count === 0) {
+      console.error(`MISSING_TARGET:${semanticTarget.id}`);
+      throw new Error(`missing semantic target: ${semanticTarget.id}`);
+    }
+    if (count !== semanticTarget.expectedCardinality) {
+      console.error(`AMBIGUOUS_TARGET:${semanticTarget.id}:${count}`);
+      throw new Error(`ambiguous semantic target: ${semanticTarget.id}`);
+    }
+  }
+
+  const renderedFiles = [];
+  for (const file of plan.files) {
+    const absolute = packageFile(target.packageRoot, file.relativePath);
+    const source = fs.readFileSync(absolute, 'utf8');
+    if (sha256(source) !== file.sourceHash) throw new Error(`source changed during analysis: ${file.relativePath}`);
+    const rendered = renderReplacements(source, file.replacements);
+    try {
+      acorn.parse(rendered, {ecmaVersion: 'latest', sourceType: file.sourceType, allowHashBang: true});
+    } catch (error) {
+      throw new Error(`post-patch parse failed in ${file.relativePath}: ${error.message}`);
+    }
+    for (const condition of file.postconditions) {
+      if (rendered.includes(condition.absent) || !rendered.includes(condition.present)) {
+        throw new Error(`postcondition failed for ${condition.semanticId} in ${file.relativePath}`);
+      }
+    }
+    renderedFiles.push({...file, absolute, rendered});
+  }
+  return renderedFiles;
+}
+
+function analyzePatch(target, patchId) {
+  if (patchId === '__contract__') return analyzeContractFixture(target);
+  throw new Error(`unsupported patch id: ${patchId}`);
+}
+
 function inspectTarget(entry) {
   if (!entry) fail('entry path is required');
   let entryPath;
@@ -902,6 +1012,26 @@ if (command === 'inspect') {
     fail(error.message);
   }
   console.log(`BINDING_SOURCE:${JSON.stringify(path.relative(target.packageRoot, binding.file))}:${binding.exportedName}`);
+} else if (command === 'check' || command === 'apply') {
+  const patchId = runtimeArgs[0];
+  let plan;
+  try {
+    plan = analyzePatch(target, patchId);
+    validatePlan(target, plan);
+  } catch (error) {
+    fail(error.message);
+  }
+  console.log(`ANALYSIS_HASH:${sha256(JSON.stringify(plan))}`);
+  if (plan.state === 'already-patched') {
+    console.log('ALREADY_PATCHED');
+  } else if (command === 'check') {
+    console.log('NEEDS_PATCH');
+    console.log(`PATCH_COUNT:${plan.files.reduce((count, file) => count + file.replacements.length, 0)}`);
+  } else if (process.env.CC_PATCH_VALIDATE_ONLY === '1') {
+    console.log('PLAN_VALID');
+  } else {
+    fail('transaction commit is not implemented');
+  }
 } else {
   fail(`unsupported runtime command: ${command || 'missing'}`);
 }

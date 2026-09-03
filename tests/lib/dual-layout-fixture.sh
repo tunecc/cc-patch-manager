@@ -30,3 +30,26 @@ fixture_add_module() {
   mkdir -p "$(dirname "$root/$relative_path")"
   printf '%s\n' "$source" >"$root/$relative_path"
 }
+
+fixture_hash_tree() {
+  node - "$1" <<'NODE'
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const root = fs.realpathSync(process.argv[2]);
+const hash = crypto.createHash('sha256');
+function visit(directory) {
+  for (const entry of fs.readdirSync(directory, {withFileTypes: true}).sort((a, b) => a.name.localeCompare(b.name))) {
+    const absolute = path.join(directory, entry.name);
+    const relative = path.relative(root, absolute);
+    if (entry.isDirectory()) visit(absolute);
+    else if (entry.isFile()) {
+      const stat = fs.statSync(absolute);
+      hash.update(relative).update('\0').update(String(stat.mode & 0o777)).update('\0').update(fs.readFileSync(absolute));
+    }
+  }
+}
+visit(root);
+console.log(hash.digest('hex'));
+NODE
+}

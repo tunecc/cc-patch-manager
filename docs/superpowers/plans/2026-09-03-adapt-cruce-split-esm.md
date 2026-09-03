@@ -241,7 +241,7 @@ git commit -m "perf: cache marker-selected ast analysis"
 
 **Interfaces:** Produces `PatchPlan { patchId, state, semanticTargets, files, resources, diagnostics }` and `validatePlan(context, plan)`.
 
-- [ ] **Step 1: 写缺失目标零写入测试**
+- [x] **Step 1: 写缺失目标零写入测试**
 
 ```bash
 before=$(fixture_hash_tree "$tmp/new")
@@ -250,13 +250,13 @@ grep -F 'MISSING_TARGET:host-cleanup' <<<"$out"
 fixture_assert_tree_equals "$before" "$(fixture_hash_tree "$tmp/new")"
 ```
 
-- [ ] **Step 2: 确认红灯**
+- [x] **Step 2: 确认红灯**
 
 Run: `bash tests/test_patch_plan_contract.sh`
 
 Expected: FAIL；check/apply 仍是独立 heredoc engine。
 
-- [ ] **Step 3: 实施计划校验器**
+- [x] **Step 3: 实施计划校验器**
 
 ```javascript
 function validatePlan(context, plan) {
@@ -267,13 +267,13 @@ function validatePlan(context, plan) {
 }
 ```
 
-- [ ] **Step 4: 复跑**
+- [x] **Step 4: 复跑**
 
 Run: `bash tests/test_patch_plan_contract.sh`
 
 Expected: PASS；check/apply 共用 analyzer/validator，完整状态才是 `ALREADY_PATCHED`。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add cc-patch-manager.sh tests/test_patch_plan_contract.sh
