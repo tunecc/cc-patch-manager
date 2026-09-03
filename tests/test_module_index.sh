@@ -19,6 +19,8 @@ fixture_add_module "$package" chunks/source.js 'export const policy="deny"'
 fixture_add_module "$package" chunks/entry.js 'import {policy as localPolicy} from "./source.js";export{localPolicy}'
 fixture_add_module "$package" chunks/unrelated.js 'export const unrelated="no marker"'
 fixture_add_module "$package" node_modules/ignored.js 'export const policy="deny"'
+fixture_add_module "$package" vendor/cometix-asr/ignored.js 'export const policy="deny"'
+fixture_add_module "$package" .cc-patch-manager-transaction-stale/ignored.js 'export const policy="deny"'
 fixture_add_module "$package" cli.js '#!/usr/bin/env node
 import "./chunks/entry.js"'
 
@@ -30,6 +32,8 @@ set -e
 grep -Fx 'TARGET_FILE:"chunks/source.js"' <<<"$output" >/dev/null || fail 'marker source candidate missing'
 grep -Fx 'BINDING_SOURCE:"chunks/source.js":policy' <<<"$output" >/dev/null || fail 'import alias did not resolve to source export'
 grep -F 'node_modules/ignored.js' <<<"$output" >/dev/null && fail 'node_modules marker candidate was included'
+grep -F 'vendor/cometix-asr/ignored.js' <<<"$output" >/dev/null && fail 'managed vendor marker candidate was included'
+grep -F '.cc-patch-manager-transaction-stale/ignored.js' <<<"$output" >/dev/null && fail 'transaction marker candidate was included'
 grep -F 'chunks/unrelated.js' <<<"$output" >/dev/null && fail 'unrelated marker candidate was included'
 
 fixture_add_module "$package" chunks/star-source.js 'export const throughStar="star-marker"'
@@ -41,6 +45,13 @@ star_status=$?
 set -e
 [[ "$star_status" -eq 0 ]] || fail "export-star probe failed: $star_output"
 grep -Fx 'BINDING_SOURCE:"chunks/star-source.js":throughStar' <<<"$star_output" >/dev/null || fail 'export-star alias did not resolve'
+
+fixture_add_module "$package" chunks/default-source.js 'const hidden="default-marker";export {hidden as default}'
+fixture_add_module "$package" chunks/default-barrel.js 'export * from "./default-source.js"'
+fixture_add_module "$package" chunks/default-consumer.js 'import {default as leakedDefault} from "./default-barrel.js";export{leakedDefault}'
+if runtime_exec index "$(fixture_entry "$package")" chunks/default-consumer.js leakedDefault default-marker >/dev/null 2>&1; then
+  fail 'export-star incorrectly propagated a default export'
+fi
 
 fixture_add_module "$package" chunks/missing.js 'import {absent} from "./source.js";export{absent}'
 if runtime_exec index "$(fixture_entry "$package")" chunks/missing.js absent deny >/dev/null 2>&1; then

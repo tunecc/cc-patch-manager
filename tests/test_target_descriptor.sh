@@ -64,6 +64,11 @@ set -e
 grep -Fx 'TARGET_PACKAGE:@cometix/anthropic-cc' <<<"$new_inspect" >/dev/null || fail 'split package name missing'
 grep -Fx 'TARGET_VERSION:2.1.259' <<<"$new_inspect" >/dev/null || fail 'split package version missing'
 grep -Fx 'TARGET_LAYOUT:split-esm' <<<"$new_inspect" >/dev/null || fail 'split layout missing'
+identity_before=$(sed -n 's/^TARGET_IDENTITY://p' <<<"$new_inspect")
+fixture_add_module "$new_root" vendor/cometix-asr/index.js 'export const managedResource=true'
+fixture_add_module "$new_root" .cc-patch-manager-transaction-stale/snapshot.js 'export const transactionSnapshot=true'
+identity_after=$(runtime_exec inspect "$(fixture_entry "$new_root")" | sed -n 's/^TARGET_IDENTITY://p')
+assert_eq "$identity_after" "$identity_before" 'manager resources must not change package identity'
 
 old_inspect=$(runtime_exec inspect "$(fixture_entry "$old_root")")
 grep -Fx 'TARGET_PACKAGE:@cometix/claude-code' <<<"$old_inspect" >/dev/null || fail 'single package name missing'
@@ -80,6 +85,41 @@ fixture_make_package "$broken_root" split-esm '@cometix/anthropic-cc' 2.1.259
 printf '#!/usr/bin/env node\nimport "./chunks/missing.js"\n' >"$broken_root/cli.js"
 if runtime_exec inspect "$(fixture_entry "$broken_root")" >/dev/null 2>&1; then
   fail 'split entry with a missing relative module was accepted'
+fi
+
+mixed_root="$tmp/mixed/@cometix/anthropic-cc"
+fixture_make_package "$mixed_root" split-esm '@cometix/anthropic-cc' 2.1.259
+printf 'module.exports = {}\n' >>"$mixed_root/cli.js"
+if runtime_exec inspect "$(fixture_entry "$mixed_root")" >/dev/null 2>&1; then
+  fail 'entry with conflicting CJS and split-ESM evidence was accepted'
+fi
+
+json_root="$tmp/json/@cometix/anthropic-cc"
+fixture_make_package "$json_root" split-esm '@cometix/anthropic-cc' 2.1.259
+printf '{"enabled":true}\n' >"$json_root/config.json"
+printf '#!/usr/bin/env node\nimport "./config.json"\n' >"$json_root/cli.js"
+if runtime_exec inspect "$(fixture_entry "$json_root")" >/dev/null 2>&1; then
+  fail 'non-JavaScript relative import was treated as split-ESM evidence'
+fi
+
+escape_root="$tmp/escape/@cometix/anthropic-cc"
+fixture_make_package "$escape_root" split-esm '@cometix/anthropic-cc' 2.1.259
+printf 'export const outside=true\n' >"$tmp/outside.js"
+ln -s "$tmp/outside.js" "$escape_root/chunks/escape.js"
+printf '#!/usr/bin/env node\nimport "./chunks/escape.js"\n' >"$escape_root/cli.js"
+if runtime_exec inspect "$(fixture_entry "$escape_root")" >/dev/null 2>&1; then
+  fail 'relative module symlink escaped the package root'
+fi
+
+if voice_mode_supported; then
+  safety_root="$tmp/safety/@cometix/anthropic-cc"
+  fixture_make_package "$safety_root" split-esm '@cometix/anthropic-cc' 2.1.259
+  CLI_PATH=$(fixture_entry "$safety_root")
+  if run_node_patch voice-mode apply >/dev/null 2>&1; then
+    fail 'split package was sent through the legacy VoiceMode engine'
+  fi
+  [[ ! -e "$safety_root/vendor/cometix-asr" ]] || fail 'rejected split package was mutated before analysis'
+  [[ "${MSG[voice-mode]:-}" == *'split-esm'* ]] || fail 'split rejection did not explain the incompatible engine path'
 fi
 
 printf 'PASS: target resolution and structural layout inspection support both packages\n'

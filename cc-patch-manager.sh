@@ -629,6 +629,7 @@ function resolveRelativeModule(packageRoot, importer, specifier) {
   const candidates = [unresolved, `${unresolved}.js`, `${unresolved}.mjs`, path.join(unresolved, 'index.js')];
   const found = candidates.find(candidate => fs.existsSync(candidate) && fs.statSync(candidate).isFile());
   if (!found) fail(`relative module ${specifier} imported by ${importer} does not exist`);
+  if (!/\.(?:js|mjs)$/.test(found)) fail(`relative module is not JavaScript: ${specifier}`);
   const real = fs.realpathSync(found);
   if (!insideRoot(packageRoot, real)) fail(`relative module escapes package root: ${specifier}`);
   return real;
@@ -650,14 +651,22 @@ function hasCommonJsShape(ast) {
   return false;
 }
 
+function excludedPackagePath(relativePath) {
+  const parts = relativePath.split(path.sep);
+  return parts.includes('node_modules') || parts.includes('vendor') ||
+    parts.includes('.cc-patch-manager-baseline') ||
+    parts.some(part => part.startsWith('.cc-patch-manager-transaction') || part.startsWith('.cc-patch-manager-tx'));
+}
+
 function packageModulePaths(packageRoot) {
   const paths = [];
   const visit = directory => {
     for (const entry of fs.readdirSync(directory, {withFileTypes: true})) {
-      if (entry.name === 'node_modules' || entry.name === '.cc-patch-manager-baseline') continue;
       const absolute = path.join(directory, entry.name);
+      const relative = path.relative(packageRoot, absolute);
+      if (excludedPackagePath(relative)) continue;
       if (entry.isDirectory()) visit(absolute);
-      else if (entry.isFile() && /\.(?:js|mjs)$/.test(entry.name)) paths.push(path.relative(packageRoot, absolute));
+      else if (entry.isFile() && /\.(?:js|mjs)$/.test(entry.name)) paths.push(relative);
     }
   };
   visit(packageRoot);
@@ -755,7 +764,7 @@ class ModuleIndex {
     const nextSeen = new Set(seen).add(key);
     const record = this.load(file);
     const bindings = record.exports.get(exportedName) || [];
-    if (bindings.length === 0 && record.exportAll.length > 0) {
+    if (bindings.length === 0 && exportedName !== 'default' && record.exportAll.length > 0) {
       const candidates = [];
       for (const sourceFile of record.exportAll) {
         try {
@@ -807,8 +816,10 @@ function inspectTarget(entry) {
   const moduleProgram = parseProgram(entryPath, 'module');
   const specifiers = relativeSpecifiers(moduleProgram.ast);
   const resolvedModules = specifiers.map(specifier => resolveRelativeModule(packageRoot, entryPath, specifier));
+  const commonJsShape = hasCommonJsShape(moduleProgram.ast);
   let layout;
   if (resolvedModules.length > 0) {
+    if (commonJsShape) fail('entry has conflicting split-ESM and CommonJS evidence');
     layout = 'split-esm';
   } else {
     const scriptProgram = parseProgram(entryPath, 'script');
@@ -862,6 +873,27 @@ runtime_exec() {
   rm -f "$runtime"
   printf '%s\n' "$output"
   return "$status"
+}
+
+target_declares_cruce() {
+  node - "$1" <<'NODE'
+const fs = require('fs');
+const path = require('path');
+let cursor = path.dirname(path.resolve(process.argv[2]));
+for (;;) {
+  const manifest = path.join(cursor, 'package.json');
+  if (fs.existsSync(manifest)) {
+    try {
+      process.exit(JSON.parse(fs.readFileSync(manifest, 'utf8')).name === '@cometix/anthropic-cc' ? 0 : 1);
+    } catch {
+      process.exit(1);
+    }
+  }
+  const parent = path.dirname(cursor);
+  if (parent === cursor) process.exit(1);
+  cursor = parent;
+}
+NODE
 }
 
 # write_patch_script id → prints temp file path
@@ -3538,7 +3570,7 @@ PATCH_EOF
 run_node_patch() {
   local id="$1"
   local mode="$2"   # check|apply
-  local script check_arg="" output ec=0
+  local script check_arg="" output ec=0 target_info target_layout
 
   if [[ "$id" == "voice-mode" ]] && ! voice_mode_supported; then
     voice_mode_platform_error
@@ -3557,6 +3589,25 @@ run_node_patch() {
   if ! ensure_node || ! ensure_acorn; then
     STATUS[$id]=error
     MSG[$id]="缺少 node 或 acorn"
+    return 1
+  fi
+
+  set +e
+  target_info=$(runtime_exec inspect "$CLI_PATH" 2>&1)
+  ec=$?
+  set -e
+  if [[ "$ec" -eq 0 ]]; then
+    target_layout=$(printf '%s\n' "$target_info" | sed -n 's/^TARGET_LAYOUT://p' | head -1)
+    if [[ "$target_layout" == "split-esm" ]]; then
+      STATUS[$id]=error
+      MSG[$id]="split-esm 尚未接入统一补丁引擎，已拒绝旧单文件写入路径"
+      LAST_OUTPUT="$target_info"
+      return 1
+    fi
+  elif target_declares_cruce "$CLI_PATH"; then
+    STATUS[$id]=error
+    MSG[$id]="cruce 目标结构检查失败，已拒绝旧单文件写入路径"
+    LAST_OUTPUT="$target_info"
     return 1
   fi
 
