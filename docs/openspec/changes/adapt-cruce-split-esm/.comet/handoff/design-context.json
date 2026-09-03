@@ -1,0 +1,14 @@
+{
+  "change": "adapt-cruce-split-esm",
+  "phase": "design",
+  "mode": "compact",
+  "canonical_spec": "openspec",
+  "generated_by": "comet-handoff.sh",
+  "context_hash": "fa67a3c5dc7b2824cc3492cb1166a9c7479c88cf334fecea5e85dceb808aa035",
+  "files": [
+    { "path": "docs/openspec/changes/adapt-cruce-split-esm/proposal.md", "sha256": "851f1b27e5033a78f148803592af6f01eab252bc0b341001d376fb13fd678a8f" },
+    { "path": "docs/openspec/changes/adapt-cruce-split-esm/design.md", "sha256": "524a34680ade24716c38972ebfd0f4535d3aa15455c3ab01451e03d04eca4637" },
+    { "path": "docs/openspec/changes/adapt-cruce-split-esm/tasks.md", "sha256": "93c45b818ccf3151770e88a1936f9b5123deaffb72d7f7632348c5a64aa1e147" },
+    { "path": "docs/openspec/changes/adapt-cruce-split-esm/specs/patch-manager-dual-layout/spec.md", "sha256": "04c8b893f46c41668ddad823a5f5dd78bba5bb318cad2a4a091eb825118bb896" }
+  ]
+}
