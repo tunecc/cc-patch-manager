@@ -328,7 +328,7 @@ git commit -m "feat: record package-level patch baselines"
 
 **Interfaces:** Produces `migrateLegacyBaseline(target)` only for identity-compatible single-CJS.
 
-- [ ] **Step 1: 写迁移失败测试**
+- [x] **Step 1: 写迁移失败测试**
 
 ```bash
 cp "$(fixture_entry "$tmp/old")" "$(fixture_entry "$tmp/old").cc-patch-baseline"
@@ -337,13 +337,13 @@ test -f "$tmp/old/.cc-patch-manager-baseline/files/cli.js"
 test -f "$(fixture_entry "$tmp/old").cc-patch-baseline"
 ```
 
-- [ ] **Step 2: 确认红灯**
+- [x] **Step 2: 确认红灯**
 
 Run: `bash tests/test_package_baseline_transaction.sh`
 
 Expected: FAIL；没有 package 基线目录和迁移逻辑。
 
-- [ ] **Step 3: 实施迁移**
+- [x] **Step 3: 实施迁移**
 
 ```javascript
 function migrateLegacyBaseline(target) {
@@ -353,13 +353,13 @@ function migrateLegacyBaseline(target) {
 }
 ```
 
-- [ ] **Step 4: 复跑**
+- [x] **Step 4: 复跑**
 
 Run: `bash tests/test_package_baseline_transaction.sh && bash tests/test_context_limit_integration.sh && bash tests/test_computer_use_integration.sh`
 
 Expected: PASS；匹配旧基线迁移不删除，不匹配旧基线拒绝。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add cc-patch-manager.sh tests/test_package_baseline_transaction.sh tests/test_context_limit_integration.sh tests/test_computer_use_integration.sh

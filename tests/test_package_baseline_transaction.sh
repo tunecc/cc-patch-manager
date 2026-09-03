@@ -177,6 +177,47 @@ if CC_PATCH_TESTING=1 runtime_exec baseline "$(fixture_entry "$externally_modifi
 fi
 [[ "$(fixture_hash_tree "$externally_modified")" == "$external_before" ]] || fail 'external modification rejection changed the package'
 
+legacy="$tmp/legacy"
+fixture_make_package "$legacy" single-cjs '@cometix/claude-code' 2.1.224
+fixture_add_module "$legacy" cli.js '#!/usr/bin/env node
+// Version: 2.1.224
+const alpha="CC_BEFORE_ALPHA",beta="CC_BEFORE_BETA";module.exports={alpha,beta}'
+cp "$(fixture_entry "$legacy")" "$(fixture_entry "$legacy").cc-patch-baseline"
+sed -i '' 's/CC_BEFORE_ALPHA/CC_AFTER_ALPHA/;s/CC_BEFORE_BETA/CC_AFTER_BETA/' "$(fixture_entry "$legacy")"
+CC_PATCH_TESTING=1 runtime_exec backup "$(fixture_entry "$legacy")" >/dev/null 2>&1 || fail 'compatible single-CJS legacy baseline was not migrated'
+legacy_manifest="$legacy/.cc-patch-manager-baseline/manifest.json"
+[[ -f "$legacy_manifest" ]] || fail 'legacy migration did not create a package manifest'
+[[ -f "$(fixture_entry "$legacy").cc-patch-baseline" ]] || fail 'legacy migration removed the old baseline'
+cmp -s "$(fixture_entry "$legacy").cc-patch-baseline" "$legacy/.cc-patch-manager-baseline/files/cli.js" || fail 'legacy migration did not preserve the original entry bytes'
+CC_PATCH_TESTING=1 runtime_exec backup "$(fixture_entry "$legacy")" >/dev/null 2>&1 || fail 'legacy migration was not idempotent'
+
+exact_legacy="$tmp/exact-legacy"
+fixture_make_package "$exact_legacy" single-cjs '@cometix/claude-code' 2.1.224
+cp "$(fixture_entry "$exact_legacy")" "$(fixture_entry "$exact_legacy").cc-patch-baseline"
+CC_PATCH_TESTING=1 runtime_exec backup "$(fixture_entry "$exact_legacy")" >/dev/null 2>&1 || fail 'byte-identical headerless legacy baseline was not migrated'
+
+stale_legacy="$tmp/stale-legacy"
+fixture_make_package "$stale_legacy" single-cjs '@cometix/claude-code' 2.1.224
+fixture_add_module "$stale_legacy" cli.js '#!/usr/bin/env node
+// Version: 2.1.224
+module.exports={current:true}'
+fixture_add_module "$stale_legacy" cli.js.cc-patch-baseline '#!/usr/bin/env node
+// Version: 2.1.223
+module.exports={old:true}'
+if CC_PATCH_TESTING=1 runtime_exec backup "$(fixture_entry "$stale_legacy")" >/dev/null 2>&1; then
+  fail 'identity-mismatched legacy baseline was migrated'
+fi
+[[ ! -e "$stale_legacy/.cc-patch-manager-baseline" ]] || fail 'rejected legacy migration left package baseline state'
+[[ -f "$(fixture_entry "$stale_legacy").cc-patch-baseline" ]] || fail 'rejected migration removed the legacy baseline'
+
+split_legacy="$tmp/split-legacy"
+make_contract_package "$split_legacy"
+cp "$(fixture_entry "$split_legacy")" "$(fixture_entry "$split_legacy").cc-patch-baseline"
+if CC_PATCH_TESTING=1 runtime_exec backup "$(fixture_entry "$split_legacy")" >/dev/null 2>&1; then
+  fail 'split-ESM legacy single-file baseline was migrated'
+fi
+[[ ! -e "$split_legacy/.cc-patch-manager-baseline" ]] || fail 'split-ESM legacy rejection left package baseline state'
+
 printf 'corrupt\n' >>"$package/.cc-patch-manager-baseline/files/chunks/alpha.js"
 if CC_PATCH_TESTING=1 runtime_exec baseline "$(fixture_entry "$package")" __contract__ >/dev/null 2>&1; then
   fail 'corrupt baseline mirror was accepted'

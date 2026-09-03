@@ -974,6 +974,10 @@ function baselineDirectory(target) {
   return path.join(target.packageRoot, '.cc-patch-manager-baseline');
 }
 
+function buildIdentityFromText(text) {
+  return text.slice(0, 4096).match(/(?:Version|VERSION|build(?:Date)?)\s*[:=]\s*["']?([^"'\s,;]+)/i)?.[1] || '';
+}
+
 function lstatIfPresent(candidate) {
   try {
     return fs.lstatSync(candidate);
@@ -1128,6 +1132,74 @@ function writeManifestAtomic(target, manifest, root = baselineDirectory(target))
   return manifestPath;
 }
 
+function migrateLegacyBaseline(target) {
+  if (target.layout !== 'single-cjs') return null;
+  const legacyPath = `${target.entryPath}.cc-patch-baseline`;
+  const legacyStat = lstatIfPresent(legacyPath);
+  if (!legacyStat) return null;
+  if (!legacyStat.isFile() || legacyStat.isSymbolicLink()) throw new Error(`legacy baseline is not a regular file: ${legacyPath}`);
+  assertManagedPathSafe(target.packageRoot, legacyPath);
+
+  const legacyBytes = fs.readFileSync(legacyPath);
+  const currentBytes = fs.readFileSync(target.entryPath);
+  const legacyText = legacyBytes.toString('utf8');
+  try {
+    const ast = acorn.parse(legacyText.replace(/^#![^\n]*(?:\n|$)/, ''), {
+      ecmaVersion: 'latest', sourceType: 'script', allowHashBang: true,
+    });
+    if (!hasCommonJsShape(ast)) throw new Error('legacy baseline has no CommonJS entry shape');
+  } catch (error) {
+    throw new Error(`invalid legacy baseline: ${error.message}`);
+  }
+  for (const sentinel of knownPatchSentinels) {
+    if (legacyText.includes(sentinel.value)) throw new Error(`legacy baseline contains patch sentinel: ${sentinel.value}`);
+  }
+  if (/\bCC_[A-Z0-9_]*(?:PATCH|PATCHED)\b/.test(legacyText)) {
+    throw new Error('legacy baseline contains an unknown patch sentinel');
+  }
+
+  if (!legacyBytes.equals(currentBytes)) {
+    const legacyBuild = buildIdentityFromText(legacyText);
+    const currentBuild = buildIdentityFromText(currentBytes.toString('utf8'));
+    if (!legacyBuild || legacyBuild !== currentBuild || legacyBuild !== target.packageVersion) {
+      throw new Error('legacy baseline build identity does not match current package');
+    }
+  }
+
+  const finalRoot = baselineDirectory(target);
+  assertManagedPathSafe(target.packageRoot, finalRoot);
+  if (lstatIfPresent(finalRoot)) throw new Error(`untrusted baseline path already exists: ${finalRoot}`);
+  const stagingRoot = path.join(target.packageRoot, `.cc-patch-manager-baseline.stage-${process.pid}-${crypto.randomBytes(6).toString('hex')}`);
+  const entryPath = path.relative(target.packageRoot, target.entryPath);
+  const entryHash = sha256(legacyBytes);
+  const mirrorRelative = path.join('files', entryPath);
+  const manifest = {
+    schemaVersion: 1,
+    package: {name: target.packageName, version: target.packageVersion, layout: target.layout,
+      identityFingerprint: target.identityFingerprint, entryPath, entrySha256: entryHash},
+    createdAt: new Date().toISOString(),
+    managerVersion: '1.0.0',
+    migratedFrom: path.basename(legacyPath),
+    files: {
+      [entryPath]: {type: 'file', existed: true, sha256: entryHash,
+        mode: legacyStat.mode & 0o777, mirror: mirrorRelative},
+    },
+    createdDirectories: [],
+  };
+  try {
+    writeManagedFileAtomic(target.packageRoot, path.join(stagingRoot, mirrorRelative), legacyBytes, legacyStat.mode & 0o777);
+    writeManifestAtomic(target, manifest, stagingRoot);
+    assertBaselineMirrors(manifest, target, stagingRoot);
+    if (lstatIfPresent(finalRoot)) throw new Error(`untrusted baseline path already exists: ${finalRoot}`);
+    fs.renameSync(stagingRoot, finalRoot);
+    assertManagedPathSafe(target.packageRoot, finalRoot);
+    return path.join(finalRoot, 'manifest.json');
+  } catch (error) {
+    fs.rmSync(stagingRoot, {recursive: true, force: true});
+    throw error;
+  }
+}
+
 function ensureBaselineForPlan(target, plan) {
   let manifest = readBaselineManifest(target);
   const creating = !manifest;
@@ -1257,7 +1329,7 @@ function inspectTarget(entry) {
     layout = 'single-cjs';
   }
 
-  const header = moduleProgram.text.slice(0, 4096).match(/(?:Version|VERSION|build(?:Date)?)\s*[:=]\s*["']?([^"'\s,;]+)/i)?.[1] || '';
+  const header = buildIdentityFromText(moduleProgram.text);
   const modulePaths = layout === 'split-esm' ? packageModulePaths(packageRoot) : ['cli.js'];
   const identityFingerprint = sha256(JSON.stringify({manifest: sha256(manifestText), header, modulePaths}));
   return {entryPath, packageRoot, packageName: manifest.name, packageVersion: String(manifest.version || ''), layout, identityFingerprint, resolvedModules};
@@ -1291,6 +1363,22 @@ if (command === 'inspect') {
     fail(error.message);
   }
   console.log(`BINDING_SOURCE:${JSON.stringify(path.relative(target.packageRoot, binding.file))}:${binding.exportedName}`);
+} else if (command === 'backup') {
+  let manifestPath;
+  try {
+    const manifest = readBaselineManifest(target);
+    if (manifest) {
+      assertBaselineIdentity(manifest, target);
+      assertBaselineMirrors(manifest, target);
+      manifestPath = path.join(baselineDirectory(target), 'manifest.json');
+    } else {
+      manifestPath = migrateLegacyBaseline(target);
+      if (!manifestPath) throw new Error('compatible legacy baseline not found');
+    }
+  } catch (error) {
+    fail(error.message);
+  }
+  console.log(`BASELINE:${JSON.stringify(manifestPath)}`);
 } else if (command === 'check' || command === 'apply' || command === 'baseline') {
   const patchId = runtimeArgs[0];
   let plan;
