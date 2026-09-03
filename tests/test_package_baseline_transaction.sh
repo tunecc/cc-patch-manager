@@ -218,6 +218,25 @@ if CC_PATCH_TESTING=1 runtime_exec backup "$(fixture_entry "$split_legacy")" >/d
 fi
 [[ ! -e "$split_legacy/.cc-patch-manager-baseline" ]] || fail 'split-ESM legacy rejection left package baseline state'
 
+transaction="$tmp/transaction"
+make_contract_package "$transaction"
+fixture_add_module "$transaction" assets/model.bin 'voice-resource'
+printf '\n// CC_CONTRACT_RESOURCE:assets/model.bin->vendor/cometix-asr/model.bin\n' >>"$transaction/cli.js"
+CC_PATCH_TESTING=1 runtime_exec baseline "$(fixture_entry "$transaction")" __contract__ >/dev/null
+for fail_after in 1 2 3; do
+  transaction_before=$(fixture_hash_tree "$transaction")
+  if CC_PATCH_TESTING=1 CC_PATCH_TEST_FAIL_AFTER="$fail_after" runtime_exec apply "$(fixture_entry "$transaction")" __contract__ >/dev/null 2>&1; then
+    fail "transaction failure injection $fail_after did not interrupt apply"
+  fi
+  [[ "$(fixture_hash_tree "$transaction")" == "$transaction_before" ]] || fail "transaction failure $fail_after did not restore the package tree"
+  [[ ! -e "$transaction/vendor/cometix-asr/model.bin" ]] || fail "transaction failure $fail_after left a copied resource"
+  [[ -z "$(find "$transaction" -maxdepth 1 -name '.cc-patch-manager-transaction-*' -print -quit)" ]] || fail "transaction failure $fail_after left a transaction directory"
+done
+CC_PATCH_TESTING=1 runtime_exec apply "$(fixture_entry "$transaction")" __contract__ >/dev/null 2>&1 || fail 'multi-file transaction did not commit'
+grep -Fq 'CC_AFTER_ALPHA' "$transaction/chunks/alpha.js" || fail 'transaction did not commit alpha replacement'
+grep -Fq 'CC_AFTER_BETA' "$transaction/chunks/beta.js" || fail 'transaction did not commit beta replacement'
+cmp -s "$transaction/assets/model.bin" "$transaction/vendor/cometix-asr/model.bin" || fail 'transaction did not commit resource copy'
+
 printf 'corrupt\n' >>"$package/.cc-patch-manager-baseline/files/chunks/alpha.js"
 if CC_PATCH_TESTING=1 runtime_exec baseline "$(fixture_entry "$package")" __contract__ >/dev/null 2>&1; then
   fail 'corrupt baseline mirror was accepted'

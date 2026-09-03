@@ -372,7 +372,7 @@ git commit -m "feat: migrate compatible single-file baselines"
 
 **Interfaces:** Produces `commitTransaction(target, operations)` and test-only `CC_PATCH_TEST_FAIL_AFTER`.
 
-- [ ] **Step 1: 写中途失败测试**
+- [x] **Step 1: 写中途失败测试**
 
 ```bash
 before=$(fixture_hash_tree "$tmp/new")
@@ -380,13 +380,13 @@ CC_PATCH_TEST_FAIL_AFTER=2 runtime_exec apply "$(fixture_entry "$tmp/new")" voic
 fixture_assert_tree_equals "$before" "$(fixture_hash_tree "$tmp/new")"
 ```
 
-- [ ] **Step 2: 确认红灯**
+- [x] **Step 2: 确认红灯**
 
 Run: `bash tests/test_package_baseline_transaction.sh`
 
 Expected: FAIL；旧 VoiceMode 资源复制无法回滚。
 
-- [ ] **Step 3: 实施事务**
+- [x] **Step 3: 实施事务**
 
 ```javascript
 function commitTransaction(target, operations) {
@@ -397,13 +397,13 @@ function commitTransaction(target, operations) {
 }
 ```
 
-- [ ] **Step 4: 复跑**
+- [x] **Step 4: 复跑**
 
 Run: `bash tests/test_package_baseline_transaction.sh`
 
 Expected: PASS；任意第 N 次 JS/resource 操作失败后，树回到事务前。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add cc-patch-manager.sh tests/lib/dual-layout-fixture.sh tests/test_package_baseline_transaction.sh

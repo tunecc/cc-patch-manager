@@ -895,7 +895,10 @@ function analyzeContractFixture(target) {
   }
   const entryText = fs.readFileSync(target.entryPath, 'utf8');
   const resources = [...entryText.matchAll(/CC_CONTRACT_RESOURCE:([^\s*]+)/g)]
-    .map(match => ({kind: 'copy', destination: match[1], expectedBefore: 'absent-or-baselined'}));
+    .map(match => {
+      const [source, destination] = match[1].includes('->') ? match[1].split('->', 2) : [null, match[1]];
+      return {kind: 'copy', source, destination, expectedBefore: 'absent-or-baselined'};
+    });
   return {
     patchId: '__contract__',
     state: states.every(state => state === 'after') ? 'already-patched' : 'needs-patch',
@@ -1200,6 +1203,156 @@ function migrateLegacyBaseline(target) {
   }
 }
 
+function managedDestination(target, relativePath) {
+  const absolute = path.resolve(target.packageRoot, relativePath);
+  if (!insideRoot(target.packageRoot, absolute) || relativePath.startsWith('..') || path.isAbsolute(relativePath)) {
+    throw new Error(`transaction path escapes package root: ${relativePath}`);
+  }
+  assertManagedPathSafe(target.packageRoot, absolute);
+  const relativeParts = relativePath.split(/[\\/]/);
+  if (relativeParts.includes('.cc-patch-manager-baseline') ||
+      relativeParts.some(part => part.startsWith('.cc-patch-manager-transaction'))) {
+    throw new Error(`transaction path is reserved: ${relativePath}`);
+  }
+  return absolute;
+}
+
+function transactionOperations(target, plan, renderedFiles) {
+  const operations = renderedFiles.map(file => ({
+    kind: 'write',
+    relativePath: file.relativePath,
+    destination: managedDestination(target, file.relativePath),
+    bytes: Buffer.from(file.rendered),
+    mode: fs.statSync(file.absolute).mode & 0o777,
+  }));
+  for (const resource of plan.resources || []) {
+    if (resource.kind !== 'copy' || !resource.source) throw new Error(`unsupported resource operation: ${resource.kind || 'missing'}`);
+    const source = managedDestination(target, resource.source);
+    const sourceStat = lstatIfPresent(source);
+    if (!sourceStat || !sourceStat.isFile()) throw new Error(`resource source is not a regular file: ${resource.source}`);
+    operations.push({
+      kind: 'copy',
+      relativePath: resource.destination,
+      destination: managedDestination(target, resource.destination),
+      bytes: fs.readFileSync(source),
+      mode: sourceStat.mode & 0o777,
+    });
+  }
+  const destinations = new Set();
+  for (const operation of operations) {
+    if (destinations.has(operation.destination)) throw new Error(`duplicate transaction destination: ${operation.relativePath}`);
+    destinations.add(operation.destination);
+    const current = lstatIfPresent(operation.destination);
+    if (current && !current.isFile()) throw new Error(`transaction destination is not a regular file: ${operation.relativePath}`);
+  }
+  return operations;
+}
+
+function missingParentDirectories(packageRoot, destination) {
+  const relative = path.relative(packageRoot, path.dirname(destination));
+  const missing = [];
+  let cursor = packageRoot;
+  for (const part of relative.split(path.sep).filter(Boolean)) {
+    cursor = path.join(cursor, part);
+    const stat = lstatIfPresent(cursor);
+    if (!stat) missing.push(cursor);
+    else if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`transaction parent is not a safe directory: ${cursor}`);
+  }
+  return missing;
+}
+
+function replaceFileAtomic(packageRoot, destination, bytes, mode) {
+  assertManagedPathSafe(packageRoot, destination);
+  const temporary = path.join(path.dirname(destination), `.cc-patch-manager-write-${process.pid}-${crypto.randomBytes(6).toString('hex')}`);
+  fs.writeFileSync(temporary, bytes, {mode, flag: 'wx'});
+  fs.chmodSync(temporary, mode);
+  fs.renameSync(temporary, destination);
+  assertManagedPathSafe(packageRoot, destination);
+}
+
+function commitTransaction(target, operations) {
+  const txRoot = path.join(target.packageRoot, `.cc-patch-manager-transaction-${process.pid}-${crypto.randomBytes(6).toString('hex')}`);
+  const snapshots = [];
+  const createdDirectories = [];
+  let committed = 0;
+  try {
+    ensureManagedDirectory(target.packageRoot, txRoot);
+    for (const [index, operation] of operations.entries()) {
+      const stat = lstatIfPresent(operation.destination);
+      const snapshot = {operation, existed: Boolean(stat), mode: stat ? stat.mode & 0o777 : null, sha256: null, snapshotPath: null};
+      if (stat) {
+        if (!stat.isFile()) throw new Error(`transaction destination is not a regular file: ${operation.relativePath}`);
+        const bytes = fs.readFileSync(operation.destination);
+        snapshot.sha256 = sha256(bytes);
+        snapshot.snapshotPath = path.join(txRoot, 'before', String(index));
+        writeManagedFileAtomic(target.packageRoot, snapshot.snapshotPath, bytes, snapshot.mode);
+      }
+      const staged = path.join(txRoot, 'after', String(index));
+      writeManagedFileAtomic(target.packageRoot, staged, operation.bytes, operation.mode);
+      snapshot.stagedPath = staged;
+      snapshots.push(snapshot);
+    }
+
+    fs.writeFileSync(path.join(txRoot, 'transaction.json'), `${JSON.stringify({
+      schemaVersion: 1,
+      operations: snapshots.map(snapshot => ({relativePath: snapshot.operation.relativePath,
+        existed: snapshot.existed, mode: snapshot.mode, sha256: snapshot.sha256})),
+    }, null, 2)}\n`, {mode: 0o600, flag: 'wx'});
+
+    for (const snapshot of snapshots) {
+      for (const directory of missingParentDirectories(target.packageRoot, snapshot.operation.destination)) {
+        if (!createdDirectories.includes(directory)) createdDirectories.push(directory);
+      }
+      fs.mkdirSync(path.dirname(snapshot.operation.destination), {recursive: true});
+      assertManagedPathSafe(target.packageRoot, path.dirname(snapshot.operation.destination));
+      fs.renameSync(snapshot.stagedPath, snapshot.operation.destination);
+      fs.chmodSync(snapshot.operation.destination, snapshot.operation.mode);
+      committed += 1;
+      if (process.env.CC_PATCH_TESTING === '1' && Number(process.env.CC_PATCH_TEST_FAIL_AFTER) === committed) {
+        throw new Error(`injected transaction failure after operation ${committed}`);
+      }
+    }
+
+    for (const snapshot of snapshots) {
+      const stat = fs.statSync(snapshot.operation.destination);
+      if (sha256(fs.readFileSync(snapshot.operation.destination)) !== sha256(snapshot.operation.bytes) ||
+          (stat.mode & 0o777) !== snapshot.operation.mode) {
+        throw new Error(`transaction verification failed: ${snapshot.operation.relativePath}`);
+      }
+    }
+  } catch (error) {
+    let rollbackError = null;
+    try {
+      for (const snapshot of snapshots.slice(0, committed).reverse()) {
+        if (snapshot.existed) {
+          replaceFileAtomic(target.packageRoot, snapshot.operation.destination,
+            fs.readFileSync(snapshot.snapshotPath), snapshot.mode);
+        } else if (lstatIfPresent(snapshot.operation.destination)) {
+          fs.unlinkSync(snapshot.operation.destination);
+        }
+      }
+      for (const directory of [...createdDirectories].sort((left, right) => right.length - left.length)) {
+        try { fs.rmdirSync(directory); } catch (directoryError) {
+          if (directoryError.code !== 'ENOENT' && directoryError.code !== 'ENOTEMPTY') throw directoryError;
+        }
+      }
+      for (const snapshot of snapshots) {
+        const current = lstatIfPresent(snapshot.operation.destination);
+        if (snapshot.existed) {
+          if (!current || !current.isFile() || sha256(fs.readFileSync(snapshot.operation.destination)) !== snapshot.sha256 ||
+              (current.mode & 0o777) !== snapshot.mode) throw new Error(`rollback verification failed: ${snapshot.operation.relativePath}`);
+        } else if (current) throw new Error(`rollback left created path: ${snapshot.operation.relativePath}`);
+      }
+    } catch (caught) {
+      rollbackError = caught;
+    }
+    if (rollbackError) throw new Error(`${error.message}; ${rollbackError.message}`);
+    throw error;
+  } finally {
+    fs.rmSync(txRoot, {recursive: true, force: true});
+  }
+}
+
 function ensureBaselineForPlan(target, plan) {
   let manifest = readBaselineManifest(target);
   const creating = !manifest;
@@ -1381,10 +1534,10 @@ if (command === 'inspect') {
   console.log(`BASELINE:${JSON.stringify(manifestPath)}`);
 } else if (command === 'check' || command === 'apply' || command === 'baseline') {
   const patchId = runtimeArgs[0];
-  let plan;
+  let plan, renderedFiles;
   try {
     plan = analyzePatch(target, patchId);
-    validatePlan(target, plan);
+    renderedFiles = validatePlan(target, plan);
   } catch (error) {
     fail(error.message);
   }
@@ -1405,7 +1558,14 @@ if (command === 'inspect') {
   } else if (process.env.CC_PATCH_VALIDATE_ONLY === '1') {
     console.log('PLAN_VALID');
   } else {
-    fail('transaction commit is not implemented');
+    try {
+      const operations = transactionOperations(target, plan, renderedFiles);
+      ensureBaselineForPlan(target, plan);
+      commitTransaction(target, operations);
+    } catch (error) {
+      fail(error.message);
+    }
+    console.log(`PATCHED:${plan.patchId}`);
   }
 } else {
   fail(`unsupported runtime command: ${command || 'missing'}`);
