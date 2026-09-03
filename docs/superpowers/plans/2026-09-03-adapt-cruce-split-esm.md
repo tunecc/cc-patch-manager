@@ -286,7 +286,7 @@ git commit -m "feat: validate shared multi-file patch plans"
 
 **Interfaces:** Produces `BaselineManifest { schemaVersion, package, files, createdDirectories }` and `baselinePath(descriptor)`.
 
-- [ ] **Step 1: 写陈旧身份测试**
+- [x] **Step 1: 写陈旧身份测试**
 
 ```bash
 runtime_exec apply "$(fixture_entry "$tmp/new")" keybindings
@@ -296,26 +296,26 @@ echo different-build >>"$tmp/new/package.json"
 runtime_exec restore "$(fixture_entry "$tmp/new")" keybindings && fail 'stale baseline restored'
 ```
 
-- [ ] **Step 2: 确认红灯**
+- [x] **Step 2: 确认红灯**
 
 Run: `bash tests/test_package_baseline_transaction.sh`
 
 Expected: FAIL；当前仅有 `cli.js.cc-patch-baseline`。
 
-- [ ] **Step 3: 实施 manifest**
+- [x] **Step 3: 实施 manifest**
 
 ```javascript
 function makeManifest(target) { return {schemaVersion: 1, package: {name: target.packageName, version: target.packageVersion, layout: target.layout, identityFingerprint: target.identityFingerprint}, files: {}, createdDirectories: []}; }
 function assertBaselineIdentity(m, t) { if (m.package.identityFingerprint !== t.identityFingerprint) throw new Error('stale baseline identity'); }
 ```
 
-- [ ] **Step 4: 复跑**
+- [x] **Step 4: 复跑**
 
 Run: `bash tests/test_package_baseline_transaction.sh`
 
 Expected: PASS；路径存在状态、mode、镜像 SHA-256 与 package 身份均受校验，未知修改不得静默接纳。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add cc-patch-manager.sh tests/lib/dual-layout-fixture.sh tests/test_package_baseline_transaction.sh

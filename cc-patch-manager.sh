@@ -947,6 +947,85 @@ function analyzePatch(target, patchId) {
   throw new Error(`unsupported patch id: ${patchId}`);
 }
 
+function baselineDirectory(target) {
+  return path.join(target.packageRoot, '.cc-patch-manager-baseline');
+}
+
+function readBaselineManifest(target) {
+  const manifestPath = path.join(baselineDirectory(target), 'manifest.json');
+  if (!fs.existsSync(manifestPath)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  } catch (error) {
+    throw new Error(`invalid baseline manifest: ${error.message}`);
+  }
+}
+
+function assertBaselineIdentity(manifest, target) {
+  const expected = manifest.package || {};
+  if (expected.name !== target.packageName || expected.version !== target.packageVersion ||
+      expected.layout !== target.layout || expected.identityFingerprint !== target.identityFingerprint) {
+    throw new Error('stale baseline package identity');
+  }
+}
+
+function assertBaselineMirrors(manifest, target) {
+  const root = baselineDirectory(target);
+  for (const [relativePath, item] of Object.entries(manifest.files || {})) {
+    if (!item.existed) continue;
+    const mirror = packageFile(root, item.mirror);
+    const actual = sha256(fs.readFileSync(mirror));
+    if (actual !== item.sha256) throw new Error(`corrupt baseline mirror: ${relativePath}`);
+  }
+}
+
+function writeManifestAtomic(target, manifest) {
+  const root = baselineDirectory(target);
+  fs.mkdirSync(root, {recursive: true});
+  const manifestPath = path.join(root, 'manifest.json');
+  const temporary = path.join(root, `.manifest-${process.pid}-${crypto.randomBytes(6).toString('hex')}.tmp`);
+  fs.writeFileSync(temporary, `${JSON.stringify(manifest, null, 2)}\n`, {mode: 0o600});
+  fs.renameSync(temporary, manifestPath);
+  return manifestPath;
+}
+
+function ensureBaselineForPlan(target, plan) {
+  let manifest = readBaselineManifest(target);
+  if (!manifest) {
+    const hasManagedState = plan.semanticTargets.some(semanticTarget =>
+      semanticTarget.matches.some(match => match.state === 'after'));
+    if (hasManagedState) throw new Error('patched or unknown state has no trusted baseline');
+    manifest = {
+      schemaVersion: 1,
+      package: {name: target.packageName, version: target.packageVersion, layout: target.layout, identityFingerprint: target.identityFingerprint},
+      createdAt: new Date().toISOString(),
+      managerVersion: '1.0.0',
+      files: {},
+      createdDirectories: [],
+    };
+  } else {
+    if (manifest.schemaVersion !== 1) throw new Error(`unsupported baseline schema: ${manifest.schemaVersion}`);
+    assertBaselineIdentity(manifest, target);
+    assertBaselineMirrors(manifest, target);
+  }
+
+  const root = baselineDirectory(target);
+  for (const file of plan.files) {
+    if (manifest.files[file.relativePath]) continue;
+    const absolute = packageFile(target.packageRoot, file.relativePath);
+    const bytes = fs.readFileSync(absolute);
+    const mode = fs.statSync(absolute).mode & 0o777;
+    const mirrorRelative = path.join('files', file.relativePath);
+    const mirror = path.join(root, mirrorRelative);
+    fs.mkdirSync(path.dirname(mirror), {recursive: true});
+    fs.writeFileSync(mirror, bytes, {mode});
+    manifest.files[file.relativePath] = {type: 'file', existed: true, sha256: sha256(bytes), mode, mirror: mirrorRelative};
+  }
+  const manifestPath = writeManifestAtomic(target, manifest);
+  assertBaselineMirrors(manifest, target);
+  return manifestPath;
+}
+
 function inspectTarget(entry) {
   if (!entry) fail('entry path is required');
   let entryPath;
@@ -1012,7 +1091,7 @@ if (command === 'inspect') {
     fail(error.message);
   }
   console.log(`BINDING_SOURCE:${JSON.stringify(path.relative(target.packageRoot, binding.file))}:${binding.exportedName}`);
-} else if (command === 'check' || command === 'apply') {
+} else if (command === 'check' || command === 'apply' || command === 'baseline') {
   const patchId = runtimeArgs[0];
   let plan;
   try {
@@ -1022,7 +1101,15 @@ if (command === 'inspect') {
     fail(error.message);
   }
   console.log(`ANALYSIS_HASH:${sha256(JSON.stringify(plan))}`);
-  if (plan.state === 'already-patched') {
+  if (command === 'baseline') {
+    let manifestPath;
+    try {
+      manifestPath = ensureBaselineForPlan(target, plan);
+    } catch (error) {
+      fail(error.message);
+    }
+    console.log(`BASELINE:${JSON.stringify(manifestPath)}`);
+  } else if (plan.state === 'already-patched') {
     console.log('ALREADY_PATCHED');
   } else if (command === 'check') {
     console.log('NEEDS_PATCH');
