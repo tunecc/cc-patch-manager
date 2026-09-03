@@ -108,7 +108,7 @@ git commit -m "test: cover dual package target discovery"
 
 **Interfaces:** Produces `TargetDescriptor { entryPath, packageRoot, packageName, packageVersion, layout, identityFingerprint }` and `runtime_exec inspect`.
 
-- [ ] **Step 1: 写失败断言**
+- [x] **Step 1: 写失败断言**
 
 ```bash
 out=$(runtime_exec inspect "$(fixture_entry "$tmp/new")")
@@ -117,13 +117,13 @@ grep -Fx 'TARGET_LAYOUT:split-esm' <<<"$out"
 runtime_exec inspect "$(fixture_entry "$tmp/unsupported")" && fail 'unsupported package accepted'
 ```
 
-- [ ] **Step 2: 确认红灯**
+- [x] **Step 2: 确认红灯**
 
 Run: `bash tests/test_target_descriptor.sh`
 
 Expected: FAIL；尚无 runtime 和 `TARGET_*` 机器协议。
 
-- [ ] **Step 3: 实施结构检查**
+- [x] **Step 3: 实施结构检查**
 
 ```javascript
 function inspectTarget(entryPath) {
@@ -135,13 +135,13 @@ function inspectTarget(entryPath) {
 }
 ```
 
-- [ ] **Step 4: 复跑**
+- [x] **Step 4: 复跑**
 
 Run: `bash tests/test_target_descriptor.sh && bash tests/test_fast_apply_all.sh`
 
 Expected: PASS；包根越界、非支持包和无结构证据目标失败。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add cc-patch-manager.sh tests/test_target_descriptor.sh

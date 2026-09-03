@@ -566,6 +566,170 @@ parse_and_set_status() {
   return 1
 }
 
+# Unified runtime. Later tasks add scanning, PatchPlan, transactions, and analyzers here.
+write_patch_runtime() {
+  local tmp
+  tmp=$(mktemp)
+  cat >"$tmp" <<'RUNTIME_EOF'
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const acorn = require(process.argv[2]);
+
+const command = process.argv[3];
+const requestedEntry = process.argv[4];
+const supportedPackages = new Set(['@cometix/claude-code', '@cometix/anthropic-cc']);
+
+function fail(message) {
+  console.error(`TARGET_ERROR:${JSON.stringify(message)}`);
+  process.exit(1);
+}
+
+function sha256(value) {
+  return crypto.createHash('sha256').update(value).digest('hex');
+}
+
+function insideRoot(root, candidate) {
+  return candidate === root || candidate.startsWith(`${root}${path.sep}`);
+}
+
+function findPackageRoot(entryPath) {
+  let cursor = path.dirname(entryPath);
+  for (;;) {
+    const manifest = path.join(cursor, 'package.json');
+    if (fs.existsSync(manifest) && fs.statSync(manifest).isFile()) return cursor;
+    const parent = path.dirname(cursor);
+    if (parent === cursor) fail(`package.json not found above ${entryPath}`);
+    cursor = parent;
+  }
+}
+
+function parseProgram(file, sourceType) {
+  const text = fs.readFileSync(file, 'utf8');
+  try {
+    return {text, ast: acorn.parse(text, {ecmaVersion: 'latest', sourceType, allowHashBang: true})};
+  } catch (error) {
+    fail(`cannot parse ${file} as ${sourceType}: ${error.message}`);
+  }
+}
+
+function relativeSpecifiers(ast) {
+  const values = [];
+  for (const node of ast.body) {
+    const isImport = node.type === 'ImportDeclaration';
+    const isExport = node.type === 'ExportNamedDeclaration' || node.type === 'ExportAllDeclaration';
+    if ((isImport || isExport) && node.source?.value?.startsWith('.')) values.push(node.source.value);
+  }
+  return values;
+}
+
+function resolveRelativeModule(packageRoot, importer, specifier) {
+  const unresolved = path.resolve(path.dirname(importer), specifier);
+  const candidates = [unresolved, `${unresolved}.js`, `${unresolved}.mjs`, path.join(unresolved, 'index.js')];
+  const found = candidates.find(candidate => fs.existsSync(candidate) && fs.statSync(candidate).isFile());
+  if (!found) fail(`relative module ${specifier} imported by ${importer} does not exist`);
+  const real = fs.realpathSync(found);
+  if (!insideRoot(packageRoot, real)) fail(`relative module escapes package root: ${specifier}`);
+  return real;
+}
+
+function hasCommonJsShape(ast) {
+  const stack = [ast];
+  while (stack.length) {
+    const node = stack.pop();
+    if (!node || typeof node !== 'object') continue;
+    if (node.type === 'CallExpression' && node.callee?.type === 'Identifier' && node.callee.name === 'require') return true;
+    if (node.type === 'MemberExpression' && node.object?.type === 'Identifier' && node.object.name === 'module') return true;
+    for (const [key, value] of Object.entries(node)) {
+      if (key === 'start' || key === 'end') continue;
+      if (Array.isArray(value)) stack.push(...value);
+      else if (value && typeof value === 'object') stack.push(value);
+    }
+  }
+  return false;
+}
+
+function packageModulePaths(packageRoot) {
+  const paths = [];
+  const visit = directory => {
+    for (const entry of fs.readdirSync(directory, {withFileTypes: true})) {
+      if (entry.name === 'node_modules' || entry.name === '.cc-patch-manager-baseline') continue;
+      const absolute = path.join(directory, entry.name);
+      if (entry.isDirectory()) visit(absolute);
+      else if (entry.isFile() && /\.(?:js|mjs)$/.test(entry.name)) paths.push(path.relative(packageRoot, absolute));
+    }
+  };
+  visit(packageRoot);
+  return paths.sort();
+}
+
+function inspectTarget(entry) {
+  if (!entry) fail('entry path is required');
+  let entryPath;
+  try {
+    entryPath = fs.realpathSync(entry);
+  } catch (error) {
+    fail(`entry is not readable: ${entry}: ${error.message}`);
+  }
+  if (!fs.statSync(entryPath).isFile()) fail(`entry is not a file: ${entryPath}`);
+
+  const packageRoot = fs.realpathSync(findPackageRoot(entryPath));
+  if (!insideRoot(packageRoot, entryPath)) fail(`entry escapes package root: ${entryPath}`);
+  const manifestPath = path.join(packageRoot, 'package.json');
+  const manifestText = fs.readFileSync(manifestPath, 'utf8');
+  let manifest;
+  try {
+    manifest = JSON.parse(manifestText);
+  } catch (error) {
+    fail(`invalid package.json: ${error.message}`);
+  }
+  if (!supportedPackages.has(manifest.name)) fail(`unsupported package: ${manifest.name || 'unnamed'}`);
+
+  const moduleProgram = parseProgram(entryPath, 'module');
+  const specifiers = relativeSpecifiers(moduleProgram.ast);
+  const resolvedModules = specifiers.map(specifier => resolveRelativeModule(packageRoot, entryPath, specifier));
+  let layout;
+  if (resolvedModules.length > 0) {
+    layout = 'split-esm';
+  } else {
+    const scriptProgram = parseProgram(entryPath, 'script');
+    if (!hasCommonJsShape(scriptProgram.ast)) fail('entry has neither split-ESM imports nor a single-CJS shape');
+    layout = 'single-cjs';
+  }
+
+  const header = moduleProgram.text.slice(0, 4096).match(/(?:Version|VERSION|build(?:Date)?)\s*[:=]\s*["']?([^"'\s,;]+)/i)?.[1] || '';
+  const modulePaths = layout === 'split-esm' ? packageModulePaths(packageRoot) : ['cli.js'];
+  const identityFingerprint = sha256(JSON.stringify({manifest: sha256(manifestText), header, modulePaths}));
+  return {entryPath, packageRoot, packageName: manifest.name, packageVersion: String(manifest.version || ''), layout, identityFingerprint, resolvedModules};
+}
+
+if (command !== 'inspect') fail(`unsupported runtime command: ${command || 'missing'}`);
+const target = inspectTarget(requestedEntry);
+console.log(`TARGET_PACKAGE:${target.packageName}`);
+console.log(`TARGET_VERSION:${target.packageVersion}`);
+console.log(`TARGET_LAYOUT:${target.layout}`);
+console.log(`TARGET_ENTRY:${JSON.stringify(target.entryPath)}`);
+console.log(`TARGET_ROOT:${JSON.stringify(target.packageRoot)}`);
+console.log(`TARGET_IDENTITY:${target.identityFingerprint}`);
+for (const file of target.resolvedModules) console.log(`TARGET_FILE:${JSON.stringify(path.relative(target.packageRoot, file))}`);
+RUNTIME_EOF
+  printf '%s\n' "$tmp"
+}
+
+runtime_exec() {
+  local command="$1" entry="$2" patch_id="${3:-}" runtime output status
+  ensure_node || return 1
+  ensure_acorn || return 1
+  runtime=$(write_patch_runtime) || return 1
+  set +e
+  output=$(node "$runtime" "$ACORN_PATH" "$command" "$entry" "$patch_id" 2>&1)
+  status=$?
+  set -e
+  rm -f "$runtime"
+  printf '%s\n' "$output"
+  return "$status"
+}
+
 # write_patch_script id → prints temp file path
 write_patch_script() {
   local id="$1"

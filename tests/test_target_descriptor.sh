@@ -56,4 +56,30 @@ if resolve_target "$tmp/missing/cli.js"; then
 fi
 [[ -z "$CLI_PATH" ]] || fail 'failed explicit target must clear CLI_PATH'
 
-printf 'PASS: target resolution preserves priority and discovers both packages\n'
+set +e
+new_inspect=$(runtime_exec inspect "$(fixture_entry "$new_root")" 2>&1)
+new_status=$?
+set -e
+[[ "$new_status" -eq 0 ]] || fail "split-esm inspect failed: $new_inspect"
+grep -Fx 'TARGET_PACKAGE:@cometix/anthropic-cc' <<<"$new_inspect" >/dev/null || fail 'split package name missing'
+grep -Fx 'TARGET_VERSION:2.1.259' <<<"$new_inspect" >/dev/null || fail 'split package version missing'
+grep -Fx 'TARGET_LAYOUT:split-esm' <<<"$new_inspect" >/dev/null || fail 'split layout missing'
+
+old_inspect=$(runtime_exec inspect "$(fixture_entry "$old_root")")
+grep -Fx 'TARGET_PACKAGE:@cometix/claude-code' <<<"$old_inspect" >/dev/null || fail 'single package name missing'
+grep -Fx 'TARGET_LAYOUT:single-cjs' <<<"$old_inspect" >/dev/null || fail 'single layout missing'
+
+unsupported_root="$tmp/unsupported"
+fixture_make_package "$unsupported_root" single-cjs '@example/not-claude-code' 1.0.0
+if runtime_exec inspect "$(fixture_entry "$unsupported_root")" >/dev/null 2>&1; then
+  fail 'unsupported package was accepted'
+fi
+
+broken_root="$tmp/broken/@cometix/anthropic-cc"
+fixture_make_package "$broken_root" split-esm '@cometix/anthropic-cc' 2.1.259
+printf '#!/usr/bin/env node\nimport "./chunks/missing.js"\n' >"$broken_root/cli.js"
+if runtime_exec inspect "$(fixture_entry "$broken_root")" >/dev/null 2>&1; then
+  fail 'split entry with a missing relative module was accepted'
+fi
+
+printf 'PASS: target resolution and structural layout inspection support both packages\n'
