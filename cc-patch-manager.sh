@@ -578,6 +578,7 @@ const acorn = require(process.argv[2]);
 
 const command = process.argv[3];
 const requestedEntry = process.argv[4];
+const runtimeArgs = process.argv.slice(5);
 const supportedPackages = new Set(['@cometix/claude-code', '@cometix/anthropic-cc']);
 
 function fail(message) {
@@ -663,6 +664,124 @@ function packageModulePaths(packageRoot) {
   return paths.sort();
 }
 
+function packageFile(packageRoot, relativePath) {
+  const absolute = path.resolve(packageRoot, relativePath);
+  if (!insideRoot(packageRoot, absolute)) fail(`module path escapes package root: ${relativePath}`);
+  if (relativePath.split(/[\\/]/).includes('node_modules')) fail(`node_modules is not indexable: ${relativePath}`);
+  if (!fs.existsSync(absolute) || !fs.statSync(absolute).isFile()) fail(`module does not exist: ${relativePath}`);
+  const real = fs.realpathSync(absolute);
+  if (!insideRoot(packageRoot, real)) fail(`module symlink escapes package root: ${relativePath}`);
+  return real;
+}
+
+function declaredNames(declaration) {
+  if (!declaration) return [];
+  if (declaration.id?.name) return [declaration.id.name];
+  if (declaration.type === 'VariableDeclaration') {
+    return declaration.declarations.map(item => item.id?.name).filter(Boolean);
+  }
+  return [];
+}
+
+class ModuleIndex {
+  constructor(target) {
+    this.target = target;
+    this.records = new Map();
+  }
+
+  load(file) {
+    file = fs.realpathSync(file);
+    if (this.records.has(file)) return this.records.get(file);
+    const {ast} = parseProgram(file, 'module');
+    const record = {locals: new Map(), exports: new Map(), exportAll: []};
+    this.records.set(file, record);
+    const addExport = (name, binding) => {
+      const bindings = record.exports.get(name) || [];
+      bindings.push(binding);
+      record.exports.set(name, bindings);
+    };
+
+    for (const node of ast.body) {
+      if (node.type === 'ImportDeclaration') {
+        const sourceFile = resolveRelativeModule(this.target.packageRoot, file, node.source.value);
+        for (const specifier of node.specifiers) {
+          const exportedName = specifier.type === 'ImportDefaultSpecifier' ? 'default' : specifier.imported?.name;
+          if (!exportedName) throw new Error(`unsupported namespace import in ${file}`);
+          record.locals.set(specifier.local.name, {kind: 'import', sourceFile, exportedName});
+        }
+        continue;
+      }
+
+      if (node.type === 'VariableDeclaration' || node.type === 'FunctionDeclaration' || node.type === 'ClassDeclaration') {
+        for (const name of declaredNames(node)) record.locals.set(name, {kind: 'local', file, name});
+        continue;
+      }
+
+      if (node.type === 'ExportNamedDeclaration') {
+        for (const name of declaredNames(node.declaration)) {
+          record.locals.set(name, {kind: 'local', file, name});
+          addExport(name, {kind: 'local-export', localName: name});
+        }
+        const sourceFile = node.source ? resolveRelativeModule(this.target.packageRoot, file, node.source.value) : null;
+        for (const specifier of node.specifiers) {
+          const exportedName = specifier.exported.name;
+          if (sourceFile) addExport(exportedName, {kind: 'reexport', sourceFile, importedName: specifier.local.name});
+          else addExport(exportedName, {kind: 'local-export', localName: specifier.local.name});
+        }
+        continue;
+      }
+      if (node.type === 'ExportAllDeclaration') {
+        record.exportAll.push(resolveRelativeModule(this.target.packageRoot, file, node.source.value));
+      }
+    }
+    return record;
+  }
+
+  resolveLocal(file, localName, seen = new Set()) {
+    file = fs.realpathSync(file);
+    const key = `local:${file}:${localName}`;
+    if (seen.has(key)) throw new Error(`cyclic binding: ${localName}`);
+    const nextSeen = new Set(seen).add(key);
+    const binding = this.load(file).locals.get(localName);
+    if (!binding) throw new Error(`missing local binding ${localName} in ${file}`);
+    if (binding.kind === 'local') return {file, exportedName: binding.name};
+    return this.resolveExport(binding.sourceFile, binding.exportedName, nextSeen);
+  }
+
+  resolveExport(file, exportedName, seen = new Set()) {
+    file = fs.realpathSync(file);
+    const key = `export:${file}:${exportedName}`;
+    if (seen.has(key)) throw new Error(`cyclic re-export: ${exportedName}`);
+    const nextSeen = new Set(seen).add(key);
+    const record = this.load(file);
+    const bindings = record.exports.get(exportedName) || [];
+    if (bindings.length === 0 && record.exportAll.length > 0) {
+      const candidates = [];
+      for (const sourceFile of record.exportAll) {
+        try {
+          candidates.push(this.resolveExport(sourceFile, exportedName, nextSeen));
+        } catch (error) {
+          if (!error.message.startsWith('missing export ')) throw error;
+        }
+      }
+      const unique = [...new Map(candidates.map(candidate => [`${candidate.file}:${candidate.exportedName}`, candidate])).values()];
+      if (unique.length === 1) return unique[0];
+      if (unique.length > 1) throw new Error(`ambiguous export-star ${exportedName} in ${file}: ${unique.length}`);
+    }
+    if (bindings.length === 0) throw new Error(`missing export ${exportedName} in ${file}`);
+    if (bindings.length !== 1) throw new Error(`ambiguous export ${exportedName} in ${file}: ${bindings.length}`);
+    const binding = bindings[0];
+    if (binding.kind === 'reexport') return this.resolveExport(binding.sourceFile, binding.importedName, nextSeen);
+    return this.resolveLocal(file, binding.localName, nextSeen);
+  }
+}
+
+function scanMarkerCandidates(target, marker) {
+  if (!marker) fail('marker is required');
+  return packageModulePaths(target.packageRoot)
+    .filter(relativePath => fs.readFileSync(path.join(target.packageRoot, relativePath), 'utf8').includes(marker));
+}
+
 function inspectTarget(entry) {
   if (!entry) fail('entry path is required');
   let entryPath;
@@ -703,26 +822,41 @@ function inspectTarget(entry) {
   return {entryPath, packageRoot, packageName: manifest.name, packageVersion: String(manifest.version || ''), layout, identityFingerprint, resolvedModules};
 }
 
-if (command !== 'inspect') fail(`unsupported runtime command: ${command || 'missing'}`);
 const target = inspectTarget(requestedEntry);
-console.log(`TARGET_PACKAGE:${target.packageName}`);
-console.log(`TARGET_VERSION:${target.packageVersion}`);
-console.log(`TARGET_LAYOUT:${target.layout}`);
-console.log(`TARGET_ENTRY:${JSON.stringify(target.entryPath)}`);
-console.log(`TARGET_ROOT:${JSON.stringify(target.packageRoot)}`);
-console.log(`TARGET_IDENTITY:${target.identityFingerprint}`);
-for (const file of target.resolvedModules) console.log(`TARGET_FILE:${JSON.stringify(path.relative(target.packageRoot, file))}`);
+if (command === 'inspect') {
+  console.log(`TARGET_PACKAGE:${target.packageName}`);
+  console.log(`TARGET_VERSION:${target.packageVersion}`);
+  console.log(`TARGET_LAYOUT:${target.layout}`);
+  console.log(`TARGET_ENTRY:${JSON.stringify(target.entryPath)}`);
+  console.log(`TARGET_ROOT:${JSON.stringify(target.packageRoot)}`);
+  console.log(`TARGET_IDENTITY:${target.identityFingerprint}`);
+  for (const file of target.resolvedModules) console.log(`TARGET_FILE:${JSON.stringify(path.relative(target.packageRoot, file))}`);
+} else if (command === 'index') {
+  const [relativeFile, localName, marker] = runtimeArgs;
+  const candidates = scanMarkerCandidates(target, marker);
+  for (const file of candidates) console.log(`TARGET_FILE:${JSON.stringify(file)}`);
+  let binding;
+  try {
+    binding = new ModuleIndex(target).resolveLocal(packageFile(target.packageRoot, relativeFile), localName);
+  } catch (error) {
+    fail(error.message);
+  }
+  console.log(`BINDING_SOURCE:${JSON.stringify(path.relative(target.packageRoot, binding.file))}:${binding.exportedName}`);
+} else {
+  fail(`unsupported runtime command: ${command || 'missing'}`);
+}
 RUNTIME_EOF
   printf '%s\n' "$tmp"
 }
 
 runtime_exec() {
-  local command="$1" entry="$2" patch_id="${3:-}" runtime output status
+  local command="$1" entry="$2" runtime output status
+  shift 2
   ensure_node || return 1
   ensure_acorn || return 1
   runtime=$(write_patch_runtime) || return 1
   set +e
-  output=$(node "$runtime" "$ACORN_PATH" "$command" "$entry" "$patch_id" 2>&1)
+  output=$(node "$runtime" "$ACORN_PATH" "$command" "$entry" "$@" 2>&1)
   status=$?
   set -e
   rm -f "$runtime"

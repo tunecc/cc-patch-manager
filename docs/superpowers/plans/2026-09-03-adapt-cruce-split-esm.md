@@ -154,7 +154,7 @@ git commit -m "feat: inspect package layout structurally"
 
 **Interfaces:** Produces `scanMarkerCandidates(descriptor, groups)` and `ModuleIndex.resolveBinding(file, localName)`.
 
-- [ ] **Step 1: 写失败 fixture**
+- [x] **Step 1: 写失败 fixture**
 
 ```bash
 fixture_add_module "$tmp/new" chunks/source.js 'export const policy="deny"'
@@ -163,13 +163,13 @@ fixture_add_module "$tmp/new" node_modules/ignored.js 'export const policy="deny
 runtime_exec check "$(fixture_entry "$tmp/new")" auto-mode || true
 ```
 
-- [ ] **Step 2: 确认红灯**
+- [x] **Step 2: 确认红灯**
 
 Run: `bash tests/test_module_index.sh`
 
 Expected: FAIL；当前 engine 只读取一个 `CLI_PATH`。
 
-- [ ] **Step 3: 实施静态索引**
+- [x] **Step 3: 实施静态索引**
 
 ```javascript
 resolveBinding(file, localName, seen = new Set()) {
@@ -179,13 +179,13 @@ resolveBinding(file, localName, seen = new Set()) {
 }
 ```
 
-- [ ] **Step 4: 复跑**
+- [x] **Step 4: 复跑**
 
 Run: `bash tests/test_module_index.sh`
 
 Expected: PASS；排除 node_modules，拒绝缺失/重复 export、包根逃逸和不可收敛循环。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add cc-patch-manager.sh tests/lib/dual-layout-fixture.sh tests/test_module_index.sh

@@ -24,3 +24,9 @@ fixture_make_package() {
 fixture_entry() {
   printf '%s/cli.js\n' "$1"
 }
+
+fixture_add_module() {
+  local root="$1" relative_path="$2" source="$3"
+  mkdir -p "$(dirname "$root/$relative_path")"
+  printf '%s\n' "$source" >"$root/$relative_path"
+}
