@@ -1,6 +1,6 @@
 ## 1. 双布局目标与分析基础
 
-- [ ] 1.1 为显式路径、`CLAUDE_CLI_PATH`、旧 `@cometix/claude-code` 与新 `@cometix/anthropic-cc` 自动发现编写失败测试，并验证测试能够区分优先级和无效 package
+- [x] 1.1 为显式路径、`CLAUDE_CLI_PATH`、旧 `@cometix/claude-code` 与新 `@cometix/anthropic-cc` 自动发现编写失败测试，并验证测试能够区分优先级和无效 package
 - [ ] 1.2 实现 TargetDescriptor 与结构化 `single-cjs`/`split-esm` 检测，并通过 1.1 的目标解析测试及现有路径行为回归测试
 - [ ] 1.3 为 marker 预筛、ESM 静态 import/export 别名和跨 chunk 绑定解析编写最小多模块失败 fixture，并验证歧义、缺失导出和 `node_modules` 排除场景均被覆盖
 - [ ] 1.4 实现候选文件扫描与轻量模块索引，并通过 1.3 测试且确认对 cruce 2.1.259 只解析 marker 命中的候选模块

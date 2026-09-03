@@ -65,7 +65,7 @@ fixture_assert_lifecycle "$tmp/new" auto-mode
 
 **Interfaces:** Consumes `resolve_target`, `CLAUDE_CLI_PATH`, `find_cli_js`; produces fixture 构建器和新旧包发现测试。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```bash
 fixture_make_package "$tmp/old" single-cjs '@cometix/claude-code' 2.1.224
@@ -74,13 +74,13 @@ CLAUDE_CLI_PATH="$(fixture_entry "$tmp/old")" resolve_target "$(fixture_entry "$
 assert_eq "$CLI_PATH" "$(fixture_entry "$tmp/new")" 'explicit target wins'
 ```
 
-- [ ] **Step 2: 确认红灯**
+- [x] **Step 2: 确认红灯**
 
 Run: `bash tests/test_target_descriptor.sh`
 
 Expected: FAIL；当前没有 fixture 且 `find_cli_js` 没有 cruce 候选。
 
-- [ ] **Step 3: 实施最小发现改动**
+- [x] **Step 3: 实施最小发现改动**
 
 ```bash
 # 在 find_cli_js 的 locations 数组中，紧随旧 @cometix 候选加入同 root 的 cruce 候选：
@@ -89,13 +89,13 @@ locations+=("$npm_root/@cometix/anthropic-cc/cli.js")
 fixture_make_package() { mkdir -p "$1"; echo "{\"name\":\"$3\",\"version\":\"$4\"}" >"$1/package.json"; echo '#!/usr/bin/env node' >"$1/cli.js"; }
 ```
 
-- [ ] **Step 4: 复跑**
+- [x] **Step 4: 复跑**
 
 Run: `bash tests/test_target_descriptor.sh`
 
 Expected: PASS；显式路径、环境变量、旧包、新包优先级固定，无效入口拒绝。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add cc-patch-manager.sh tests/lib/dual-layout-fixture.sh tests/test_target_descriptor.sh

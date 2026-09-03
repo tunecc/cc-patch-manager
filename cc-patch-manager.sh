@@ -181,6 +181,7 @@ find_cli_js() {
   local locations=(
     "$HOME/.claude/local/node_modules/@anthropic-ai/claude-code/cli.js"
     "$HOME/.claude/local/node_modules/@cometix/claude-code/cli.js"
+    "$HOME/.claude/local/node_modules/@cometix/anthropic-cc/cli.js"
   )
   if command -v npm >/dev/null 2>&1; then
     local npm_root
@@ -189,14 +190,17 @@ find_cli_js() {
       locations+=(
         "$npm_root/@anthropic-ai/claude-code/cli.js"
         "$npm_root/@cometix/claude-code/cli.js"
+        "$npm_root/@cometix/anthropic-cc/cli.js"
       )
     fi
   fi
   locations+=(
     "/usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js"
     "/usr/local/lib/node_modules/@cometix/claude-code/cli.js"
+    "/usr/local/lib/node_modules/@cometix/anthropic-cc/cli.js"
     "/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js"
     "/usr/lib/node_modules/@cometix/claude-code/cli.js"
+    "/usr/lib/node_modules/@cometix/anthropic-cc/cli.js"
   )
   local p
   for p in "${locations[@]}"; do
