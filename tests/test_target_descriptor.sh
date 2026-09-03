@@ -102,6 +102,13 @@ if runtime_exec inspect "$(fixture_entry "$json_root")" >/dev/null 2>&1; then
   fail 'non-JavaScript relative import was treated as split-ESM evidence'
 fi
 
+resource_root="$tmp/resource/@cometix/anthropic-cc"
+fixture_make_package "$resource_root" split-esm '@cometix/anthropic-cc' 2.1.259
+printf '{"enabled":true}\n' >"$resource_root/config.json"
+printf '#!/usr/bin/env node\nimport "./chunks/main.js"\nimport "./config.json"\n' >"$resource_root/cli.js"
+resource_inspect=$(runtime_exec inspect "$(fixture_entry "$resource_root")" 2>&1) || fail 'split entry with an additional resource import was rejected'
+grep -Fx 'TARGET_LAYOUT:split-esm' <<<"$resource_inspect" >/dev/null || fail 'JS plus resource imports did not identify split-esm'
+
 escape_root="$tmp/escape/@cometix/anthropic-cc"
 fixture_make_package "$escape_root" split-esm '@cometix/anthropic-cc' 2.1.259
 printf 'export const outside=true\n' >"$tmp/outside.js"

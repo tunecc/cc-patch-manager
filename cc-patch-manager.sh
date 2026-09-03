@@ -624,12 +624,15 @@ function relativeSpecifiers(ast) {
   return values;
 }
 
-function resolveRelativeModule(packageRoot, importer, specifier) {
+function resolveRelativeModule(packageRoot, importer, specifier, ignoreNonJavaScript = false) {
   const unresolved = path.resolve(path.dirname(importer), specifier);
   const candidates = [unresolved, `${unresolved}.js`, `${unresolved}.mjs`, path.join(unresolved, 'index.js')];
   const found = candidates.find(candidate => fs.existsSync(candidate) && fs.statSync(candidate).isFile());
   if (!found) fail(`relative module ${specifier} imported by ${importer} does not exist`);
-  if (!/\.(?:js|mjs)$/.test(found)) fail(`relative module is not JavaScript: ${specifier}`);
+  if (!/\.(?:js|mjs)$/.test(found)) {
+    if (ignoreNonJavaScript) return null;
+    fail(`relative module is not JavaScript: ${specifier}`);
+  }
   const real = fs.realpathSync(found);
   if (!insideRoot(packageRoot, real)) fail(`relative module escapes package root: ${specifier}`);
   return real;
@@ -712,6 +715,12 @@ class ModuleIndex {
 
     for (const node of ast.body) {
       if (node.type === 'ImportDeclaration') {
+        if (!node.source.value.startsWith('.')) {
+          for (const specifier of node.specifiers) {
+            record.locals.set(specifier.local.name, {kind: 'external', specifier: node.source.value});
+          }
+          continue;
+        }
         const sourceFile = resolveRelativeModule(this.target.packageRoot, file, node.source.value);
         for (const specifier of node.specifiers) {
           const exportedName = specifier.type === 'ImportDefaultSpecifier' ? 'default' : specifier.imported?.name;
@@ -754,6 +763,7 @@ class ModuleIndex {
     const binding = this.load(file).locals.get(localName);
     if (!binding) throw new Error(`missing local binding ${localName} in ${file}`);
     if (binding.kind === 'local') return {file, exportedName: binding.name};
+    if (binding.kind === 'external') throw new Error(`external binding unsupported: ${localName} from ${binding.specifier}`);
     return this.resolveExport(binding.sourceFile, binding.exportedName, nextSeen);
   }
 
@@ -815,7 +825,9 @@ function inspectTarget(entry) {
 
   const moduleProgram = parseProgram(entryPath, 'module');
   const specifiers = relativeSpecifiers(moduleProgram.ast);
-  const resolvedModules = specifiers.map(specifier => resolveRelativeModule(packageRoot, entryPath, specifier));
+  const resolvedModules = specifiers
+    .map(specifier => resolveRelativeModule(packageRoot, entryPath, specifier, true))
+    .filter(Boolean);
   const commonJsShape = hasCommonJsShape(moduleProgram.ast);
   let layout;
   if (resolvedModules.length > 0) {

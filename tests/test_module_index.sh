@@ -16,7 +16,7 @@ source "$ROOT/cc-patch-manager.sh"
 package="$tmp/package"
 fixture_make_package "$package" split-esm '@cometix/anthropic-cc' 2.1.259
 fixture_add_module "$package" chunks/source.js 'export const policy="deny"'
-fixture_add_module "$package" chunks/entry.js 'import {policy as localPolicy} from "./source.js";export{localPolicy}'
+fixture_add_module "$package" chunks/entry.js 'import fs from "node:fs";import {policy as localPolicy} from "./source.js";export{localPolicy}'
 fixture_add_module "$package" chunks/unrelated.js 'export const unrelated="no marker"'
 fixture_add_module "$package" node_modules/ignored.js 'export const policy="deny"'
 fixture_add_module "$package" vendor/cometix-asr/ignored.js 'export const policy="deny"'
@@ -35,6 +35,9 @@ grep -F 'node_modules/ignored.js' <<<"$output" >/dev/null && fail 'node_modules 
 grep -F 'vendor/cometix-asr/ignored.js' <<<"$output" >/dev/null && fail 'managed vendor marker candidate was included'
 grep -F '.cc-patch-manager-transaction-stale/ignored.js' <<<"$output" >/dev/null && fail 'transaction marker candidate was included'
 grep -F 'chunks/unrelated.js' <<<"$output" >/dev/null && fail 'unrelated marker candidate was included'
+if runtime_exec index "$(fixture_entry "$package")" chunks/entry.js fs deny >/dev/null 2>&1; then
+  fail 'external bare-import binding was treated as an internal module binding'
+fi
 
 fixture_add_module "$package" chunks/star-source.js 'export const throughStar="star-marker"'
 fixture_add_module "$package" chunks/star-barrel.js 'export * from "./star-source.js"'
