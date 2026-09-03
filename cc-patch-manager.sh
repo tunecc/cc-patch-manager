@@ -705,7 +705,7 @@ class ModuleIndex {
     file = fs.realpathSync(file);
     if (this.records.has(file)) return this.records.get(file);
     const {ast} = parseProgram(file, 'module');
-    const record = {locals: new Map(), exports: new Map(), exportAll: []};
+    const record = {locals: new Map(), exports: new Map(), exportAll: [], externalExportAll: []};
     this.records.set(file, record);
     const addExport = (name, binding) => {
       const bindings = record.exports.get(name) || [];
@@ -740,16 +740,22 @@ class ModuleIndex {
           record.locals.set(name, {kind: 'local', file, name});
           addExport(name, {kind: 'local-export', localName: name});
         }
-        const sourceFile = node.source ? resolveRelativeModule(this.target.packageRoot, file, node.source.value) : null;
+        const relativeSource = node.source?.value?.startsWith('.') ? node.source.value : null;
+        const sourceFile = relativeSource ? resolveRelativeModule(this.target.packageRoot, file, relativeSource) : null;
         for (const specifier of node.specifiers) {
           const exportedName = specifier.exported.name;
           if (sourceFile) addExport(exportedName, {kind: 'reexport', sourceFile, importedName: specifier.local.name});
+          else if (node.source) addExport(exportedName, {kind: 'external-reexport', specifier: node.source.value, importedName: specifier.local.name});
           else addExport(exportedName, {kind: 'local-export', localName: specifier.local.name});
         }
         continue;
       }
       if (node.type === 'ExportAllDeclaration') {
-        record.exportAll.push(resolveRelativeModule(this.target.packageRoot, file, node.source.value));
+        if (node.source.value.startsWith('.')) {
+          record.exportAll.push(resolveRelativeModule(this.target.packageRoot, file, node.source.value));
+        } else {
+          record.externalExportAll.push(node.source.value);
+        }
       }
     }
     return record;
@@ -774,6 +780,9 @@ class ModuleIndex {
     const nextSeen = new Set(seen).add(key);
     const record = this.load(file);
     const bindings = record.exports.get(exportedName) || [];
+    if (bindings.length === 0 && record.externalExportAll.length > 0) {
+      throw new Error(`external export-star unsupported for ${exportedName}: ${record.externalExportAll.join(',')}`);
+    }
     if (bindings.length === 0 && exportedName !== 'default' && record.exportAll.length > 0) {
       const candidates = [];
       for (const sourceFile of record.exportAll) {
@@ -790,6 +799,9 @@ class ModuleIndex {
     if (bindings.length === 0) throw new Error(`missing export ${exportedName} in ${file}`);
     if (bindings.length !== 1) throw new Error(`ambiguous export ${exportedName} in ${file}: ${bindings.length}`);
     const binding = bindings[0];
+    if (binding.kind === 'external-reexport') {
+      throw new Error(`external re-export unsupported: ${binding.importedName} from ${binding.specifier}`);
+    }
     if (binding.kind === 'reexport') return this.resolveExport(binding.sourceFile, binding.importedName, nextSeen);
     return this.resolveLocal(file, binding.localName, nextSeen);
   }

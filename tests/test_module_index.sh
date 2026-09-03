@@ -39,6 +39,17 @@ if runtime_exec index "$(fixture_entry "$package")" chunks/entry.js fs deny >/de
   fail 'external bare-import binding was treated as an internal module binding'
 fi
 
+fixture_add_module "$package" chunks/external-reexport.js 'export {externalThing} from "external-package";export * from "another-package";import {policy as internalPolicy} from "./source.js";export{internalPolicy}'
+set +e
+reexport_output=$(runtime_exec index "$(fixture_entry "$package")" chunks/external-reexport.js internalPolicy deny 2>&1)
+reexport_status=$?
+set -e
+[[ "$reexport_status" -eq 0 ]] || fail "bare re-export blocked an independent internal binding: $reexport_output"
+grep -Fx 'BINDING_SOURCE:"chunks/source.js":policy' <<<"$reexport_output" >/dev/null || fail 'internal binding beside bare re-export did not resolve'
+if runtime_exec index "$(fixture_entry "$package")" chunks/external-reexport.js externalThing deny >/dev/null 2>&1; then
+  fail 'bare named re-export was treated as an internal module binding'
+fi
+
 fixture_add_module "$package" chunks/star-source.js 'export const throughStar="star-marker"'
 fixture_add_module "$package" chunks/star-barrel.js 'export * from "./star-source.js"'
 fixture_add_module "$package" chunks/star-consumer.js 'import {throughStar as starAlias} from "./star-barrel.js";export{starAlias}'
