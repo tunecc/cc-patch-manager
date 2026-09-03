@@ -237,6 +237,34 @@ grep -Fq 'CC_AFTER_ALPHA' "$transaction/chunks/alpha.js" || fail 'transaction di
 grep -Fq 'CC_AFTER_BETA' "$transaction/chunks/beta.js" || fail 'transaction did not commit beta replacement'
 cmp -s "$transaction/assets/model.bin" "$transaction/vendor/cometix-asr/model.bin" || fail 'transaction did not commit resource copy'
 
+crash_recovery="$tmp/crash-recovery"
+make_contract_package "$crash_recovery"
+CC_PATCH_TESTING=1 runtime_exec baseline "$(fixture_entry "$crash_recovery")" __contract__ >/dev/null
+crash_before=$(fixture_hash_tree "$crash_recovery")
+if CC_PATCH_TESTING=1 CC_PATCH_TEST_LEAVE_TRANSACTION=1 runtime_exec apply "$(fixture_entry "$crash_recovery")" __contract__ >/dev/null 2>&1; then
+  fail 'crash injection did not interrupt the transaction'
+fi
+[[ "$(fixture_hash_tree "$crash_recovery")" != "$crash_before" ]] || fail 'crash injection did not leave an interrupted state to recover'
+[[ -n "$(find "$crash_recovery" -maxdepth 1 -name '.cc-patch-manager-transaction-*' -print -quit)" ]] || fail 'crash injection did not leave a recovery journal'
+if CC_PATCH_TESTING=1 runtime_exec apply "$(fixture_entry "$crash_recovery")" __contract__ >/dev/null 2>&1; then
+  fail 'write continued in the same invocation after recovering an interrupted transaction'
+fi
+[[ "$(fixture_hash_tree "$crash_recovery")" == "$crash_before" ]] || fail 'interrupted transaction was not restored before re-analysis'
+[[ -z "$(find "$crash_recovery" -maxdepth 1 -name '.cc-patch-manager-transaction-*' -print -quit)" ]] || fail 'recovered transaction journal was not removed'
+CC_PATCH_TESTING=1 runtime_exec apply "$(fixture_entry "$crash_recovery")" __contract__ >/dev/null 2>&1 || fail 'apply was not retryable after recovery'
+
+unrecoverable="$tmp/unrecoverable"
+make_contract_package "$unrecoverable"
+CC_PATCH_TESTING=1 runtime_exec baseline "$(fixture_entry "$unrecoverable")" __contract__ >/dev/null
+mkdir "$unrecoverable/.cc-patch-manager-transaction-corrupt"
+printf '{not-json\n' >"$unrecoverable/.cc-patch-manager-transaction-corrupt/transaction.json"
+unrecoverable_before=$(fixture_hash_tree "$unrecoverable")
+if CC_PATCH_TESTING=1 runtime_exec apply "$(fixture_entry "$unrecoverable")" __contract__ >/dev/null 2>&1; then
+  fail 'apply continued with an unrecoverable transaction journal'
+fi
+[[ "$(fixture_hash_tree "$unrecoverable")" == "$unrecoverable_before" ]] || fail 'failed recovery mutated the package'
+[[ -d "$unrecoverable/.cc-patch-manager-transaction-corrupt" ]] || fail 'failed recovery removed forensic transaction state'
+
 printf 'corrupt\n' >>"$package/.cc-patch-manager-baseline/files/chunks/alpha.js"
 if CC_PATCH_TESTING=1 runtime_exec baseline "$(fixture_entry "$package")" __contract__ >/dev/null 2>&1; then
   fail 'corrupt baseline mirror was accepted'

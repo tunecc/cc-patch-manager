@@ -1270,11 +1270,89 @@ function replaceFileAtomic(packageRoot, destination, bytes, mode) {
   assertManagedPathSafe(packageRoot, destination);
 }
 
+function restoreTransactionDirectory(target, txRoot) {
+  assertManagedPathSafe(target.packageRoot, txRoot);
+  const journalPath = path.join(txRoot, 'transaction.json');
+  assertManagedPathSafe(target.packageRoot, journalPath);
+  let journal;
+  try {
+    journal = JSON.parse(fs.readFileSync(journalPath, 'utf8'));
+  } catch (error) {
+    throw new Error(`invalid transaction journal ${path.basename(txRoot)}: ${error.message}`);
+  }
+  if (journal.schemaVersion !== 1 || !Array.isArray(journal.operations) || !Array.isArray(journal.createdDirectories)) {
+    throw new Error(`invalid transaction journal contract: ${path.basename(txRoot)}`);
+  }
+
+  const states = journal.operations.map((operation, index) => {
+    if (!operation || typeof operation.relativePath !== 'string' || typeof operation.existed !== 'boolean') {
+      throw new Error(`invalid transaction operation ${index}: ${path.basename(txRoot)}`);
+    }
+    const destination = managedDestination(target, operation.relativePath);
+    if (!operation.existed) return {operation, destination, bytes: null};
+    if (!Number.isInteger(operation.mode) || !/^[a-f0-9]{64}$/.test(operation.sha256 || '')) {
+      throw new Error(`invalid transaction snapshot metadata: ${operation.relativePath}`);
+    }
+    const snapshotPath = path.join(txRoot, 'before', String(index));
+    assertManagedPathSafe(target.packageRoot, snapshotPath);
+    const bytes = fs.readFileSync(snapshotPath);
+    if (sha256(bytes) !== operation.sha256) throw new Error(`corrupt transaction snapshot: ${operation.relativePath}`);
+    return {operation, destination, bytes};
+  });
+  const createdDirectories = journal.createdDirectories.map(relativeDirectory => {
+    if (typeof relativeDirectory !== 'string') throw new Error(`invalid transaction directory: ${relativeDirectory}`);
+    const directory = path.resolve(target.packageRoot, relativeDirectory);
+    if (!insideRoot(target.packageRoot, directory) || path.isAbsolute(relativeDirectory) || relativeDirectory.startsWith('..')) {
+      throw new Error(`transaction directory escapes package root: ${relativeDirectory}`);
+    }
+    return directory;
+  });
+
+  for (const state of [...states].reverse()) {
+    if (state.operation.existed) {
+      replaceFileAtomic(target.packageRoot, state.destination, state.bytes, state.operation.mode);
+    } else {
+      const current = lstatIfPresent(state.destination);
+      if (current) {
+        if (!current.isFile() || current.isSymbolicLink()) throw new Error(`unsafe created transaction path: ${state.operation.relativePath}`);
+        fs.unlinkSync(state.destination);
+      }
+    }
+  }
+  for (const directory of createdDirectories.sort((left, right) => right.length - left.length)) {
+    try { fs.rmdirSync(directory); } catch (error) {
+      if (error.code !== 'ENOENT' && error.code !== 'ENOTEMPTY') throw error;
+    }
+  }
+  for (const state of states) {
+    const current = lstatIfPresent(state.destination);
+    if (state.operation.existed) {
+      if (!current || !current.isFile() || sha256(fs.readFileSync(state.destination)) !== state.operation.sha256 ||
+          (current.mode & 0o777) !== state.operation.mode) throw new Error(`transaction recovery verification failed: ${state.operation.relativePath}`);
+    } else if (current) throw new Error(`transaction recovery left created path: ${state.operation.relativePath}`);
+  }
+}
+
+function recoverIncompleteTransactions(target) {
+  const transactions = fs.readdirSync(target.packageRoot, {withFileTypes: true})
+    .filter(entry => entry.name.startsWith('.cc-patch-manager-transaction-'))
+    .sort((left, right) => left.name.localeCompare(right.name));
+  for (const entry of transactions) {
+    const txRoot = path.join(target.packageRoot, entry.name);
+    const stat = fs.lstatSync(txRoot);
+    if (!entry.isDirectory() || stat.isSymbolicLink()) throw new Error(`unsafe transaction journal path: ${entry.name}`);
+    restoreTransactionDirectory(target, txRoot);
+    fs.rmSync(txRoot, {recursive: true, force: true});
+  }
+  return transactions.length;
+}
+
 function commitTransaction(target, operations) {
   const txRoot = path.join(target.packageRoot, `.cc-patch-manager-transaction-${process.pid}-${crypto.randomBytes(6).toString('hex')}`);
   const snapshots = [];
   const createdDirectories = [];
   let committed = 0;
+  let preserveTransaction = false;
   try {
     ensureManagedDirectory(target.packageRoot, txRoot);
     for (const [index, operation] of operations.entries()) {
@@ -1293,21 +1371,29 @@ function commitTransaction(target, operations) {
       snapshots.push(snapshot);
     }
 
-    fs.writeFileSync(path.join(txRoot, 'transaction.json'), `${JSON.stringify({
-      schemaVersion: 1,
-      operations: snapshots.map(snapshot => ({relativePath: snapshot.operation.relativePath,
-        existed: snapshot.existed, mode: snapshot.mode, sha256: snapshot.sha256})),
-    }, null, 2)}\n`, {mode: 0o600, flag: 'wx'});
-
     for (const snapshot of snapshots) {
       for (const directory of missingParentDirectories(target.packageRoot, snapshot.operation.destination)) {
         if (!createdDirectories.includes(directory)) createdDirectories.push(directory);
       }
+    }
+
+    fs.writeFileSync(path.join(txRoot, 'transaction.json'), `${JSON.stringify({
+      schemaVersion: 1,
+      operations: snapshots.map(snapshot => ({relativePath: snapshot.operation.relativePath,
+        existed: snapshot.existed, mode: snapshot.mode, sha256: snapshot.sha256})),
+      createdDirectories: createdDirectories.map(directory => path.relative(target.packageRoot, directory)),
+    }, null, 2)}\n`, {mode: 0o600, flag: 'wx'});
+
+    for (const snapshot of snapshots) {
       fs.mkdirSync(path.dirname(snapshot.operation.destination), {recursive: true});
       assertManagedPathSafe(target.packageRoot, path.dirname(snapshot.operation.destination));
       fs.renameSync(snapshot.stagedPath, snapshot.operation.destination);
       fs.chmodSync(snapshot.operation.destination, snapshot.operation.mode);
       committed += 1;
+      if (process.env.CC_PATCH_TESTING === '1' && process.env.CC_PATCH_TEST_LEAVE_TRANSACTION === '1' && committed === 1) {
+        console.error(`INCOMPLETE_TRANSACTION:${path.basename(txRoot)}`);
+        process.exit(86);
+      }
       if (process.env.CC_PATCH_TESTING === '1' && Number(process.env.CC_PATCH_TEST_FAIL_AFTER) === committed) {
         throw new Error(`injected transaction failure after operation ${committed}`);
       }
@@ -1346,10 +1432,13 @@ function commitTransaction(target, operations) {
     } catch (caught) {
       rollbackError = caught;
     }
-    if (rollbackError) throw new Error(`${error.message}; ${rollbackError.message}`);
+    if (rollbackError) {
+      preserveTransaction = true;
+      throw new Error(`${error.message}; ${rollbackError.message}`);
+    }
     throw error;
   } finally {
-    fs.rmSync(txRoot, {recursive: true, force: true});
+    if (!preserveTransaction) fs.rmSync(txRoot, {recursive: true, force: true});
   }
 }
 
@@ -1489,6 +1578,15 @@ function inspectTarget(entry) {
 }
 
 const target = inspectTarget(requestedEntry);
+if (command === 'backup' || command === 'baseline' ||
+    (command === 'apply' && process.env.CC_PATCH_VALIDATE_ONLY !== '1')) {
+  try {
+    const recovered = recoverIncompleteTransactions(target);
+    if (recovered > 0) throw new Error(`recovered ${recovered} incomplete transaction(s); retry the requested operation`);
+  } catch (error) {
+    fail(error.message);
+  }
+}
 if (command === 'inspect') {
   console.log(`TARGET_PACKAGE:${target.packageName}`);
   console.log(`TARGET_VERSION:${target.packageVersion}`);

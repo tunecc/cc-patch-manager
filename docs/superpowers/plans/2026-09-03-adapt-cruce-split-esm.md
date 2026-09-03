@@ -416,7 +416,7 @@ git commit -m "feat: transact multi-file patch writes"
 
 **Interfaces:** Produces `recoverIncompleteTransactions(target)` and `prepareWrite(target, plan)`.
 
-- [ ] **Step 1: 写遗留事务测试**
+- [x] **Step 1: 写遗留事务测试**
 
 ```bash
 before=$(fixture_hash_tree "$tmp/new")
@@ -425,13 +425,13 @@ runtime_exec apply "$(fixture_entry "$tmp/new")" transcript-dialog || true
 fixture_assert_tree_equals "$before" "$(fixture_hash_tree "$tmp/new")"
 ```
 
-- [ ] **Step 2: 确认红灯**
+- [x] **Step 2: 确认红灯**
 
 Run: `bash tests/test_package_baseline_transaction.sh && bash tests/test_patch_plan_contract.sh`
 
 Expected: FAIL；无持久事务日志和写前门禁。
 
-- [ ] **Step 3: 实施恢复**
+- [x] **Step 3: 实施恢复**
 
 ```javascript
 function prepareWrite(target, plan) {
@@ -441,13 +441,13 @@ function prepareWrite(target, plan) {
 }
 ```
 
-- [ ] **Step 4: 复跑**
+- [x] **Step 4: 复跑**
 
 Run: `bash tests/test_package_baseline_transaction.sh && bash tests/test_patch_plan_contract.sh`
 
 Expected: PASS；无法证明恢复成功就停止，AST/后置条件失败零写入。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add cc-patch-manager.sh tests/test_package_baseline_transaction.sh tests/test_patch_plan_contract.sh
