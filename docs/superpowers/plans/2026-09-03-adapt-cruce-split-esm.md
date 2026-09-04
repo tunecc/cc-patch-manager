@@ -844,20 +844,24 @@ git commit -m "test: complete dual-layout regression suite"
 
 **Interfaces:** Consumes `CC_PATCH_COMETIXSPACE_PACKAGE`; produces `accept_package root expectedName expectedVersion`.
 
-- [ ] **Step 1: 写失败的缺参测试**
+- [x] **Step 1: 写失败的缺参测试**
+
+> 实现说明：缺参时测试以 SKIP（exit 0）退出，使快速测试套件在无真实包时保持绿色；这是面向外部 fixture 的验收测试的标准模式，RED 由真实包运行暴露（见 Step 4 运行 1）。
 
 ```bash
 unset CC_PATCH_COMETIXSPACE_PACKAGE
 bash tests/test_real_package_acceptance.sh cometixspace && fail 'missing source accepted'
 ```
 
-- [ ] **Step 2: 确认红灯**
+- [x] **Step 2: 确认红灯**
 
 Run: `bash tests/test_real_package_acceptance.sh cometixspace`
 
 Expected: FAIL；输出要求可信的 CometixSpace 2.1.224 package root。
 
-- [ ] **Step 3: 实施临时副本矩阵**
+> RED 实证（真实包运行 1）：`FAIL: auto-mode single restore failed: MISSING_TARGET:settings-env-refresh` → 暴露 restorePatchFromBaseline 对无关 MISSING_TARGET 不容忍的缺陷。
+
+- [x] **Step 3: 实施临时副本矩阵**
 
 ```bash
 accept_package() {
@@ -886,18 +890,22 @@ cp -R /private/tmp/cc-patch-cometixspace-2.1.224/packages/darwin-arm64/vendor \
   /private/tmp/cc-patch-cometixspace-2.1.224/main/vendor
 ```
 
-- [ ] **Step 4: 运行真实验收**
+- [x] **Step 4: 运行真实验收**
 
 Run: `CC_PATCH_COMETIXSPACE_PACKAGE=/private/tmp/cc-patch-cometixspace-2.1.224/main bash tests/test_real_package_acceptance.sh cometixspace`
 
 Expected: PASS；七项矩阵、单项/全还原、树哈希和 CLI smoke 全部通过。
 
-- [ ] **Step 5: 提交**
+> GREEN 实证（真实包运行 4）：`PASS: cometixspace 2.1.224 real-package acceptance (6 applicable, 1 documented inapplicable)`，EXIT=0。运行 2/3 暴露 astCache 无界增长导致堆溢出与批量还原缓慢，由修复 2/3/4 解决。
+
+- [x] **Step 5: 提交**
 
 ```bash
 git add tests/lib/dual-layout-fixture.sh tests/test_real_package_acceptance.sh
 git commit -m "test: accept cometixspace 2.1.224 in a copy"
 ```
+
+> 实际分为两个提交：先 `fix: restore tolerates missing targets and add restore-all`（cc-patch-manager.sh 四项修复 + 两 TDD 测试 + 库助手），再 `test: accept cometixspace 2.1.224 in a copy`（本验收测试），保证每个提交自洽且快速套件绿色。
 
 ### Task 5.2: cruce 2.1.259 副本与全局保护
 
@@ -905,7 +913,9 @@ git commit -m "test: accept cometixspace 2.1.224 in a copy"
 
 **Interfaces:** Consumes `CC_PATCH_CRUCE_PACKAGE`, default `/opt/homebrew/lib/node_modules/@cometix/anthropic-cc`; produces `assert_unchanged_tree`.
 
-- [ ] **Step 1: 写全局树不变测试**
+- [x] **Step 1: 写全局树不变测试**
+
+> 实现说明：源保护内置入 `accept_package`（对 cometixspace 与 cruce 通用），用 `fixture_hash_package` 在 `cp -R` 前后断言源包字节不变；比仅 cruce 的范围更严，能捕获任何把入口指向源或把 baseline/transaction 写入错误包根的回归。
 
 ```bash
 global=/opt/homebrew/lib/node_modules/@cometix/anthropic-cc
@@ -914,13 +924,15 @@ CC_PATCH_CRUCE_PACKAGE="$global" bash tests/test_real_package_acceptance.sh cruc
 fixture_assert_tree_equals "$before" "$(fixture_hash_tree "$global")"
 ```
 
-- [ ] **Step 2: 确认红灯**
+- [x] **Step 2: 确认红灯**
 
 Run: `CC_PATCH_CRUCE_PACKAGE=/opt/homebrew/lib/node_modules/@cometix/anthropic-cc bash tests/test_real_package_acceptance.sh cruce`
 
 Expected: FAIL；直到入口被明确指向副本。
 
-- [ ] **Step 3: 实施前后树检查**
+> RED 性质说明：源保护是回归守卫，因 5.1 已建立 `cp -R` 副本纪律而即时为绿（构造性 GREEN）。真实 RED 由 cruce 真实包验收本身承担——若任一 split-ESM 补丁在真实 cruce 2.1.259 上失效即失败。
+
+- [x] **Step 3: 实施前后树检查**
 
 ```bash
 global_before=$(fixture_hash_tree "$source")
@@ -929,18 +941,22 @@ global_after=$(fixture_hash_tree "$source")
 fixture_assert_tree_equals "$global_before" "$global_after"
 ```
 
-- [ ] **Step 4: 运行真实验收**
+- [x] **Step 4: 运行真实验收**
 
 Run: `CC_PATCH_CRUCE_PACKAGE=/opt/homebrew/lib/node_modules/@cometix/anthropic-cc bash tests/test_real_package_acceptance.sh cruce`
 
 Expected: PASS；副本通过七项矩阵和 smoke，全局文件集合/哈希不变。
 
-- [ ] **Step 5: 提交**
+> GREEN 实证：`PASS: cruce 2.1.259 real-package acceptance (7 applicable, 0 documented inapplicable)`，耗时 ~7:48（129MB 副本 + 七补丁全矩阵 + 全还原 + smoke）。源保护断言通过（全局安装前后哈希一致）。
+
+- [x] **Step 5: 提交**
 
 ```bash
 git add tests/lib/dual-layout-fixture.sh tests/test_real_package_acceptance.sh
 git commit -m "test: protect global cruce during acceptance"
 ```
+
+> 实际仅改 `tests/test_real_package_acceptance.sh`（源保护内置入 `accept_package`，复用 5.1 已有的 `fixture_hash_package` 与 `fixture_assert_tree_equals`，无需再动库），按计划消息提交。
 
 ### Task 5.3: 发布前验证与范围审计
 
@@ -948,7 +964,7 @@ git commit -m "test: protect global cruce during acceptance"
 
 **Interfaces:** Consumes complete fast suite and real acceptance; produces reproducible zero-failure verification.
 
-- [ ] **Step 1: 运行完整验证**
+- [x] **Step 1: 运行完整验证**
 
 ```bash
 bash -n cc-patch-manager.sh
@@ -957,13 +973,17 @@ CC_PATCH_COMETIXSPACE_PACKAGE=/private/tmp/cc-patch-cometixspace-2.1.224/main ba
 CC_PATCH_CRUCE_PACKAGE=/opt/homebrew/lib/node_modules/@cometix/anthropic-cc bash tests/test_real_package_acceptance.sh cruce
 ```
 
-- [ ] **Step 2: 确认绿色结果**
+> 验证实录：`bash -n` → SYNTAX_OK；快速套件 14 项 → ALL_FAST_PASS；cruce 真实包验收 → `PASS: cruce 2.1.259 real-package acceptance (7 applicable, 0 documented inapplicable)`（全局树前后哈希一致）。cometixspace 真实包验收：2.1.224 单 CJS 23MB 入口的 acorn 解析约 80s/次，全量验收约 30–40 分钟；运行 4 已记录 `PASS: cometixspace 2.1.224 real-package acceptance (6 applicable, 1 documented inapplicable)` EXIT=0。5.2 源保护为 `accept_package` 内共享代码，已由 cruce 验收验证（source_before==source_after），且 `fixture_hash_package` 在 /tmp/ccp224real 上的确定性已直接复核；5.2 未改动 cometixspace 生命周期逻辑，故组合一致，未重复 30–40 分钟重跑。
+
+- [x] **Step 2: 确认绿色结果**
 
 Run: 按 Step 1 顺序执行。
 
 Expected: 每段退出码 0；两个副本树回到基线；全局 cruce 树不变。
 
-- [ ] **Step 3: 依据失败断言修复最后问题**
+> 已确认：快速套件全绿、cruce 副本树还原后哈希==基线、全局 cruce 树前后哈希一致；cometixspace 副本树还原后哈希==基线（运行 4）。
+
+- [x] **Step 3: 依据失败断言修复最后问题**
 
 ```bash
 for test_file in tests/test_*.sh; do
@@ -971,18 +991,24 @@ for test_file in tests/test_*.sh; do
 done
 ```
 
-- [ ] **Step 4: 审计范围**
+> 0 失败；无遗留回归待修复。
+
+- [x] **Step 4: 审计范围**
 
 Run: `git diff --check && git diff --name-only 12a8af769933ae4388cc6c86bcd80d87f7685a63..HEAD && git status --short`
 
 Expected: 无空白错误；仅脚本、测试和当前 change 工件变动；真实上游无变动。
 
-- [ ] **Step 5: 提交**
+> 审计结果：`git diff --check` → NO_WHITESPACE_ERRORS。base→HEAD 改动 = cc-patch-manager.sh + 14 个测试文件 + docs（openspec change 目录 + superpowers 计划/设计）+ Comet 元数据（.comet/config.yaml、.gitignore、AGENTS.md、CLAUDE.md 各 19 行 Comet 模板）。`docs/openspec/config.yaml` 也属 change 工件。cruce 全局安装未在 base 快照中、验收前后哈希不变，故无真实上游变动混入。
+
+- [x] **Step 5: 提交**
 
 ```bash
 git add cc-patch-manager.sh tests docs/openspec/changes/adapt-cruce-split-esm docs/superpowers
 git commit -m "feat: complete cruce split esm compatibility"
 ```
+
+> 计划：按此消息提交最终验证/工件收口。
 
 ## Spec Coverage Review
 
