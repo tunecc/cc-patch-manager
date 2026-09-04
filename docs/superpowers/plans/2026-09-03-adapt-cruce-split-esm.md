@@ -715,7 +715,7 @@ git commit -m "feat: migrate computer use to split esm"
 
 **Interfaces:** Consumes `TARGET_PACKAGE`, `TARGET_VERSION`, `TARGET_LAYOUT`, `MISSING_TARGET`, `AMBIGUOUS_TARGET`, `ROLLBACK`; produces Bash globals and中文状态。
 
-- [ ] **Step 1: 写失败输出断言**
+- [x] **Step 1: 写失败输出断言**
 
 ```bash
 out=$(./cc-patch-manager.sh "$(fixture_entry "$tmp/new")" --check || true)
@@ -723,13 +723,13 @@ grep -F '包: @cometix/anthropic-cc 2.1.259 (split-esm)' <<<"$out"
 grep -F '缺失目标: host-cleanup' <<<"$out"
 ```
 
-- [ ] **Step 2: 确认红灯**
+- [x] **Step 2: 确认红灯**
 
 Run: `bash tests/test_target_descriptor.sh && bash tests/test_patch_plan_contract.sh`
 
 Expected: FAIL；状态 parser 只理解旧标记。
 
-- [ ] **Step 3: 实施协议映射**
+- [x] **Step 3: 实施协议映射**
 
 ```bash
 case "$line" in
@@ -741,13 +741,13 @@ case "$line" in
 esac
 ```
 
-- [ ] **Step 4: 复跑**
+- [x] **Step 4: 复跑**
 
 Run: `bash tests/test_target_descriptor.sh && bash tests/test_patch_plan_contract.sh`
 
 Expected: PASS；目标身份和布局可见，错误含 patch、阶段、文件和语义目标。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add cc-patch-manager.sh tests/test_target_descriptor.sh tests/test_patch_plan_contract.sh

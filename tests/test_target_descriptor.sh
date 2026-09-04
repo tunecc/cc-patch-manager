@@ -130,4 +130,29 @@ if voice_mode_supported; then
   [[ "${MSG[voice-mode]:-}" != *'split-esm'* ]] || fail 'split package was still rejected by layout'
 fi
 
+# Task 4.1: --check 必须显示目标包身份（旧/新两种布局的快照断言）
+# 诊断 fixture：权限弹窗通道存在、宿主清理目标缺失 → transcript-dialog 应报告缺失目标。
+SIGNAL_HELPERS='function makeSignal(){let listeners=new Set;return{subscribe(listener){listeners.add(listener);return()=>listeners.delete(listener)},emit(value){for(const listener of listeners)listener(value)}}}function deferred(){let resolve;let promise=new Promise(done=>resolve=done);return{promise,resolve}}'
+DIALOG_CHANNEL_CRUCE='function createDialogChannel(){let events=makeSignal(),cancels=makeSignal(),updates=makeSignal(),pending=new Map,counter=0,subscribers=0;return{subscribe(listener){subscribers+=1;let unsubscribe=events.subscribe(listener),closed=!1;return()=>{if(closed)return;closed=!0,subscribers-=1,unsubscribe()}},onCancel:cancels.subscribe,onUpdate:updates.subscribe,reply(reply){let resolver=pending.get(reply.id);if(!resolver)return;pending.delete(reply.id),resolver(reply)},request({kind,payload,userInvoked,hideWhile,holdsTop},options){counter+=1;let id=`dialog-${counter}`,{promise,resolve}=deferred(),signal=options?.signal;if(signal?.aborted||subscribers===0)return queueMicrotask(()=>resolve({id,cancelled:!0})),{id,replied:promise,update:()=>{}};let onAbort;if(pending.set(id,value=>{if(signal&&onAbort)signal.removeEventListener("abort",onAbort);resolve(value)}),signal)onAbort=()=>{if(pending.delete(id))resolve({id,cancelled:!0}),cancels.emit(id)},signal.addEventListener("abort",onAbort,{once:!0});return events.emit({id,kind,payload,userInvoked,hideWhile,holdsTop}),{id,replied:promise,update:value=>{if(pending.has(id))updates.emit({id,payload:value})}}}}}'
+diag_root="$tmp/diag/@cometix/anthropic-cc"
+fixture_make_package "$diag_root" split-esm '@cometix/anthropic-cc' 2.1.259
+fixture_add_module "$diag_root" chunks/dialog-channel.js "$SIGNAL_HELPERS
+export $DIALOG_CHANNEL_CRUCE"
+set +e
+diag_out=$(bash "$ROOT/cc-patch-manager.sh" "$(fixture_entry "$diag_root")" --check 2>&1)
+diag_ec=$?
+set -e
+[[ "$diag_ec" -ne 0 ]] || fail 'diagnostics fixture --check should exit non-zero on missing semantic targets'
+grep -Fq '包: @cometix/anthropic-cc 2.1.259 (split-esm)' <<<"$diag_out" ||
+  fail "--check output lacked split package identity: $diag_out"
+grep -Fq '缺失目标: host-cleanup' <<<"$diag_out" ||
+  fail "--check output lacked structured missing-target diagnostic: $diag_out"
+
+set +e
+old_check_out=$(bash "$ROOT/cc-patch-manager.sh" "$(fixture_entry "$old_root")" --check 2>&1)
+old_check_ec=$?
+set -e
+grep -Fq '包: @cometix/claude-code 2.1.224 (single-cjs)' <<<"$old_check_out" ||
+  fail "--check output lacked single-cjs package identity: $old_check_out"
+
 printf 'PASS: target resolution and structural layout inspection support both packages\n'

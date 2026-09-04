@@ -159,6 +159,21 @@ declare -A MSG=()
 # Globals set by last run_node_patch / parse_and_set_status
 LAST_OUTPUT=""
 LAST_BACKUP=""
+# 目标包身份（inspect / check / apply 输出的 TARGET_* 标记）
+TARGET_PACKAGE=""
+TARGET_VERSION=""
+TARGET_LAYOUT=""
+TARGET_IDENTITY_LOADED=""
+
+# 机器协议的 JSON 字符串字段值（路径等）剥引号后用于展示
+protocol_json_value() {
+  local value="$1"
+  if [[ "$value" == \"*\" && "${#value}" -ge 2 ]]; then
+    value="${value#\"}"
+    value="${value%\"}"
+  fi
+  printf '%s' "$value"
+}
 
 usage() {
   cat <<EOF
@@ -219,20 +234,25 @@ resolve_target() {
   if [[ -n "$arg" ]]; then
     if [[ -f "$arg" ]]; then
       CLI_PATH="$arg"
+      TARGET_IDENTITY_LOADED=""
       return 0
     fi
     error "指定文件不存在: $arg"
     CLI_PATH=""
+    TARGET_IDENTITY_LOADED=""
     return 1
   fi
   if [[ -n "${CLAUDE_CLI_PATH:-}" && -f "$CLAUDE_CLI_PATH" ]]; then
     CLI_PATH="$CLAUDE_CLI_PATH"
+    TARGET_IDENTITY_LOADED=""
     return 0
   fi
   if CLI_PATH=$(find_cli_js); then
+    TARGET_IDENTITY_LOADED=""
     return 0
   fi
   CLI_PATH=""
+  TARGET_IDENTITY_LOADED=""
   return 1
 }
 
@@ -502,7 +522,12 @@ parse_and_set_status() {
 
   LAST_BACKUP=""
   MSG[$id]=""
-  local line has_already=0 has_needs=0 has_success=0 has_err=0 err_msg=""
+  local line has_already=0 has_needs=0 has_success=0 has_err=0 err_msg="" structured=0 scope_kind="" scope_files=""
+  local stage_cn
+  case "$mode" in
+    apply) stage_cn="应用" ;;
+    *)     stage_cn="检测" ;;
+  esac
 
   while IFS= read -r line || [[ -n "$line" ]]; do
     case "$line" in
@@ -533,6 +558,33 @@ parse_and_set_status() {
         LAST_BACKUP="${line#BASELINE_CREATED:}"
         info "已创建备份: $LAST_BACKUP"
         ;;
+      TARGET_PACKAGE:*)
+        TARGET_PACKAGE="${line#TARGET_PACKAGE:}"
+        ;;
+      TARGET_VERSION:*)
+        TARGET_VERSION="${line#TARGET_VERSION:}"
+        ;;
+      TARGET_LAYOUT:*)
+        TARGET_LAYOUT="${line#TARGET_LAYOUT:}"
+        ;;
+      MISSING_TARGET:*)
+        has_err=1
+        structured=1
+        scope_kind="范围"
+        err_msg="${id} ${stage_cn}: 缺失目标: ${line#MISSING_TARGET:}"
+        ;;
+      CANDIDATE_FILE:*)
+        scope_files="${scope_files}${scope_files:+、}$(protocol_json_value "${line#CANDIDATE_FILE:}" </dev/null)"
+        ;;
+      AMBIGUOUS_TARGET:*)
+        has_err=1
+        structured=1
+        scope_kind="候选"
+        err_msg="${id} ${stage_cn}: 目标歧义: ${line#AMBIGUOUS_TARGET:}"
+        ;;
+      AMBIGUOUS_FILE:*)
+        scope_files="${scope_files}${scope_files:+、}$(protocol_json_value "${line#AMBIGUOUS_FILE:}" </dev/null)"
+        ;;
       PARSE_ERROR:*)
         has_err=1
         err_msg="解析错误: ${line#PARSE_ERROR:}"
@@ -547,7 +599,9 @@ parse_and_set_status() {
         ;;
       TARGET_ERROR:*)
         has_err=1
-        err_msg="统一补丁失败: ${line#TARGET_ERROR:}"
+        if [[ $structured -eq 0 ]]; then
+          err_msg="统一补丁失败: ${line#TARGET_ERROR:}"
+        fi
         ;;
       FOUND:*|PATCH:*|STEP:*|VERSION:*|OQQ_NAME:*)
         # informational; keep last interesting in MSG if empty later
@@ -557,6 +611,11 @@ parse_and_set_status() {
 
   if [[ $has_err -eq 1 ]]; then
     STATUS[$id]=error
+    # 结构化诊断（缺失/歧义目标）携带补丁 ID、阶段与候选文件，优先于通用 TARGET_ERROR
+    if [[ -n "$scope_files" ]]; then
+      [[ -n "$scope_kind" ]] || scope_kind="候选"
+      err_msg="${err_msg}（${scope_kind}: ${scope_files}）"
+    fi
     MSG[$id]="$err_msg"
     return 1
   fi
@@ -594,6 +653,31 @@ parse_and_set_status() {
   STATUS[$id]=error
   MSG[$id]="${MSG[$id]:-应用失败 (exit $exit_code)}"
   return 1
+}
+
+# 惰性加载目标包身份：成功后缓存（缓存命中返回 0 即身份可用），失败不缓存以便重试；
+# 换路径由调用方重置 TARGET_IDENTITY_LOADED，全量刷新由 refresh_all 重置。
+load_target_identity() {
+  local output ec=0 line
+  [[ -n "$CLI_PATH" ]] || return 1
+  [[ -z "${TARGET_IDENTITY_LOADED:-}" ]] || return 0
+  TARGET_PACKAGE="" TARGET_VERSION="" TARGET_LAYOUT=""
+  set +e
+  output=$(runtime_exec inspect "$CLI_PATH" 2>&1)
+  ec=$?
+  set -e
+  if [[ "$ec" -ne 0 ]]; then
+    return 1
+  fi
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    case "$line" in
+      TARGET_PACKAGE:*) TARGET_PACKAGE="${line#TARGET_PACKAGE:}" ;;
+      TARGET_VERSION:*) TARGET_VERSION="${line#TARGET_VERSION:}" ;;
+      TARGET_LAYOUT:*) TARGET_LAYOUT="${line#TARGET_LAYOUT:}" ;;
+    esac
+  done <<< "$output"
+  TARGET_IDENTITY_LOADED=1
+  return 0
 }
 
 # Unified runtime. Later tasks add scanning, PatchPlan, transactions, and analyzers here.
@@ -2738,10 +2822,16 @@ function validatePlan(target, plan) {
     const count = semanticTarget.matches.length;
     if (count === 0) {
       console.error(`MISSING_TARGET:${semanticTarget.id}`);
+      for (const file of (plan.diagnostics && plan.diagnostics.candidateFiles) || []) {
+        console.error(`CANDIDATE_FILE:${JSON.stringify(file)}`);
+      }
       throw new Error(`missing semantic target: ${semanticTarget.id}`);
     }
     if (count !== semanticTarget.expectedCardinality) {
       console.error(`AMBIGUOUS_TARGET:${semanticTarget.id}:${count}`);
+      for (const match of semanticTarget.matches) {
+        console.error(`AMBIGUOUS_FILE:${JSON.stringify(match.relativePath)}`);
+      }
       throw new Error(`ambiguous semantic target: ${semanticTarget.id}`);
     }
   }
@@ -4094,6 +4184,9 @@ if (command === 'inspect') {
   }
 } else if (command === 'check' || command === 'apply' || command === 'baseline') {
   const patchId = runtimeArgs[0];
+  console.log(`TARGET_PACKAGE:${target.packageName}`);
+  console.log(`TARGET_VERSION:${target.packageVersion}`);
+  console.log(`TARGET_LAYOUT:${target.layout}`);
   let plan, renderedFiles;
   try {
     plan = analyzePatch(target, patchId);
@@ -6887,31 +6980,54 @@ run_node_patch() {
     return $?
   fi
 
-  set +e
-  target_info=$(runtime_exec inspect "$CLI_PATH" 2>&1)
-  ec=$?
-  set -e
-  if [[ "$ec" -eq 0 ]]; then
-    target_layout=$(printf '%s\n' "$target_info" | sed -n 's/^TARGET_LAYOUT://p' | head -1)
-    if [[ "$id" == "context-limit" || "$id" == "computer-use" ]]; then
-      set +e
-      output=$(runtime_exec "$mode" "$CLI_PATH" "$id" 2>&1)
-      ec=$?
-      set -e
-      LAST_OUTPUT="$output"
-      parse_and_set_status "$id" "$mode" "$output" "$ec"
-      return $?
+  # 先刷新目标包身份（带缓存；inspect 失败时 target_layout 为空，走旧单文件回退）
+  target_layout=""
+  local inspect_ok=0
+  if [[ -z "${TARGET_IDENTITY_LOADED:-}" ]]; then
+    set +e
+    target_info=$(runtime_exec inspect "$CLI_PATH" 2>&1)
+    ec=$?
+    set -e
+    if [[ "$ec" -eq 0 ]]; then
+      TARGET_IDENTITY_LOADED=1
+      inspect_ok=1
+      local line
+      while IFS= read -r line || [[ -n "$line" ]]; do
+        case "$line" in
+          TARGET_PACKAGE:*) TARGET_PACKAGE="${line#TARGET_PACKAGE:}" ;;
+          TARGET_VERSION:*) TARGET_VERSION="${line#TARGET_VERSION:}" ;;
+          TARGET_LAYOUT:*) TARGET_LAYOUT="${line#TARGET_LAYOUT:}" ;;
+        esac
+      done <<< "$target_info"
+    else
+      # inspect 失败不缓存：保证后续补丁/刷新重新探测，且 cruce-reject 路径的
+      # LAST_OUTPUT 仍持有本次 inspect 的原始错误输出（target_info 刚由命令替换赋值）。
+      TARGET_PACKAGE="" TARGET_VERSION="" TARGET_LAYOUT=""
     fi
-    if [[ "$target_layout" == "split-esm" ]]; then
-      STATUS[$id]=error
-      MSG[$id]="split-esm 尚未接入统一补丁引擎，已拒绝旧单文件写入路径"
-      LAST_OUTPUT="$target_info"
-      return 1
-    fi
-  elif target_declares_cruce "$CLI_PATH"; then
+  elif [[ -n "${TARGET_LAYOUT:-}" ]]; then
+    inspect_ok=1
+  fi
+  target_layout="${TARGET_LAYOUT:-}"
+
+  # split-esm 与已接入统一引擎的补丁走 runtime check/apply（输出含 TARGET_* 身份行）。
+  # context-limit/computer-use 仅在 inspect 成功（真实包结构）时走 runtime；
+  # inspect 失败的合成单文件 fixture 仍走旧引擎以保持 single-CJS 回归行为。
+  if [[ "$target_layout" == "split-esm" || \
+        ( "$inspect_ok" -eq 1 && ( "$id" == "context-limit" || "$id" == "computer-use" ) ) ]]; then
+    set +e
+    output=$(runtime_exec "$mode" "$CLI_PATH" "$id" 2>&1)
+    ec=$?
+    set -e
+    LAST_OUTPUT="$output"
+    parse_and_set_status "$id" "$mode" "$output" "$ec"
+    return $?
+  fi
+
+  # inspect 失败且目标声明 cruce：拒绝旧单文件写入路径
+  if [[ "$inspect_ok" -eq 0 ]] && target_declares_cruce "$CLI_PATH"; then
     STATUS[$id]=error
     MSG[$id]="cruce 目标结构检查失败，已拒绝旧单文件写入路径"
-    LAST_OUTPUT="$target_info"
+    LAST_OUTPUT="${target_info:-}"
     return 1
   fi
 
@@ -6947,6 +7063,9 @@ refresh_one() {
 # 全量检测全部补丁；quiet=1 时不打印进度（给 --check 用）
 refresh_all() {
   local quiet="${1:-0}" id n=0 total=${#PATCH_IDS[@]}
+  # 全量刷新：丢弃上次 inspect 缓存（含失败缓存），让本次刷新重新探测目标身份。
+  # 用户在外部修复/更换目标后按 [r] 能拿到最新身份，而非复用陈旧的失败缓存。
+  TARGET_IDENTITY_LOADED=""
   for id in "${PATCH_IDS[@]}"; do
     n=$((n + 1))
     if [[ "$quiet" != "1" ]]; then
@@ -7052,6 +7171,14 @@ draw_header() {
     printf '目标:  %s\n' "$CLI_PATH"
   else
     printf '目标:  %s(未找到)%s\n' "$RED" "$NC"
+  fi
+  if [[ -n "${TARGET_PACKAGE:-}" ]]; then
+    printf '包:    %s %s (%s)\n' "$TARGET_PACKAGE" "${TARGET_VERSION:-}" "${TARGET_LAYOUT:-}"
+  elif [[ -n "$CLI_PATH" ]]; then
+    load_target_identity 2>/dev/null || true
+    if [[ -n "${TARGET_PACKAGE:-}" ]]; then
+      printf '包:    %s %s (%s)\n' "$TARGET_PACKAGE" "${TARGET_VERSION:-}" "${TARGET_LAYOUT:-}"
+    fi
   fi
   if [[ $((a + i + e)) -eq 0 ]]; then
     printf '状态:  %s尚未检测%s — 按 [r] 刷新全部，或进入补丁后按 [c]\n' "$YELLOW" "$NC"
@@ -7284,6 +7411,7 @@ set_path_interactive() {
   read -r p || true
   if [[ -f "$p" ]]; then
     CLI_PATH="$p"
+    TARGET_IDENTITY_LOADED=""
     STATUS=()
     MSG=()
     success "目标已设置（状态已清空，按 [r] 检测）"
@@ -7338,7 +7466,11 @@ run_check_mode() {
   # --check 静默跑全量，进度不刷屏
   refresh_all 1 || true
   local id ec=0 st_cn
-  printf '目标: %s\n\n' "$CLI_PATH"
+  printf '目标: %s\n' "$CLI_PATH"
+  if [[ -n "${TARGET_PACKAGE:-}" ]]; then
+    printf '包: %s %s (%s)\n' "$TARGET_PACKAGE" "${TARGET_VERSION:-}" "${TARGET_LAYOUT:-}"
+  fi
+  printf '\n'
   printf '%-18s %-10s %s\n' "ID" "状态" "说明"
   printf '%-18s %-10s %s\n' "------------------" "----------" "-------"
   for id in "${PATCH_IDS[@]}"; do

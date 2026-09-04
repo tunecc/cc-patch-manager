@@ -10,6 +10,11 @@ fail() {
   exit 1
 }
 
+assert_eq() {
+  local actual="$1" expected="$2" label="$3"
+  [[ "$actual" == "$expected" ]] || fail "$label: expected [$expected], got [$actual]"
+}
+
 source "$ROOT/tests/lib/dual-layout-fixture.sh"
 source "$ROOT/cc-patch-manager.sh"
 
@@ -62,6 +67,37 @@ ambiguous_status=$?
 set -e
 [[ "$ambiguous_status" -ne 0 ]] || fail 'ambiguous alpha target was accepted'
 grep -Fx 'AMBIGUOUS_TARGET:alpha:2' <<<"$ambiguous_output" >/dev/null || fail 'ambiguous target diagnostic was not structured'
+grep -Fq 'AMBIGUOUS_FILE:"chunks/alpha-a.js"' <<<"$ambiguous_output" ||
+  fail 'ambiguous target diagnostic did not list candidate files'
+grep -Fq 'AMBIGUOUS_FILE:"chunks/alpha-b.js"' <<<"$ambiguous_output" ||
+  fail 'ambiguous target diagnostic listed only one candidate file'
+
+# Task 4.1: facade 状态映射必须把结构化诊断翻译成含补丁 ID、阶段与候选文件的中文错误
+STATUS=()
+MSG=()
+TARGET_PACKAGE="" TARGET_VERSION="" TARGET_LAYOUT=""
+parse_and_set_status transcript-dialog check "$missing_output" "$missing_status" || true
+[[ "${STATUS[transcript-dialog]:-}" == error ]] || fail 'missing target did not map to error status'
+[[ "${MSG[transcript-dialog]:-}" == *'缺失目标: beta'* ]] ||
+  fail "missing target diagnostic was not translated: ${MSG[transcript-dialog]:-}"
+[[ "${MSG[transcript-dialog]:-}" == *'transcript-dialog'* && "${MSG[transcript-dialog]:-}" == *'检测'* ]] ||
+  fail "missing target diagnostic lacked patch id or stage: ${MSG[transcript-dialog]:-}"
+assert_eq "${TARGET_PACKAGE:-}" '@cometix/anthropic-cc' 'check/apply output must carry package identity'
+assert_eq "${TARGET_VERSION:-}" '2.1.259' 'check/apply output must carry package version'
+assert_eq "${TARGET_LAYOUT:-}" 'split-esm' 'check/apply output must carry package layout'
+
+STATUS=()
+MSG=()
+TARGET_PACKAGE="" TARGET_VERSION="" TARGET_LAYOUT=""
+parse_and_set_status ultracode apply "$ambiguous_output" "$ambiguous_status" || true
+[[ "${STATUS[ultracode]:-}" == error ]] || fail 'ambiguous target did not map to error status'
+[[ "${MSG[ultracode]:-}" == *'目标歧义: alpha:2'* ]] ||
+  fail "ambiguous target diagnostic was not translated: ${MSG[ultracode]:-}"
+[[ "${MSG[ultracode]:-}" == *'ultracode'* && "${MSG[ultracode]:-}" == *'应用'* &&
+  "${MSG[ultracode]:-}" == *'候选'* &&
+  "${MSG[ultracode]:-}" == *'chunks/alpha-a.js'* &&
+  "${MSG[ultracode]:-}" == *'chunks/alpha-b.js'* ]] ||
+  fail "ambiguous target diagnostic lacked patch id, stage or candidate files: ${MSG[ultracode]:-}"
 
 overlap="$tmp/overlap"
 fixture_make_package "$overlap" split-esm '@cometix/anthropic-cc' 2.1.259
