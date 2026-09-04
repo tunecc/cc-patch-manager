@@ -672,7 +672,7 @@ git commit -m "feat: support context limit across esm modules"
 
 **Interfaces:** Produces `settings-schema`, `enable-gate`, `config-merge`; supports default off, `CLAUDE_CODE_COMPUTER_USE=1`, settings and child config merge.
 
-- [ ] **Step 1: 写跨模块 fixture**
+- [x] **Step 1: 写跨模块 fixture**
 
 ```bash
 fixture_add_module "$tmp/new" chunks/schema.js 'export const schema={autoCompactEnabled:z.boolean()}'
@@ -681,13 +681,13 @@ fixture_add_module "$tmp/new" chunks/config.js 'export const config=()=>({enable
 fixture_assert_computer_use "$tmp/new"
 ```
 
-- [ ] **Step 2: 确认红灯**
+- [x] **Step 2: 确认红灯**
 
 Run: `bash tests/test_computer_use_integration.sh && bash tests/test_dual_layout_lifecycle.sh computer-use`
 
 Expected: FAIL；旧 engine 假定 builder、gate、merge 在同一文件。
 
-- [ ] **Step 3: 实施 live builder 计划**
+- [x] **Step 3: 实施 live builder 计划**
 
 ```javascript
 const builders = inferZodBuilders(findAdjacentSchemaProperty(context, 'autoCompactEnabled'));
@@ -696,13 +696,13 @@ plan.files.push(rewriteComputerUseGate(gateTarget, settingsBinding));
 plan.files.push(mergeComputerUseConfig(configTarget, settingsBinding));
 ```
 
-- [ ] **Step 4: 复跑**
+- [x] **Step 4: 复跑**
 
 Run: `bash tests/test_computer_use_integration.sh && bash tests/test_dual_layout_lifecycle.sh computer-use`
 
 Expected: PASS；typed factory、hipaa 早返回、默认/环境/settings/子配置行为不退化。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add cc-patch-manager.sh tests/test_computer_use_integration.sh tests/test_dual_layout_lifecycle.sh

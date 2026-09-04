@@ -429,9 +429,10 @@ restore_baseline() {
 # 还原单个补丁：从备份还原后重打其它已应用补丁（保持「一份备份」模型）
 restore_patch() {
   local id="$1" other kept=() x output ec=0
-  if [[ "$id" == "voice-mode" || ( "$id" == "context-limit" && -f "$(dirname "$CLI_PATH")/.cc-patch-manager-baseline/manifest.json" ) ]]; then
+  if [[ "$id" == "voice-mode" || ( ( "$id" == "context-limit" || "$id" == "computer-use" ) &&
+      -f "$(dirname "$CLI_PATH")/.cc-patch-manager-baseline/manifest.json" ) ]]; then
     if ! require_target_readable || ! ensure_node || ! ensure_acorn; then
-      error "VoiceMode 目标或 Node/acorn 不可用"
+      error "补丁目标或 Node/acorn 不可用"
       return 1
     fi
     set +e
@@ -925,6 +926,80 @@ function memberNamed(node, name) {
 function enclosingNode(ast, target, type) {
   const containers = findAstNodes(ast, node => node.type === type && node.start <= target.start && target.end <= node.end);
   return containers.sort((left, right) => (left.end - left.start) - (right.end - right.start))[0] || null;
+}
+
+function bindingPatternNames(pattern, names = []) {
+  if (!pattern) return names;
+  if (pattern.type === 'Identifier') names.push(pattern.name);
+  else if (pattern.type === 'RestElement') bindingPatternNames(pattern.argument, names);
+  else if (pattern.type === 'AssignmentPattern') bindingPatternNames(pattern.left, names);
+  else if (pattern.type === 'ArrayPattern') pattern.elements.forEach(item => bindingPatternNames(item, names));
+  else if (pattern.type === 'ObjectPattern') pattern.properties.forEach(property =>
+    bindingPatternNames(property.type === 'RestElement' ? property.argument : property.value, names));
+  return names;
+}
+
+function astPathToNode(root, target, path = []) {
+  if (!root || typeof root !== 'object') return null;
+  const next = [...path, root];
+  if (root === target) return next;
+  for (const [key, value] of Object.entries(root)) {
+    if (key === 'start' || key === 'end') continue;
+    if (Array.isArray(value)) {
+      for (const child of value) {
+        const found = astPathToNode(child, target, next);
+        if (found) return found;
+      }
+    } else if (value && typeof value === 'object') {
+      const found = astPathToNode(value, target, next);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+function declarationBindsName(declaration, name) {
+  if (declaration?.type === 'VariableDeclaration') {
+    return declaration.declarations.some(item => bindingPatternNames(item.id).includes(name));
+  }
+  return ['FunctionDeclaration', 'ClassDeclaration'].includes(declaration?.type) && declaration.id?.name === name;
+}
+
+function functionVarBindsName(fn, name) {
+  const visit = (node, root = false) => {
+    if (!node || typeof node !== 'object') return false;
+    if (!root && ['FunctionDeclaration', 'FunctionExpression', 'ArrowFunctionExpression'].includes(node.type)) return false;
+    if (node.type === 'VariableDeclaration' && node.kind === 'var' && declarationBindsName(node, name)) return true;
+    for (const [key, value] of Object.entries(node)) {
+      if (key === 'start' || key === 'end') continue;
+      if (Array.isArray(value) && value.some(child => visit(child))) return true;
+      if (value && typeof value === 'object' && visit(value)) return true;
+    }
+    return false;
+  };
+  return visit(fn.body, true);
+}
+
+function identifierIsLexicallyShadowed(ast, identifier) {
+  if (identifier?.type !== 'Identifier') return true;
+  const pathToIdentifier = astPathToNode(ast, identifier);
+  if (!pathToIdentifier) return true;
+  const name = identifier.name;
+  for (const scope of pathToIdentifier) {
+    if (['FunctionDeclaration', 'FunctionExpression', 'ArrowFunctionExpression'].includes(scope.type)) {
+      if (scope.params.some(param => bindingPatternNames(param).includes(name)) ||
+          scope.type === 'FunctionExpression' && scope.id?.name === name || functionVarBindsName(scope, name)) return true;
+    }
+    if (scope.type === 'CatchClause' && bindingPatternNames(scope.param).includes(name)) return true;
+    if (scope.type === 'BlockStatement' && scope.body.some(statement =>
+      statement.type === 'VariableDeclaration' && statement.kind !== 'var' && declarationBindsName(statement, name) ||
+      ['FunctionDeclaration', 'ClassDeclaration'].includes(statement.type) && declarationBindsName(statement, name))) return true;
+    if (['ForStatement', 'ForInStatement', 'ForOfStatement'].includes(scope.type)) {
+      const declaration = scope.type === 'ForStatement' ? scope.init : scope.left;
+      if (declaration?.type === 'VariableDeclaration' && declaration.kind !== 'var' && declarationBindsName(declaration, name)) return true;
+    }
+  }
+  return false;
 }
 
 function booleanReturnCount(node, value) {
@@ -2145,6 +2220,427 @@ function analyzeContextLimit(target) {
   return plan;
 }
 
+function unwrapComputerSchemaExpression(expression) {
+  let current = expression;
+  while (current?.type === 'SequenceExpression' || current?.type === 'ParenthesizedExpression') {
+    current = current.type === 'SequenceExpression' ? current.expressions.at(-1) : current.expression;
+  }
+  return current;
+}
+
+function computerSchemaRoot(expression) {
+  let current = unwrapComputerSchemaExpression(expression);
+  while (current?.type === 'CallExpression' && current.callee?.type === 'MemberExpression') {
+    current = unwrapComputerSchemaExpression(current.callee.object);
+  }
+  return current;
+}
+
+function computerSchemaShape(program, property) {
+  if ((property.key?.name || property.key?.value) !== 'autoCompactEnabled') return null;
+  const parent = enclosingNode(program.ast, property, 'ObjectExpression');
+  const valueSource = program.text.slice(property.value.start, property.value.end).toLowerCase();
+  if (!parent || parent.properties.length < 50 || !valueSource.includes('compact conversation')) return null;
+  const root = computerSchemaRoot(property.value);
+  if (root?.type === 'Identifier') {
+    return {property, parent, direct: true, boolean: root.name, object: root.name, enumeration: root.name};
+  }
+  if (root?.type !== 'CallExpression' || root.callee?.type !== 'Identifier') return null;
+  const objects = new Set(), enumerations = new Set();
+  for (const sibling of parent.properties) {
+    if (sibling.type !== 'Property') continue;
+    const siblingRoot = computerSchemaRoot(sibling.value);
+    if (siblingRoot?.type !== 'CallExpression' || siblingRoot.callee?.type !== 'Identifier') continue;
+    if (siblingRoot.arguments[0]?.type === 'ObjectExpression') objects.add(siblingRoot.callee.name);
+    if (siblingRoot.arguments[0]?.type === 'ArrayExpression' && siblingRoot.arguments[0].elements.length > 0 &&
+        siblingRoot.arguments[0].elements.every(item => item?.type === 'Literal' && typeof item.value === 'string')) {
+      enumerations.add(siblingRoot.callee.name);
+    }
+  }
+  if (objects.size !== 1 || enumerations.size !== 1) return null;
+  return {property, parent, direct: false, boolean: root.callee.name,
+    object: [...objects][0], enumeration: [...enumerations][0]};
+}
+
+function computerSchemaInsertion(shape, keys) {
+  const boolean = shape.direct ? `${shape.boolean}.boolean()` : `${shape.boolean}()`;
+  const object = shape.direct ? `${shape.object}.object` : shape.object;
+  const enumeration = shape.direct ? `${shape.enumeration}.enum` : shape.enumeration;
+  const parts = [];
+  if (keys.includes('computerUseEnabled')) {
+    parts.push(`computerUseEnabled:${boolean}.optional().describe("Enable computer use MCP server for desktop control (macOS only, default off)")`);
+  }
+  if (keys.includes('computerUseConfig')) {
+    parts.push(`computerUseConfig:${object}({mouseAnimation:${boolean}.optional(),hideBeforeAction:${boolean}.optional(),clipboardGuard:${boolean}.optional(),coordinateMode:${enumeration}(["pixels","normalized_0_100"]).optional()}).optional().describe("Computer use sub-configuration overrides")`);
+  }
+  return parts.length > 0 ? `,${parts.join(',')}` : '';
+}
+
+function analyzeComputerSchema(target, files) {
+  const programs = candidatePrograms(target,
+    ['autoCompactEnabled', 'Automatically compact conversation', 'compact conversation', 'CC_COMPUTER_SCHEMA']);
+  const matches = [];
+  for (const program of programs) {
+    const properties = findAstNodes(program.ast, node => node.type === 'Property' &&
+      (node.key?.name || node.key?.value) === 'autoCompactEnabled');
+    for (const property of properties) {
+      const shape = computerSchemaShape(program, property);
+      if (!shape) continue;
+      const keys = shape.parent.properties.map(item => item.key?.name || item.key?.value);
+      const enabledCount = keys.filter(key => key === 'computerUseEnabled').length;
+      const configCount = keys.filter(key => key === 'computerUseConfig').length;
+      if (enabledCount > 1 || configCount > 1) continue;
+      const missing = [];
+      if (enabledCount === 0) missing.push('computerUseEnabled');
+      if (configCount === 0) missing.push('computerUseConfig');
+      if (missing.length > 0) {
+        const insertion = computerSchemaInsertion(shape, missing);
+        const marked = `${reversibleBodyMarker('COMPUTER_SCHEMA', '', insertion)}${insertion}`;
+        const beforeProperty = program.text.slice(property.start, property.end);
+        const afterProperty = `${beforeProperty}${marked}`;
+        const beforeParent = program.text.slice(shape.parent.start, shape.parent.end);
+        const offset = property.end - shape.parent.start;
+        const afterParent = beforeParent.slice(0, offset) + marked + beforeParent.slice(offset);
+        matches.push({relativePath: program.relativePath, start: property.start, end: property.end,
+          state: 'before', before: beforeProperty, after: afterProperty});
+        addPlannedReplacement(files, program,
+          {start: property.start, end: property.end, text: afterProperty, semanticId: 'settings-schema'},
+          beforeParent, afterParent);
+        continue;
+      }
+      const marker = /\/\*CC_COMPUTER_SCHEMA:[A-Za-z0-9+/=]*:[a-f0-9]{64}\*\//g;
+      const parentSource = program.text.slice(shape.parent.start, shape.parent.end);
+      const attributed = [];
+      for (const markerMatch of parentSource.matchAll(marker)) {
+        const start = shape.parent.start + markerMatch.index;
+        for (const insertedKeys of [
+          ['computerUseEnabled', 'computerUseConfig'], ['computerUseEnabled'], ['computerUseConfig']]) {
+          const insertion = computerSchemaInsertion(shape, insertedKeys);
+          const expected = `${reversibleBodyMarker('COMPUTER_SCHEMA', '', insertion)}${insertion}`;
+          if (program.text.slice(start, start + expected.length) === expected) {
+            const propertySource = program.text.slice(property.start, property.end);
+            attributed.push({relativePath: program.relativePath, start: property.start,
+              end: start + expected.length, state: 'after', before: propertySource,
+              after: `${propertySource}${expected}`});
+          }
+        }
+      }
+      if (attributed.length === 1) matches.push(attributed[0]);
+      else if (attributed.length === 0) matches.push({relativePath: program.relativePath,
+        start: shape.parent.start, end: shape.parent.end, state: 'after', before: '',
+        after: parentSource, attributable: false});
+    }
+  }
+  return {programs, matches};
+}
+
+function processEnvMember(node, names) {
+  return node?.type === 'MemberExpression' && names.includes(node.property?.name || node.property?.value) &&
+    node.object?.type === 'MemberExpression' && node.object.object?.name === 'process' &&
+    (node.object.property?.name || node.object.property?.value) === 'env';
+}
+
+function computerImmediateImportRoute(target, program, localName, binding) {
+  const absolute = packageFile(target.packageRoot, program.relativePath);
+  for (const declaration of program.ast.body.filter(node => node.type === 'ImportDeclaration' &&
+      typeof node.source.value === 'string' && node.source.value.startsWith('.'))) {
+    const specifier = declaration.specifiers.find(item => item.local?.name === localName &&
+      item.type === 'ImportSpecifier' && item.imported?.name);
+    if (!specifier) continue;
+    const sourceFile = resolveRelativeModule(target.packageRoot, absolute, declaration.source.value);
+    return {sourceFile, sourceRelative: path.relative(target.packageRoot, sourceFile),
+      importedName: specifier.imported.name, binding};
+  }
+  return null;
+}
+
+function discoverComputerHelpers(target) {
+  const programs = candidatePrograms(target,
+    ['DISABLE_AUTO_COMPACT', 'DISABLE_COMPACT', 'autoCompactEnabled']);
+  const index = new ModuleIndex(target), envFunctions = [], envUses = [];
+  for (const program of programs) {
+    const absolute = packageFile(target.packageRoot, program.relativePath);
+    for (const fn of findAstNodes(program.ast, node => node.type === 'FunctionDeclaration' && node.id?.name)) {
+      if (!memberNamed(fn, 'DISABLE_AUTO_COMPACT') && !memberNamed(fn, 'DISABLE_COMPACT')) continue;
+      const calls = findAstNodes(fn, node => node.type === 'CallExpression' &&
+        node.callee?.type === 'Identifier' &&
+        processEnvMember(node.arguments?.[0], ['DISABLE_AUTO_COMPACT', 'DISABLE_COMPACT']));
+      for (const call of calls) {
+        if (identifierIsLexicallyShadowed(program.ast, call.callee)) continue;
+        try {
+          const binding = index.resolveLocal(absolute, call.callee.name);
+          envFunctions.push({relativePath: program.relativePath, name: fn.id.name});
+          envUses.push({program, localName: call.callee.name, binding,
+            route: target.layout === 'split-esm' ?
+              computerImmediateImportRoute(target, program, call.callee.name, binding) : null});
+        } catch {}
+      }
+    }
+  }
+  const settingUses = [];
+  for (const program of programs) {
+    const absolute = packageFile(target.packageRoot, program.relativePath);
+    const localEnvFunctions = envFunctions.filter(item => item.relativePath === program.relativePath).map(item => item.name);
+    for (const fn of findAstNodes(program.ast, node => node.type === 'FunctionDeclaration')) {
+      const readsDisableEnv = memberNamed(fn, 'DISABLE_AUTO_COMPACT') || memberNamed(fn, 'DISABLE_COMPACT');
+      const callsEnvReader = findAstNodes(fn, node => node.type === 'CallExpression' &&
+        node.callee?.type === 'Identifier' && localEnvFunctions.includes(node.callee.name) &&
+        !identifierIsLexicallyShadowed(program.ast, node.callee)).length > 0;
+      if (!readsDisableEnv && !callsEnvReader) continue;
+      const calls = findAstNodes(fn, node => node.type === 'CallExpression' &&
+        node.callee?.type === 'Identifier' && node.arguments?.[0]?.type === 'Literal' &&
+        node.arguments[0].value === 'autoCompactEnabled');
+      for (const call of calls) {
+        if (identifierIsLexicallyShadowed(program.ast, call.callee)) continue;
+        try {
+          const binding = index.resolveLocal(absolute, call.callee.name);
+          settingUses.push({program, localName: call.callee.name, binding,
+            route: target.layout === 'split-esm' ?
+              computerImmediateImportRoute(target, program, call.callee.name, binding) : null});
+        } catch {}
+      }
+    }
+  }
+  const unique = uses => [...new Map(uses.map(use => [bindingKey(use.binding), use])).values()];
+  const environments = unique(envUses), settings = unique(settingUses);
+  if (environments.length !== 1 || settings.length !== 1) return null;
+  if (target.layout === 'split-esm' && (!environments[0].route || !settings[0].route)) return null;
+  return {index, environment: environments[0], setting: settings[0], programs};
+}
+
+function computerConfigShape(fn) {
+  const statements = fn.body?.body;
+  if (!statements || statements.length !== 1 || statements[0].type !== 'ReturnStatement') return null;
+  const object = statements[0].argument;
+  if (object?.type !== 'ObjectExpression' || object.properties.length !== 2) return null;
+  const [defaults, feature] = object.properties;
+  if (defaults.type !== 'SpreadElement' || defaults.argument?.type !== 'Identifier' ||
+      feature.type !== 'SpreadElement' || feature.argument?.type !== 'CallExpression' ||
+      feature.argument.callee?.type !== 'Identifier' ||
+      feature.argument.arguments?.[0]?.type !== 'Literal' ||
+      feature.argument.arguments[0].value !== 'tengu_malort_pedway' ||
+      feature.argument.arguments[1]?.name !== defaults.argument.name) return null;
+  return {defaults: defaults.argument.name, feature: feature.argument.callee.name};
+}
+
+function falseReturn(statement) {
+  if (statement?.type !== 'ReturnStatement') return false;
+  const value = statement.argument;
+  return value?.type === 'Literal' && (value.value === false || value.value === 0) ||
+    value?.type === 'UnaryExpression' && value.operator === '!' &&
+    value.argument?.type === 'Literal' && value.argument.value === 1;
+}
+
+function computerGateShape(fn) {
+  const statements = fn.body?.body;
+  if (!statements || statements.length < 1 || statements.length > 4) return null;
+  for (const statement of statements.slice(0, -1)) {
+    const returned = statement.type === 'IfStatement' && !statement.alternate ?
+      (statement.consequent?.type === 'BlockStatement' ? statement.consequent.body?.[0] : statement.consequent) : null;
+    if (!falseReturn(returned)) return null;
+  }
+  const value = statements.at(-1)?.type === 'ReturnStatement' ? statements.at(-1).argument : null;
+  if (value?.type !== 'LogicalExpression' || value.operator !== '&&' ||
+      value.left?.type !== 'CallExpression' || value.left.callee?.type !== 'Identifier' ||
+      value.right?.type !== 'MemberExpression' ||
+      (value.right.property?.name || value.right.property?.value) !== 'enabled' ||
+      value.right.object?.type !== 'CallExpression' || value.right.object.callee?.type !== 'Identifier') return null;
+  return {config: value.right.object.callee.name, configCall: value.right.object};
+}
+
+function reconstructedComputerFunction(program, fn, markerId) {
+  const before = decodeReversibleBody(program.text.slice(fn.body.start, fn.body.end), markerId);
+  if (before === null) return null;
+  const parameters = fn.params.map(param => program.text.slice(param.start, param.end)).join(',');
+  const text = `function __CC_RECONSTRUCT(${parameters})${before}`;
+  try {
+    const ast = acorn.parse(text, {ecmaVersion: 'latest', sourceType: 'script'});
+    return {before, program: {...program, text, ast}, fn: ast.body[0]};
+  } catch { return null; }
+}
+
+function computerLocalCollision(fn, names) {
+  return findAstNodes(fn, node =>
+    node.type === 'VariableDeclarator' && node.id?.type === 'Identifier' && names.includes(node.id.name) ||
+    node.type === 'Identifier' && fn.params.includes(node) && names.includes(node.name)).length > 0;
+}
+
+function computerImportSpecifier(targetFile, sourceFile) {
+  let specifier = path.posix.relative(path.posix.dirname(targetFile), sourceFile);
+  if (!specifier.startsWith('.')) specifier = `./${specifier}`;
+  return specifier;
+}
+
+function prepareComputerImports(target, program, requirements, helpers, files, transformations) {
+  if (target.layout !== 'split-esm') {
+    return {environment: helpers.environment.localName, setting: helpers.setting.localName};
+  }
+  const definitions = {
+    environment: {helper: helpers.environment, alias: '__ccComputerEnvTruthy'},
+    setting: {helper: helpers.setting, alias: '__ccComputerReadSetting'},
+  };
+  const requested = requirements.map(name => ({name, ...definitions[name]}));
+  const imports = requested.map(item => {
+    const route = item.helper.route;
+    const specifier = computerImportSpecifier(program.relativePath, route.sourceRelative);
+    return `import{${route.importedName} as ${item.alias}}from${JSON.stringify(specifier)};`;
+  }).join('');
+  const marker = '/*CC_COMPUTER_IMPORTS*/';
+  const prefix = `${marker}${imports}`;
+  const markerPositions = [...program.text.matchAll(/\/\*CC_COMPUTER_IMPORTS\*\//g)].map(match => match.index);
+  if (markerPositions.length > 0) {
+    if (markerPositions.length !== 1 || program.text.slice(markerPositions[0], markerPositions[0] + prefix.length) !== prefix) return null;
+    const prefixEnd = markerPositions[0] + prefix.length;
+    const shiftedNode = program.ast.body.find(node => node.start >= prefixEnd);
+    if (!shiftedNode) return null;
+    const shifted = program.text.slice(shiftedNode.start, shiftedNode.end);
+    const leading = shifted.match(/^([A-Za-z]+)(\s+)/);
+    if (!leading) return null;
+    const before = `${leading[1]}${leading[2].slice(0, -1)}${shifted.slice(leading[0].length)}`;
+    const after = `${prefix}${shifted}`;
+    const index = new ModuleIndex(target), absolute = packageFile(target.packageRoot, program.relativePath);
+    for (const item of requested) {
+      try {
+        if (bindingKey(index.resolveLocal(absolute, item.alias)) !== bindingKey(item.helper.binding)) return null;
+      } catch { return null; }
+    }
+    transformations.push({semanticId: 'computer-helper-imports', relativePath: program.relativePath,
+      start: markerPositions[0], state: 'after', before, after});
+  } else {
+    if (requested.some(item => findAstNodes(program.ast,
+      node => node.type === 'Identifier' && node.name === item.alias).length > 0)) return null;
+    const first = program.ast.body[0];
+    if (!first) return null;
+    const before = program.text.slice(first.start, first.end);
+    const shifted = before.replace(/^([A-Za-z]+)(\s*)/, (_, keyword, whitespace) =>
+      `${keyword}${whitespace} `);
+    if (shifted === before) return null;
+    const after = `${prefix}${shifted}`;
+    addPlannedReplacement(files, program,
+      {start: first.start, end: first.end, text: after, semanticId: 'computer-helper-imports'}, before, after);
+    transformations.push({semanticId: 'computer-helper-imports', relativePath: program.relativePath,
+      start: first.start, state: 'before', before, after});
+  }
+  return Object.fromEntries(requested.map(item => [item.name, item.alias]));
+}
+
+function computerGateBody(program, fn, helpers) {
+  const body = program.text.slice(fn.body.start, fn.body.end);
+  return `{if(${helpers.environment}(process.env.CLAUDE_CODE_COMPUTER_USE))return!0;` +
+    `var __ccComputerSetting=${helpers.setting}("computerUseEnabled",void 0);` +
+    `if(__ccComputerSetting.source!=="default")return!!__ccComputerSetting.value;${body.slice(1)}`;
+}
+
+function computerConfigBody(shape, setting) {
+  return `{var __ccComputerBase={...${shape.defaults},...${shape.feature}("tengu_malort_pedway",${shape.defaults})};` +
+    `var __ccComputerOptions=${setting}("computerUseConfig",void 0);` +
+    'if(__ccComputerOptions.source!=="default"&&typeof __ccComputerOptions.value==="object"&&__ccComputerOptions.value!==null)' +
+    'return{...__ccComputerBase,...__ccComputerOptions.value};return __ccComputerBase}';
+}
+
+function analyzeComputerUse(target) {
+  const files = new Map(), importTransformations = [];
+  const schema = analyzeComputerSchema(target, files);
+  const helpers = discoverComputerHelpers(target);
+  const configPrograms = candidatePrograms(target, ['tengu_malort_pedway', 'CC_COMPUTER_CONFIG']);
+  const rawConfigs = [];
+  for (const program of configPrograms) {
+    for (const fn of findAstNodes(program.ast, node => node.type === 'FunctionDeclaration' && node.id?.name)) {
+      const reconstructed = reconstructedComputerFunction(program, fn, 'COMPUTER_CONFIG');
+      const sourceFunction = reconstructed?.fn || fn;
+      const shape = computerConfigShape(sourceFunction);
+      if (shape) rawConfigs.push({program, fn, sourceFunction, shape,
+        state: reconstructed ? 'after' : 'before'});
+    }
+  }
+  const index = new ModuleIndex(target), configBindings = [];
+  for (const targetConfig of rawConfigs) {
+    try {
+      configBindings.push(index.resolveLocal(packageFile(target.packageRoot, targetConfig.program.relativePath),
+        targetConfig.fn.id.name));
+    } catch {}
+  }
+  const uniqueConfigBindings = [...new Map(configBindings.map(binding => [bindingKey(binding), binding])).values()];
+  const gatePrograms = candidatePrograms(target, ['hipaa', '.enabled', 'CC_COMPUTER_ENABLE']);
+  const rawGates = [];
+  for (const program of gatePrograms) {
+    const absolute = packageFile(target.packageRoot, program.relativePath);
+    for (const fn of findAstNodes(program.ast, node => node.type === 'FunctionDeclaration' && node.id?.name)) {
+      const reconstructed = reconstructedComputerFunction(program, fn, 'COMPUTER_ENABLE');
+      const sourceFunction = reconstructed?.fn || fn;
+      const shape = computerGateShape(sourceFunction);
+      if (!shape || uniqueConfigBindings.length !== 1) continue;
+      const sourceProgram = reconstructed?.program || program;
+      if (identifierIsLexicallyShadowed(sourceProgram.ast, shape.configCall.callee)) continue;
+      try {
+        if (bindingKey(index.resolveLocal(absolute, shape.config)) !== bindingKey(uniqueConfigBindings[0])) continue;
+      } catch { continue; }
+      rawGates.push({program, fn, sourceProgram, sourceFunction, shape, state: reconstructed ? 'after' : 'before'});
+    }
+  }
+
+  const requirements = new Map();
+  for (const item of rawConfigs) requirements.set(item.program.relativePath, {program: item.program, names: new Set(['setting'])});
+  for (const item of rawGates) {
+    const current = requirements.get(item.program.relativePath) || {program: item.program, names: new Set()};
+    current.names.add('environment');
+    current.names.add('setting');
+    requirements.set(item.program.relativePath, current);
+  }
+  const aliases = new Map();
+  if (helpers) {
+    for (const [relativePath, requirement] of requirements) {
+      const prepared = prepareComputerImports(target, requirement.program,
+        [...requirement.names].sort(), helpers, files, importTransformations);
+      if (prepared) aliases.set(relativePath, prepared);
+    }
+  }
+
+  const configMatches = [];
+  for (const item of rawConfigs) {
+    const names = aliases.get(item.program.relativePath);
+    if (!names || computerLocalCollision(item.sourceFunction,
+      ['__ccComputerBase', '__ccComputerOptions', names.setting])) continue;
+    if (item.state === 'before') {
+      const modified = computerConfigBody(item.shape, names.setting);
+      configMatches.push(bodyPatch(files, item.program, item.fn, 'config-merge', 'COMPUTER_CONFIG', modified));
+    } else {
+      const match = reconstructedBodyMatch(item.program, item.fn, 'COMPUTER_CONFIG',
+        (originalProgram, originalFunction) => {
+          const shape = computerConfigShape(originalFunction);
+          return shape ? computerConfigBody(shape, names.setting) : null;
+        });
+      if (match) configMatches.push(match);
+    }
+  }
+  const gateMatches = [];
+  for (const item of rawGates) {
+    const names = aliases.get(item.program.relativePath);
+    if (!names || computerLocalCollision(item.sourceFunction,
+      ['__ccComputerSetting', names.environment, names.setting])) continue;
+    if (item.state === 'before') {
+      gateMatches.push(bodyPatch(files, item.program, item.fn, 'enable-gate', 'COMPUTER_ENABLE',
+        computerGateBody(item.program, item.fn, names)));
+    } else {
+      const match = reconstructedBodyMatch(item.program, item.fn, 'COMPUTER_ENABLE',
+        (originalProgram, originalFunction) => computerGateShape(originalFunction) ?
+          computerGateBody(originalProgram, originalFunction, names) : null);
+      if (match) gateMatches.push(match);
+    }
+  }
+  const semanticTargets = [
+    {id: 'settings-schema', expectedCardinality: 1, matches: schema.matches},
+    {id: 'enable-gate', expectedCardinality: 1, matches: gateMatches},
+    {id: 'config-merge', expectedCardinality: 1, matches: configMatches},
+  ];
+  const plan = finishSemanticPlan('computer-use', semanticTargets, files, {
+    candidateFiles: [...new Set([...schema.programs, ...(helpers?.programs || []), ...configPrograms, ...gatePrograms]
+      .map(item => item.relativePath))],
+  });
+  plan.attribution.transformations.push(...importTransformations);
+  return plan;
+}
+
 function analyzeContractFixture(target, patchId = '__contract__') {
   if (process.env.CC_PATCH_TESTING !== '1') throw new Error('internal contract analyzer is disabled');
   const allDefinitions = [
@@ -2281,13 +2777,14 @@ function analyzerForPatch(patchId) {
     return target => analyzeContractFixture(target, patchId);
   }
   if (process.env.CC_PATCH_TESTING === '1' && process.env.CC_PATCH_TEST_PRODUCTION_IDS === '1' &&
-      patchId === 'context-limit') return null;
+      ['context-limit', 'computer-use'].includes(patchId)) return null;
   if (patchId === 'auto-mode') return analyzeAutoMode;
   if (patchId === 'keybindings') return analyzeKeybindings;
   if (patchId === 'transcript-dialog') return analyzeTranscriptDialog;
   if (patchId === 'ultracode') return analyzeUltracode;
   if (patchId === 'voice-mode') return analyzeVoiceMode;
   if (patchId === 'context-limit') return analyzeContextLimit;
+  if (patchId === 'computer-use') return analyzeComputerUse;
   return null;
 }
 
@@ -2419,6 +2916,7 @@ const knownPatchSentinels = [
   {patchId: 'voice-mode', value: 'cometix-asr voice adapter'},
   {patchId: 'context-limit', value: 'CLAUDE_CODE_CONTEXT_LIMIT'},
   {patchId: 'computer-use', value: 'computerUseEnabled'},
+  {patchId: 'computer-use', value: 'computerUseConfig'},
   {patchId: 'transcript-dialog', value: 'CC_DIALOG_FIX_'},
   {patchId: 'ultracode', value: 'CC_ULTRACODE_'},
 ];
@@ -6395,7 +6893,7 @@ run_node_patch() {
   set -e
   if [[ "$ec" -eq 0 ]]; then
     target_layout=$(printf '%s\n' "$target_info" | sed -n 's/^TARGET_LAYOUT://p' | head -1)
-    if [[ "$id" == "context-limit" ]]; then
+    if [[ "$id" == "context-limit" || "$id" == "computer-use" ]]; then
       set +e
       output=$(runtime_exec "$mode" "$CLI_PATH" "$id" 2>&1)
       ec=$?

@@ -20,7 +20,7 @@
 - [x] 3.2 先增加权限弹窗重放与 Ultracode 的 split-ESM 多模块失败 fixture，再迁移 module AST、channel/cleanup 及 xhigh/max/激活目标，并通过新旧布局生命周期测试
 - [x] 3.3 先增加 VoiceMode 七类语义目标和 ASR vendor 操作的 split-ESM 失败 fixture，再迁移 VoiceMode PatchPlan，并通过平台门禁、资源缺失、应用、复检和还原测试
 - [x] 3.4 先增加 Context Limit 跨模块默认值与 settings env 刷新失败 fixture，再实现绑定解析和补丁后刷新语义，并通过环境变量、settings env、幂等与恢复测试
-- [ ] 3.5 先增加 Computer Use 跨模块 schema、启用门禁、配置合并与 settings helper 失败 fixture，再迁移 PatchPlan，并通过默认关闭、环境变量、settings、部分状态修复与恢复测试
+- [x] 3.5 先增加 Computer Use 跨模块 schema、启用门禁、配置合并与 settings helper 失败 fixture，再迁移 PatchPlan，并通过默认关闭、环境变量、settings、部分状态修复与恢复测试
 
 ## 4. 交互、诊断与批量行为
 

@@ -35,6 +35,11 @@ VOICE_CONNECTION='async function connectVoiceStream(callbacks,options){let query
 VOICE_SETTINGS='function writeUserSettings(kind,value){return{kind,value}}function voiceSettings({settingsData,setAppState,setSettingsData,setChanges}){writeUserSettings("userSettings",{});let settings=[{id:"autoCompact"},{id:"language"},{id:"editor"}];return{settings}}'
 CONTEXT_LIMIT='var contextWindow=200000,compactWindow=200000,outputLimit=32000;function contextDisabled(){return process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT}function configuredMaximum(){let configured=process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS;return configured||contextWindow}function compactBoundary(){return configuredMaximum()>compactWindow?compactWindow:configuredMaximum()}function readContextWindow(){return contextWindow}function readCompactWindow(){return compactWindow}'
 CONTEXT_SETTINGS='class SettingsLoader{applyConfigEnvironmentVariables(env){Object.assign(process.env,env)}}'
+COMPUTER_SCHEMA_PROPERTIES='p01:0,p02:0,p03:0,p04:0,p05:0,p06:0,p07:0,p08:0,p09:0,p10:0,p11:0,p12:0,p13:0,p14:0,p15:0,p16:0,p17:0,p18:0,p19:0,p20:0,p21:0,p22:0,p23:0,p24:0,p25:0,p26:0,p27:0,p28:0,p29:0,p30:0,p31:0,p32:0,p33:0,p34:0,p35:0,p36:0,p37:0,p38:0,p39:0,p40:0,p41:0,p42:0,p43:0,p44:0,p45:0,p46:0,p47:0,p48:0,p49:0,p50:0'
+COMPUTER_CJS_SCHEMA="const z={boolean(){return this},optional(){return this},describe(){return this},object(){return this},enum(){return this}};const settingsSchema={$COMPUTER_SCHEMA_PROPERTIES,autoCompactEnabled:z.boolean().optional().describe(\"compact conversation setting\")};"
+COMPUTER_HELPERS='let computerSettings={};function envTruthy(value){return value==="1"||value==="true"}function readSetting(name,fallback){return Object.prototype.hasOwnProperty.call(computerSettings,name)?{source:"userSettings",value:computerSettings[name]}:{source:"default",value:fallback}}function setComputerSettings(value){computerSettings=value}function readCompactSetting(){return envTruthy(process.env.DISABLE_AUTO_COMPACT)||readSetting("autoCompactEnabled",void 0).value}'
+COMPUTER_CONFIG='const computerDefaults={enabled:false,mouseAnimation:true,hideBeforeAction:true,clipboardGuard:true,coordinateMode:"pixels"};function featureConfig(name,defaults){return{}}function computerConfig(){return{...computerDefaults,...featureConfig("tengu_malort_pedway",computerDefaults)}}'
+COMPUTER_GATE='function hasSubscription(){return true}function isHipaa(flag){return flag==="hipaa"&&process.env.TEST_HIPAA==="1"}function computerEnabled(){if(isHipaa("hipaa"))return!1;return hasSubscription()&&computerConfig().enabled}'
 
 fixture_make_dual_patch_package() {
   local root="$1" layout="$2" key_flag="${3:-}"
@@ -60,7 +65,11 @@ $VOICE_CONNECTION
 $VOICE_SETTINGS
 $CONTEXT_LIMIT
 $CONTEXT_SETTINGS
-module.exports={modelEligible,decide,classifierModel,keybindingsEnabled,defaultKeybindings,createDialogChannel,ultracodeEligible,resolveEffort,ultracodeActive,voiceCommand,voiceStreamAvailable,connectVoiceStream,voiceSettings,readContextWindow,readCompactWindow,SettingsLoader}"
+$COMPUTER_CJS_SCHEMA
+$COMPUTER_HELPERS
+$COMPUTER_CONFIG
+$COMPUTER_GATE
+module.exports={modelEligible,decide,classifierModel,keybindingsEnabled,defaultKeybindings,createDialogChannel,ultracodeEligible,resolveEffort,ultracodeActive,voiceCommand,voiceStreamAvailable,connectVoiceStream,voiceSettings,readContextWindow,readCompactWindow,SettingsLoader,settingsSchema,setComputerSettings,computerConfig,computerEnabled}"
   else
     fixture_make_package "$root" "$layout" '@cometix/anthropic-cc' 2.1.259
     printf '{"name":"@cometix/anthropic-cc","version":"2.1.259","type":"module"}\n' >"$root/package.json"
@@ -90,6 +99,13 @@ export{voiceSettings}"
 export{readContextWindow,readCompactWindow}"
     fixture_add_module "$root" chunks/context-settings.js "import{readContextWindow,readCompactWindow}from\"./context-limit.js\";$CONTEXT_SETTINGS
 export{SettingsLoader,readContextWindow,readCompactWindow}"
+    fixture_add_module "$root" chunks/computer-schema.js "function Bool(){return{optional(){return this},describe(){return this}}}function Obj(shape){return{optional(){return this},describe(){return this}}}function Enum(values){return{optional(){return this},describe(){return this}}}export const settingsSchema={$COMPUTER_SCHEMA_PROPERTIES,workflowSizeGuideline:Enum([\"small\",\"large\"]).optional(),fileSuggestion:Obj({enabled:Bool().optional()}).optional(),autoCompactEnabled:Bool().optional().describe(\"Automatically compact conversation when context fills\")}"
+    fixture_add_module "$root" chunks/computer-env.js 'export function envTruthy(value){return value==="1"||value==="true"}'
+    fixture_add_module "$root" chunks/computer-settings.js 'let values={};export function readSetting(name,fallback){return Object.prototype.hasOwnProperty.call(values,name)?{source:"userSettings",value:values[name]}:{source:"default",value:fallback}}export function setComputerSettings(next){values=next}'
+    fixture_add_module "$root" chunks/computer-helper-consumer.js 'import{envTruthy}from"./computer-env.js";import{readSetting}from"./computer-settings.js";export function readCompactSetting(){return envTruthy(process.env.DISABLE_AUTO_COMPACT)||readSetting("autoCompactEnabled",void 0).value}'
+    fixture_add_module "$root" chunks/computer-config.js 'const computerDefaults={enabled:false,mouseAnimation:true,hideBeforeAction:true,clipboardGuard:true,coordinateMode:"pixels"};function featureConfig(name,defaults){return{}}export function computerConfig(){return{...computerDefaults,...featureConfig("tengu_malort_pedway",computerDefaults)}}'
+    fixture_add_module "$root" chunks/computer-gate.js 'import{computerConfig}from"./computer-config.js";function hasSubscription(){return true}function isHipaa(flag){return flag==="hipaa"&&process.env.TEST_HIPAA==="1"}export function computerEnabled(){if(isHipaa("hipaa"))return!1;return hasSubscription()&&computerConfig().enabled}'
+    fixture_add_module "$root" chunks/computer-index.js 'export{settingsSchema}from"./computer-schema.js";export{setComputerSettings}from"./computer-settings.js";export{computerConfig}from"./computer-config.js";export{computerEnabled}from"./computer-gate.js"'
   fi
 }
 
@@ -345,6 +361,152 @@ export{SettingsLoader}"
   done
 }
 
+assert_computer_effects() {
+  local root="$1" layout="$2"
+  if [[ "$layout" == single-cjs ]]; then
+    rg -q 'computerUseEnabled:' "$root/cli.js" || fail 'computer-use schema setting missing'
+    rg -q 'CLAUDE_CODE_COMPUTER_USE' "$root/cli.js" || fail 'computer-use environment gate missing'
+    rg -q 'readSetting\("computerUseConfig"' "$root/cli.js" || fail 'computer-use config merge missing'
+  else
+    rg -l 'CC_COMPUTER_SCHEMA' "$root" --glob '*.js' >/dev/null || fail 'computer-use schema marker missing'
+    rg -l 'CC_COMPUTER_ENABLE' "$root" --glob '*.js' >/dev/null || fail 'computer-use enable marker missing'
+    rg -l 'CC_COMPUTER_CONFIG' "$root" --glob '*.js' >/dev/null || fail 'computer-use config marker missing'
+  fi
+}
+
+assert_computer_behavior() {
+  local layout="$1" root="$tmp/computer-behavior-$1" module
+  fixture_make_dual_patch_package "$root" "$layout"
+  runtime_exec apply "$(fixture_entry "$root")" computer-use >/dev/null 2>&1 || fail "$layout computer-use behavior apply failed"
+  if [[ "$layout" == single-cjs ]]; then module="$root/cli.js"; else module="$root/chunks/computer-index.js"; fi
+  node - "$layout" "$module" <<'NODE' || fail "$layout computer-use behavior changed"
+const {pathToFileURL} = require('url');
+(async () => {
+  delete process.env.CLAUDE_CODE_COMPUTER_USE;
+  delete process.env.TEST_HIPAA;
+  const layout = process.argv[2], modulePath = process.argv[3];
+  const loaded = layout === 'single-cjs' ? require(modulePath) : await import(pathToFileURL(modulePath));
+  loaded.setComputerSettings({});
+  if (loaded.computerEnabled() !== false) process.exit(1);
+  process.env.CLAUDE_CODE_COMPUTER_USE = '1';
+  if (loaded.computerEnabled() !== true) process.exit(2);
+  delete process.env.CLAUDE_CODE_COMPUTER_USE;
+  loaded.setComputerSettings({computerUseEnabled: true, computerUseConfig: {mouseAnimation: false, coordinateMode: 'normalized_0_100'}});
+  if (loaded.computerEnabled() !== true) process.exit(3);
+  const config = loaded.computerConfig();
+  if (config.mouseAnimation !== false || config.coordinateMode !== 'normalized_0_100' || config.clipboardGuard !== true) process.exit(4);
+  loaded.setComputerSettings({computerUseEnabled: false});
+  if (loaded.computerEnabled() !== false) process.exit(5);
+})().catch(error => { console.error(error); process.exit(1); });
+NODE
+}
+
+assert_computer_missing_helper_rejected() {
+  local root="$tmp/computer-missing-helper" before output
+  fixture_make_dual_patch_package "$root" split-esm
+  fixture_add_module "$root" chunks/computer-helper-consumer.js 'export function readCompactSetting(){return false}'
+  before=$(fixture_hash_tree "$root")
+  output=$(runtime_exec apply "$(fixture_entry "$root")" computer-use 2>&1) || true
+  [[ "$output" == *'MISSING_TARGET:'* ]] || fail "computer-use accepted missing settings helpers: $output"
+  [[ "$(fixture_hash_tree "$root")" == "$before" ]] || fail 'computer-use missing-helper apply changed package'
+}
+
+assert_computer_facade_lifecycle() {
+  local root="$tmp/computer-facade" output
+  fixture_make_dual_patch_package "$root" split-esm
+  CLI_PATH=$(fixture_entry "$root")
+  run_node_patch computer-use check || fail "computer-use facade check failed: ${LAST_OUTPUT:-}"
+  [[ "${STATUS[computer-use]:-}" == idle ]] || fail 'computer-use facade clean state was not idle'
+  run_node_patch computer-use apply || fail "computer-use facade apply failed: ${LAST_OUTPUT:-}"
+  [[ "${STATUS[computer-use]:-}" == applied ]] || fail 'computer-use facade apply state was not applied'
+  restore_patch computer-use || fail 'computer-use facade restore failed'
+  run_node_patch computer-use check || fail "computer-use facade restored check failed: ${LAST_OUTPUT:-}"
+  [[ "${STATUS[computer-use]:-}" == idle ]] || fail 'computer-use facade restored state was not idle'
+}
+
+assert_computer_partial_state_repaired() {
+  local root="$tmp/computer-partial-state" original_gate="$tmp/computer-original-gate.js" before output enabled_count config_count
+  fixture_make_dual_patch_package "$root" split-esm
+  before=$(fixture_hash_sources "$root")
+  cp "$root/chunks/computer-gate.js" "$original_gate"
+  output=$(runtime_exec apply "$(fixture_entry "$root")" computer-use 2>&1) || fail "partial-state setup apply failed: $output"
+  cp "$original_gate" "$root/chunks/computer-gate.js"
+  output=$(runtime_exec apply "$(fixture_entry "$root")" computer-use 2>&1) || fail "partial-state repair apply failed: $output"
+  enabled_count=$(rg -o 'computerUseEnabled:' "$root/chunks/computer-schema.js" | wc -l | tr -d ' ')
+  config_count=$(rg -o 'computerUseConfig:' "$root/chunks/computer-schema.js" | wc -l | tr -d ' ')
+  [[ "$enabled_count" == 1 && "$config_count" == 1 ]] || fail 'partial-state repair duplicated schema keys'
+  runtime_exec check "$(fixture_entry "$root")" computer-use | grep -Fxq ALREADY_PATCHED || fail 'partial-state repair remained incomplete'
+  runtime_exec restore "$(fixture_entry "$root")" computer-use >/dev/null 2>&1 || fail 'partial-state restore failed'
+  [[ "$(fixture_hash_sources "$root")" == "$before" ]] || fail 'partial-state restore did not recover original sources'
+}
+
+assert_computer_untrusted_config_only_rejected() {
+  local root="$tmp/computer-untrusted-config-only" before output
+  fixture_make_dual_patch_package "$root" split-esm
+  sed -i '' 's/,autoCompactEnabled:/,computerUseConfig:Obj({mouseAnimation:Bool().optional()}).optional(),autoCompactEnabled:/' \
+    "$root/chunks/computer-schema.js"
+  before=$(fixture_hash_tree "$root")
+  output=$(runtime_exec apply "$(fixture_entry "$root")" computer-use 2>&1) || true
+  [[ "$output" == *'untrusted patch sentinel computerUseConfig'* ]] || \
+    fail "computer-use accepted untrusted config-only schema: $output"
+  [[ "$(fixture_hash_tree "$root")" == "$before" ]] || \
+    fail 'computer-use config-only apply changed package'
+}
+
+assert_computer_shadowed_bindings_rejected() {
+  local kind root before output
+  for kind in helper-params helper-local helper-catch gate-param; do
+    root="$tmp/computer-shadowed-$kind"
+    fixture_make_dual_patch_package "$root" split-esm
+    case "$kind" in
+      helper-params)
+        sed -i '' 's/readCompactSetting()/readCompactSetting(envTruthy,readSetting)/' \
+          "$root/chunks/computer-helper-consumer.js"
+        ;;
+      helper-local)
+        sed -i '' 's/readCompactSetting(){/readCompactSetting(){let envTruthy=value=>value;/' \
+          "$root/chunks/computer-helper-consumer.js"
+        ;;
+      helper-catch)
+        fixture_add_module "$root" chunks/computer-helper-consumer.js \
+          'import{envTruthy}from"./computer-env.js";import{readSetting}from"./computer-settings.js";export function readCompactSetting(){try{throw 0}catch(envTruthy){return envTruthy(process.env.DISABLE_AUTO_COMPACT)||readSetting("autoCompactEnabled",void 0).value}}'
+        ;;
+      gate-param)
+        sed -i '' 's/computerEnabled()/computerEnabled(computerConfig)/' \
+          "$root/chunks/computer-gate.js"
+        ;;
+    esac
+    before=$(fixture_hash_tree "$root")
+    output=$(runtime_exec apply "$(fixture_entry "$root")" computer-use 2>&1) || true
+    [[ "$output" == *'MISSING_TARGET:'* || "$output" == *'AMBIGUOUS_TARGET:'* ]] || \
+      fail "computer-use accepted shadowed $kind binding: $output"
+    [[ "$(fixture_hash_tree "$root")" == "$before" ]] || \
+      fail "computer-use apply mutated shadowed $kind binding"
+  done
+}
+
+assert_computer_negative_bindings_rejected() {
+  local kind root before output
+  for kind in alias-collision wrong-source; do
+    root="$tmp/computer-negative-$kind"
+    fixture_make_dual_patch_package "$root" split-esm
+    case "$kind" in
+      alias-collision)
+        sed -i '' 's/computerEnabled()/computerEnabled(__ccComputerEnvTruthy)/' "$root/chunks/computer-gate.js"
+        ;;
+      wrong-source)
+        runtime_exec apply "$(fixture_entry "$root")" computer-use >/dev/null 2>&1 || fail 'wrong-source fixture apply failed'
+        fixture_add_module "$root" chunks/computer-fake-env.js 'export function envTruthy(){return true}'
+        sed -i '' 's#./computer-env.js#./computer-fake-env.js#' "$root/chunks/computer-gate.js"
+        ;;
+    esac
+    before=$(fixture_hash_tree "$root")
+    output=$(runtime_exec apply "$(fixture_entry "$root")" computer-use 2>&1) || true
+    [[ "$output" == *'MISSING_TARGET:'* || "$output" == *'AMBIGUOUS_TARGET:'* ]] || fail "computer-use accepted $kind: $output"
+    [[ "$(fixture_hash_tree "$root")" == "$before" ]] || fail "computer-use apply mutated $kind"
+  done
+}
+
 assert_patch_effects() {
   local root="$1" layout="$2" patch_id="$3"
   case "$patch_id" in
@@ -354,6 +516,7 @@ assert_patch_effects() {
     ultracode) assert_ultracode_effects "$root" "$layout" ;;
     voice-mode) assert_voice_effects "$root" ;;
     context-limit) assert_context_effects "$root" ;;
+    computer-use) assert_computer_effects "$root" "$layout" ;;
     *) fail "unsupported lifecycle effects: $patch_id" ;;
   esac
 }
@@ -513,7 +676,7 @@ NODE
 requested=("${@:-auto-mode keybindings}")
 for patch_id in ${requested[*]}; do
   case "$patch_id" in
-    auto-mode|keybindings|transcript-dialog|ultracode|voice-mode|context-limit) ;;
+    auto-mode|keybindings|transcript-dialog|ultracode|voice-mode|context-limit|computer-use) ;;
     *) fail "unsupported lifecycle patch: $patch_id" ;;
   esac
   fixture_assert_lifecycle single-cjs "$patch_id"
@@ -541,6 +704,16 @@ if [[ " ${requested[*]} " == *' context-limit '* ]]; then
   assert_context_behavior split-esm
   assert_context_missing_import_rejected
   assert_context_negative_shapes_rejected
+fi
+if [[ " ${requested[*]} " == *' computer-use '* ]]; then
+  assert_computer_behavior single-cjs
+  assert_computer_behavior split-esm
+  assert_computer_missing_helper_rejected
+  assert_computer_facade_lifecycle
+  assert_computer_partial_state_repaired
+  assert_computer_untrusted_config_only_rejected
+  assert_computer_shadowed_bindings_rejected
+  assert_computer_negative_bindings_rejected
 fi
 
 # Preserve the exact original boolean spelling for baseline attribution.
