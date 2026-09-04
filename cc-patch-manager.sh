@@ -184,6 +184,7 @@ Claude Code 补丁管理器 v${VERSION}
   $(basename "$0")                  进入交互菜单
   $(basename "$0") /path/to/cli.js  指定目标后进入菜单
   $(basename "$0") --check          打印七个补丁状态后退出
+  $(basename "$0") --restore-all /path/to/cli.js  从基线全还原所有补丁后退出
   $(basename "$0") --help           显示本帮助
 
 环境变量:
@@ -449,8 +450,12 @@ restore_baseline() {
 # 还原单个补丁：从备份还原后重打其它已应用补丁（保持「一份备份」模型）
 restore_patch() {
   local id="$1" other kept=() x output ec=0
-  if [[ "$id" == "voice-mode" || ( ( "$id" == "context-limit" || "$id" == "computer-use" ) &&
-      -f "$(dirname "$CLI_PATH")/.cc-patch-manager-baseline/manifest.json" ) ]]; then
+  # split-ESM（或任何已建包级基线的目标）对所有补丁都走运行时还原；voice-mode
+  # 在 single-CJS 旧引擎下也始终走运行时。包级 manifest 存在即意味着 apply 走过
+  # 运行时并建了包级基线，此时遗留 cli.js.cc-patch-baseline 不存在，必须路由到
+  # runtime restore，否则 auto-mode/keybindings/transcript-dialog/ultracode 会落入
+  # 遗留路径报「未找到备份」。无包级 manifest 的 single-CJS 旧引擎仍走遗留路径。
+  if [[ "$id" == "voice-mode" || -f "$(dirname "$CLI_PATH")/.cc-patch-manager-baseline/manifest.json" ]]; then
     if ! require_target_readable || ! ensure_node || ! ensure_acorn; then
       error "补丁目标或 Node/acorn 不可用"
       return 1
@@ -462,8 +467,8 @@ restore_patch() {
     LAST_OUTPUT="$output"
     if [[ "$ec" -ne 0 ]]; then
       STATUS[$id]=error
-      MSG[$id]="VoiceMode 还原失败"
-      error "$MSG[$id]: $output"
+      MSG[$id]="$(patch_name "$id") 还原失败"
+      error "${MSG[$id]}: $output"
       return 1
     fi
     STATUS[$id]=idle
@@ -498,6 +503,53 @@ restore_patch() {
       warning "重打失败: $(patch_name "$x") — ${MSG[$x]:-}"
     fi
   done
+  return 0
+}
+
+# 全还原：把所有受管理文件重置回可信基线，移除全部已应用补丁（不重打）。
+# 大数据包（如 23MB 单 CJS）的快速逃生口：逐补丁还原会每保留一个补丁重解析
+# 一次入口，全还原直接从基线镜像恢复，避免 O(N) 重解析。包级 manifest 存在时
+# 走 runtime restore-all；无包级 manifest 的 single-CJS 旧引擎回退遗留单文件基线。
+restore_all_patches() {
+  local manifest output ec=0 id
+  if ! require_target_writable; then
+    error "目标不可写: ${CLI_PATH:-无}"
+    return 1
+  fi
+  manifest="$(dirname "$CLI_PATH")/.cc-patch-manager-baseline/manifest.json"
+  if [[ -f "$manifest" ]]; then
+    if ! require_target_readable || ! ensure_node || ! ensure_acorn; then
+      error "补丁目标或 Node/acorn 不可用"
+      return 1
+    fi
+    set +e
+    output=$(runtime_exec restore-all "$CLI_PATH" 2>&1)
+    ec=$?
+    set -e
+    LAST_OUTPUT="$output"
+    if [[ "$ec" -ne 0 ]]; then
+      error "全还原失败: $output"
+      return 1
+    fi
+    for id in "${PATCH_IDS[@]}"; do
+      STATUS[$id]=idle
+      MSG[$id]="已全还原"
+    done
+    success "已从基线全还原所有补丁"
+    return 0
+  fi
+  # 无包级基线：回退遗留单文件基线（single-CJS 旧引擎共用 cli.js.cc-patch-baseline）
+  if ! has_baseline; then
+    error "未找到备份: $(baseline_path)"
+    error "提示: 先成功应用一次补丁（会自动建备份），或在主菜单按 [b] 备份当前 cli.js。"
+    return 1
+  fi
+  restore_baseline || return 1
+  for id in "${PATCH_IDS[@]}"; do
+    STATUS[$id]=idle
+    MSG[$id]="已全还原"
+  done
+  success "已从备份全还原: $(baseline_path)"
   return 0
 }
 
@@ -7261,7 +7313,7 @@ draw_main() {
     idx=$((idx + 1))
   done
   printf '%s\n' '----------------------------------------'
-  printf '[1-7] 选择补丁   [a] 一键应用全部   [b] 备份当前   [r] 刷新全部   [p] 换路径   [q] 退出\n'
+  printf '[1-7] 选择补丁   [a] 一键应用全部   [R] 全还原   [b] 备份当前   [r] 刷新全部   [p] 换路径   [q] 退出\n'
   if has_baseline 2>/dev/null; then
     printf '备份:  %s\n' "$(basename "$(baseline_path)")"
   else
@@ -7316,6 +7368,24 @@ confirm_restore() {
     read -r ans || true
     [[ -z "$ans" || "$ans" == "y" || "$ans" == "Y" ]]
   fi
+}
+
+confirm_restore_all() {
+  local ans
+  printf '\n即将【全还原】: 把所有补丁恢复到基线（移除全部已应用补丁，不重打）\n'
+  printf '目标:  %s\n' "$CLI_PATH"
+  if [[ -f "$(dirname "$CLI_PATH")/.cc-patch-manager-baseline/manifest.json" ]]; then
+    printf '策略:  从可信包级基线镜像恢复所有受管理文件\n'
+  elif has_baseline 2>/dev/null; then
+    printf '策略:  从遗留单文件基线恢复 cli.js\n'
+  else
+    printf '策略:  %s无基线，无法还原%s\n' "$RED" "$NC"
+    return 1
+  fi
+  printf '\n%s警告%s: 此操作移除全部已应用补丁，不可按补丁单独撤销。\n' "$RED" "$NC"
+  printf '请输入 %syes%s 继续（其它任意键取消）: ' "$BOLD" "$NC"
+  read -r ans || true
+  [[ "$ans" == "yes" ]]
 }
 
 show_detail() {
@@ -7488,11 +7558,25 @@ menu_loop() {
         apply_all_patches
         pause
         ;;
+      R)
+        if ! require_target_writable; then
+          error "目标不存在或不可写"; pause; continue
+        fi
+        if confirm_restore_all; then
+          if restore_all_patches; then
+            info "正在复检全部补丁..."
+            refresh_all
+          fi
+        else
+          info "已取消"
+        fi
+        pause
+        ;;
       b|B)
         backup_current_cli
         pause
         ;;
-      r|R)
+      r)
         info "正在刷新全部补丁..."
         refresh_all
         ;;
@@ -7537,12 +7621,28 @@ run_check_mode() {
   exit "$ec"
 }
 
+run_restore_all_mode() {
+  if ! require_target_readable; then
+    error "未找到 cli.js 目标（请传入路径或设置 CLAUDE_CLI_PATH）"
+    exit 1
+  fi
+  if ! ensure_node || ! ensure_acorn; then
+    exit 1
+  fi
+  if restore_all_patches; then
+    exit 0
+  else
+    exit 1
+  fi
+}
+
 main() {
   local mode="menu" path_arg=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --help|-h) usage; exit 0 ;;
       --check|-c) mode="check"; shift ;;
+      --restore-all) mode="restore-all"; shift ;;
       -*)
         error "未知选项: $1"
         usage
@@ -7559,6 +7659,9 @@ main() {
 
   if [[ "$mode" == "check" ]]; then
     run_check_mode
+  fi
+  if [[ "$mode" == "restore-all" ]]; then
+    run_restore_all_mode
   fi
 
   menu_loop

@@ -673,6 +673,89 @@ NODE
   grep -Fq 'MISSING_TARGET:entry-gate' <<<"$output" || fail "voice-mode accepted a gate with a non-call leaf: $output"
 }
 
+# C1: the Bash UI restore_patch must route the four non-voice/context/computer
+# patches to the runtime restore on split-ESM (package-level baseline), not the
+# legacy single-file baseline path that has no cli.js.cc-patch-baseline to restore
+# from. The runtime restore path was already exercised for voice-mode/context-limit/
+# computer-use; this closes the routing gap for auto-mode/keybindings/transcript-dialog/
+# ultracode by driving the Bash restore_patch UI layer (not runtime_exec directly).
+assert_split_esm_restore_patch_routing() {
+  local patch_id root before
+  for patch_id in auto-mode keybindings transcript-dialog ultracode; do
+    root="$tmp/restore-routing-split-esm-$patch_id"
+    fixture_make_dual_patch_package "$root" split-esm
+    CLI_PATH=$(fixture_entry "$root")
+    before=$(fixture_hash_sources "$root")
+    run_node_patch "$patch_id" check || fail "split-esm $patch_id routing clean check failed: ${LAST_OUTPUT:-}"
+    [[ "${STATUS[$patch_id]:-}" == 'idle' ]] || fail "split-esm $patch_id clean state was not idle"
+    run_node_patch "$patch_id" apply || fail "split-esm $patch_id routing apply failed: ${LAST_OUTPUT:-}"
+    [[ "${STATUS[$patch_id]:-}" == 'applied' ]] || fail "split-esm $patch_id apply state was not applied"
+    restore_patch "$patch_id" || fail "split-esm $patch_id UI restore_patch failed: ${LAST_OUTPUT:-}"
+    fixture_assert_tree_equals "$before" "$(fixture_hash_sources "$root")"
+    run_node_patch "$patch_id" check || fail "split-esm $patch_id routing restored check failed: ${LAST_OUTPUT:-}"
+    [[ "${STATUS[$patch_id]:-}" == 'idle' ]] || fail "split-esm $patch_id restored state was not idle"
+  done
+}
+
+# I2: a runtime restore failure must report the failure using the patch being
+# restored (via patch_name), not the hardcoded "VoiceMode" label. Injects a
+# retained-patch reapply failure so runtime restore exits non-zero, then checks
+# MSG[id] names the restored patch. Requires C1 routing to reach the runtime path.
+# Uses an `if` guard (not `set +e`) because restore_patch re-enables `set -e`
+# internally before returning, which would otherwise abort the test script on the
+# expected non-zero return.
+assert_restore_failure_message_uses_patch_name() {
+  local root
+  root="$tmp/restore-failure-message"
+  fixture_make_dual_patch_package "$root" split-esm
+  CLI_PATH=$(fixture_entry "$root")
+  run_node_patch auto-mode apply || fail "restore-failure setup auto-mode apply failed: ${LAST_OUTPUT:-}"
+  run_node_patch keybindings apply || fail "restore-failure setup keybindings apply failed: ${LAST_OUTPUT:-}"
+  if CC_PATCH_TESTING=1 CC_PATCH_TEST_FAIL_REAPPLY=keybindings restore_patch auto-mode >/dev/null 2>&1; then
+    fail "restore-failure expected restore_patch to fail on injected reapply failure"
+  fi
+  [[ "${MSG[auto-mode]:-}" == *'自动模式解锁'* ]] || \
+    fail "restore failure message did not use the restored patch name: ${MSG[auto-mode]:-}"
+  [[ "${MSG[auto-mode]:-}" != *'VoiceMode'* ]] || \
+    fail "restore failure message hardcoded VoiceMode for auto-mode: ${MSG[auto-mode]:-}"
+}
+
+# I1: restore-all must be reachable from the Bash UI (restore_all_patches), resetting
+# every managed file to the trusted baseline with no reapply, and resetting patch
+# states to idle. Drives the UI function directly.
+assert_restore_all_ui_split_esm() {
+  local root before
+  root="$tmp/restore-all-ui-split-esm"
+  fixture_make_dual_patch_package "$root" split-esm
+  CLI_PATH=$(fixture_entry "$root")
+  before=$(fixture_hash_sources "$root")
+  run_node_patch auto-mode apply || fail "restore-all UI setup auto-mode apply failed: ${LAST_OUTPUT:-}"
+  run_node_patch keybindings apply || fail "restore-all UI setup keybindings apply failed: ${LAST_OUTPUT:-}"
+  [[ "${STATUS[auto-mode]:-}" == 'applied' && "${STATUS[keybindings]:-}" == 'applied' ]] || \
+    fail "restore-all UI setup did not apply both patches"
+  restore_all_patches || fail "restore-all UI failed: ${LAST_OUTPUT:-}"
+  fixture_assert_tree_equals "$before" "$(fixture_hash_sources "$root")"
+  [[ "${STATUS[auto-mode]:-}" == 'idle' && "${STATUS[keybindings]:-}" == 'idle' ]] || \
+    fail "restore-all UI did not reset patch states to idle"
+}
+
+# I1: restore-all must also be reachable via the --restore-all CLI surface, exercising
+# the main() dispatch end-to-end (not just the function).
+assert_restore_all_cli_split_esm() {
+  local root before output rc
+  root="$tmp/restore-all-cli-split-esm"
+  fixture_make_dual_patch_package "$root" split-esm
+  before=$(fixture_hash_sources "$root")
+  runtime_exec apply "$(fixture_entry "$root")" auto-mode >/dev/null 2>&1 || fail "restore-all CLI setup auto-mode apply failed"
+  runtime_exec apply "$(fixture_entry "$root")" keybindings >/dev/null 2>&1 || fail "restore-all CLI setup keybindings apply failed"
+  set +e
+  output=$(bash "$ROOT/cc-patch-manager.sh" --restore-all "$(fixture_entry "$root")" 2>&1)
+  rc=$?
+  set -e
+  [[ "$rc" -eq 0 ]] || fail "restore-all CLI exited non-zero: $output"
+  fixture_assert_tree_equals "$before" "$(fixture_hash_sources "$root")"
+}
+
 requested=("${@:-auto-mode keybindings}")
 for patch_id in ${requested[*]}; do
   case "$patch_id" in
@@ -729,5 +812,13 @@ assert_transcript_extra_factory_state_rejected
 assert_transcript_extra_request_effect_rejected
 assert_ultracode_decoy_ignored
 assert_ultracode_disconnected_activation_rejected
+
+# UI-layer routing + restore-all/message coverage (C1/I1/I2): independent of the
+# requested patch set, these guard the Bash restore_patch/restore_all_patches paths
+# that runtime_exec-only lifecycle tests do not exercise.
+assert_split_esm_restore_patch_routing
+assert_restore_failure_message_uses_patch_name
+assert_restore_all_ui_split_esm
+assert_restore_all_cli_split_esm
 
 printf 'PASS: requested patches complete the same lifecycle on single-CJS and split-ESM layouts\n'
