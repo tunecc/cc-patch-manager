@@ -29,6 +29,10 @@ ULTRA_SUPPORT='function capability(model,name){return model[name]}function workf
 ULTRA_ELIGIBILITY='function ultracodeEligible(model){return workflowEnabled()&&(model===void 0||xhighGate(model)&&supportsEffort("xhigh",model))}'
 ULTRA_FALLBACK='function resolveEffort(model,effort){let resolved=effort;if(resolved==="max"&&!maxGate(model))resolved="high";if(resolved==="xhigh"&&!xhighGate(model))resolved="high";return resolved}'
 ULTRA_ACTIVATION='function sessionEffort(model,effort){return resolveEffort(model,effort)}function ultracodeActive(model,effort,enabled){return enabled===!0&&workflowEnabled()&&sessionEffort(model,effort)==="xhigh"}'
+VOICE_COMMAND='function voiceAuthProbe(){try{if(!hasAccount())return!1;return tokenProbe()}catch{return!1}}function voiceFeatureFlag(){return featureFlag("allow_voice_mode")}function voiceEntryGate(){return voiceAuthProbe()&&voiceFeatureFlag()}const voiceCommand={type:"local",name:"voice",description:"Toggle voice mode",argumentHint:"[hold|tap|off]",availability:["claude-ai"],get isHidden(){return!voiceEntryGate()},supportsNonInteractive:!1}'
+VOICE_CAPABILITY='function voiceStreamAvailable(){if(!hasAccount())return!1;let session=currentSession();return session!==null&&session.accessToken!==null}const voiceRuntime={isVoiceStreamAvailable:()=>voiceStreamAvailable()}'
+VOICE_CONNECTION='async function connectVoiceStream(callbacks,options){let query=new URLSearchParams({encoding:"linear16",stt_provider:"deepgram-nova3"}),endpoint="/api/ws/speech_to_text/voice_stream";callbacks.onReady();callbacks.onTranscript("hello",!0);return{endpoint,query}}'
+VOICE_SETTINGS='function writeUserSettings(kind,value){return{kind,value}}function voiceSettings({settingsData,setAppState,setSettingsData,setChanges}){writeUserSettings("userSettings",{});let settings=[{id:"autoCompact"},{id:"language"},{id:"editor"}];return{settings}}'
 
 fixture_make_dual_patch_package() {
   local root="$1" layout="$2" key_flag="${3:-}"
@@ -48,7 +52,11 @@ $ULTRA_SUPPORT
 $ULTRA_ELIGIBILITY
 $ULTRA_FALLBACK
 $ULTRA_ACTIVATION
-module.exports={modelEligible,decide,classifierModel,keybindingsEnabled,defaultKeybindings,createDialogChannel,ultracodeEligible,resolveEffort,ultracodeActive}"
+$VOICE_COMMAND
+$VOICE_CAPABILITY
+$VOICE_CONNECTION
+$VOICE_SETTINGS
+module.exports={modelEligible,decide,classifierModel,keybindingsEnabled,defaultKeybindings,createDialogChannel,ultracodeEligible,resolveEffort,ultracodeActive,voiceCommand,voiceStreamAvailable,connectVoiceStream,voiceSettings}"
   else
     fixture_make_package "$root" "$layout" '@cometix/anthropic-cc' 2.1.259
     printf '{"name":"@cometix/anthropic-cc","version":"2.1.259","type":"module"}\n' >"$root/package.json"
@@ -66,6 +74,14 @@ export{xhighGate,maxGate}"
     fixture_add_module "$root" chunks/ultra-effort.js 'import{xhighGate as supportsXhigh,maxGate as supportsMax}from"./ultra-gates.js";export function resolveEffort(model,effort){let resolved=effort;if(resolved==="max"&&!supportsMax(model))resolved="high";if(resolved==="xhigh"&&!supportsXhigh(model))resolved="high";return resolved}'
     fixture_add_module "$root" chunks/ultra-activation.js 'import{resolveEffort as effectiveEffort}from"./ultra-effort.js";function workflowEnabled(){return!0}export function ultracodeActive(model,effort,enabled){return enabled===!0&&workflowEnabled()&&effectiveEffort(model,effort)==="xhigh"}'
     fixture_add_module "$root" chunks/ultra-index.js 'export{ultracodeEligible}from"./ultra-eligibility.js";export{resolveEffort}from"./ultra-effort.js";export{ultracodeActive}from"./ultra-activation.js"'
+    fixture_add_module "$root" chunks/voice-command.js "$VOICE_COMMAND
+export{voiceCommand,voiceEntryGate,voiceAuthProbe,voiceFeatureFlag}"
+    fixture_add_module "$root" chunks/voice-capability.js "$VOICE_CAPABILITY
+export{voiceStreamAvailable}"
+    fixture_add_module "$root" chunks/voice-connection.js "$VOICE_CONNECTION
+export{connectVoiceStream}"
+    fixture_add_module "$root" chunks/voice-settings.js "$VOICE_SETTINGS
+export{voiceSettings}"
   fi
 }
 
@@ -167,6 +183,93 @@ const {pathToFileURL} = require('url');
 NODE
 }
 
+assert_voice_effects() {
+  local root="$1" marker asset
+  for marker in COMETIX_VOICE_GATE COMETIX_VOICE_STREAM_AVAIL COMETIX_VOICE_AVAIL \
+      COMETIX_VOICE_SETTING COMETIX_ASR_VOICE_STREAM COMETIX_VOICE_AUTH COMETIX_VOICE_FLAG; do
+    rg -l "$marker" "$root" --glob '*.js' --glob '!vendor/**' >/dev/null || fail "voice-mode marker missing: $marker"
+  done
+  for asset in index.js index.d.ts package.json libcometix-asr.darwin-arm64.node; do
+    [[ -f "$root/vendor/cometix-asr/$asset" ]] || fail "voice-mode resource missing: $asset"
+  done
+}
+
+assert_voice_adapter_behavior() {
+  local layout="$1" root="$tmp/voice-adapter-behavior-$1" assets="$tmp/voice-adapter-assets-$1" output module
+  fixture_make_dual_patch_package "$root" "$layout"
+  mkdir -p "$assets"
+  printf '%s\n' 'module.exports={startSession(config,callback){queueMicrotask(()=>{callback(null,JSON.stringify({type:"ready",session_id:"test"}));callback(null,JSON.stringify({type:"transcript",stage:"interim",display:"hello"}));callback(null,JSON.stringify({type:"transcript",stage:"stable",display:"hello world"}));callback(null,JSON.stringify({type:"transcript",stage:"session_final",display:"hello world"}));callback(null,JSON.stringify({type:"processed",text:"duplicate final"}));callback(null,JSON.stringify({type:"close"}))});return 1},feedPcm(){},finalizeSession(){},closeSession(){}}' >"$assets/index.js"
+  printf '%s\n' 'export function startSession(): number' >"$assets/index.d.ts"
+  printf '%s\n' '{"name":"cometix-asr","main":"index.js"}' >"$assets/package.json"
+  printf '%s\n' 'test native placeholder' >"$assets/libcometix-asr.darwin-arm64.node"
+
+  output=$(CC_PATCH_VOICE_ASSET_SOURCE="$assets" runtime_exec apply "$(fixture_entry "$root")" voice-mode 2>&1) ||
+    fail "$layout voice adapter behavior apply failed: $output"
+  if [[ "$layout" == 'single-cjs' ]]; then module="$root/cli.js"; else module="$root/chunks/voice-connection.js"; fi
+  node - "$layout" "$module" <<'NODE' || fail "$layout voice adapter behavior changed"
+const {pathToFileURL} = require('url');
+(async () => {
+  const layout = process.argv[2], modulePath = process.argv[3];
+  const loaded = layout === 'single-cjs' ? require(modulePath) : await import(pathToFileURL(modulePath));
+  const transcripts = [];
+  let ready = 0, closed = 0;
+  const api = await loaded.connectVoiceStream({
+    onReady() { ready += 1; },
+    onTranscript(text, final) { transcripts.push({text, final}); },
+    onError(error) { throw new Error(String(error)); },
+    onClose() { closed += 1; },
+  }, {});
+  await new Promise(resolve => setImmediate(resolve));
+  const interim = transcripts.filter(item => !item.final);
+  const finals = transcripts.filter(item => item.final);
+  if (!api || ready !== 1 || closed !== 1) process.exit(1);
+  if (interim.length !== 2 || interim[0].text !== 'hello' || interim[1].text !== 'hello world') process.exit(1);
+  if (finals.length !== 1 || finals[0].text !== 'hello world') process.exit(1);
+})().catch(error => { console.error(error); process.exit(1); });
+NODE
+}
+
+assert_voice_facade_lifecycle() {
+  local layout="$1" root="$tmp/voice-facade-$1" output
+  fixture_make_dual_patch_package "$root" "$layout"
+  CLI_PATH=$(fixture_entry "$root")
+  run_node_patch voice-mode check || fail "$layout facade check failed: ${LAST_OUTPUT:-}"
+  [[ "${STATUS[voice-mode]:-}" == 'idle' ]] || fail "$layout facade clean state was not idle"
+  run_node_patch voice-mode apply || fail "$layout facade apply failed: ${LAST_OUTPUT:-}"
+  [[ "${STATUS[voice-mode]:-}" == 'applied' ]] || fail "$layout facade patched state was not applied"
+  restore_patch voice-mode || fail "$layout facade restore failed"
+  run_node_patch voice-mode check || fail "$layout facade restored check failed: ${LAST_OUTPUT:-}"
+  [[ "${STATUS[voice-mode]:-}" == 'idle' ]] || fail "$layout facade restored state was not idle"
+  [[ ! -e "$root/vendor/cometix-asr" ]] || fail "$layout facade restore retained VoiceMode resources"
+}
+
+assert_voice_restore_without_source() {
+  local root="$tmp/voice-restore-without-source" assets="$tmp/voice-restore-assets" moved="$tmp/voice-restore-assets-away" before output
+  fixture_make_dual_patch_package "$root" split-esm
+  mkdir -p "$assets"
+  cp "$ROOT/original-scripts/claude-code-enable-voice-mode-darwin-arm64/cometix-asr/"{index.js,index.d.ts,package.json,libcometix-asr.darwin-arm64.node} "$assets/"
+  before=$(fixture_hash_sources "$root")
+  CC_PATCH_VOICE_ASSET_SOURCE="$assets" runtime_exec apply "$(fixture_entry "$root")" voice-mode >/dev/null 2>&1 ||
+    fail 'voice-mode source-loss fixture apply failed'
+  mv "$assets" "$moved"
+  output=$(CC_PATCH_VOICE_ASSET_SOURCE="$assets" runtime_exec restore "$(fixture_entry "$root")" voice-mode 2>&1) ||
+    fail "voice-mode restore depended on missing external resources: $output"
+  [[ "$(fixture_hash_sources "$root")" == "$before" ]] || fail 'voice-mode source-loss restore did not recover original sources'
+}
+
+assert_voice_source_symlink_race_rejected() {
+  local root="$tmp/voice-source-symlink-race" assets="$tmp/voice-source-symlink-assets" before output
+  fixture_make_dual_patch_package "$root" split-esm
+  mkdir -p "$assets"
+  cp "$ROOT/original-scripts/claude-code-enable-voice-mode-darwin-arm64/cometix-asr/"{index.js,index.d.ts,package.json,libcometix-asr.darwin-arm64.node} "$assets/"
+  before=$(fixture_hash_tree "$root")
+  output=$(CC_PATCH_VOICE_ASSET_SOURCE="$assets" CC_PATCH_TESTING=1 \
+    CC_PATCH_TEST_SWAP_VOICE_SOURCE_AFTER_ANALYSIS='index.js:package.json' \
+    runtime_exec apply "$(fixture_entry "$root")" voice-mode 2>&1) || true
+  [[ "$output" == *'VoiceMode resource source'* ]] || fail "voice-mode symlink race lacked context: $output"
+  [[ "$(fixture_hash_tree "$root")" == "$before" ]] || fail 'voice-mode source symlink race changed the package'
+}
+
 assert_patch_effects() {
   local root="$1" layout="$2" patch_id="$3"
   case "$patch_id" in
@@ -174,6 +277,7 @@ assert_patch_effects() {
     keybindings) assert_keybinding_effects "$root" ;;
     transcript-dialog) assert_dialog_effects "$root" "$layout" ;;
     ultracode) assert_ultracode_effects "$root" "$layout" ;;
+    voice-mode) assert_voice_effects "$root" ;;
     *) fail "unsupported lifecycle effects: $patch_id" ;;
   esac
 }
@@ -202,6 +306,9 @@ fixture_assert_lifecycle() {
   output=$(runtime_exec restore "$(fixture_entry "$root")" "$patch_id" 2>&1) || fail "$layout $patch_id restore failed: $output"
   restored=$(fixture_hash_sources "$root")
   [[ "$restored" == "$before" ]] || fail "$layout $patch_id restore did not recover original managed sources"
+  if [[ "$patch_id" == 'voice-mode' && -e "$root/vendor/cometix-asr" ]]; then
+    fail "$layout voice-mode restore retained originally absent resources"
+  fi
 
   output=$(runtime_exec check "$(fixture_entry "$root")" "$patch_id" 2>&1) || fail "$layout $patch_id restored check failed: $output"
   grep -Fxq 'NEEDS_PATCH' <<<"$output" || fail "$layout $patch_id restored check did not report NEEDS_PATCH"
@@ -302,15 +409,57 @@ NODE
   grep -Fq 'MISSING_TARGET:ultracode-activation' <<<"$output" || fail "ultracode accepted a disconnected activation target: $output"
 }
 
+assert_voice_settings_ambiguity_rejected() {
+  local root="$tmp/voice-settings-ambiguous" output
+  fixture_make_dual_patch_package "$root" split-esm
+  node - "$root/chunks/voice-settings.js" <<'NODE'
+const fs = require('fs'), file = process.argv[2], source = fs.readFileSync(file, 'utf8');
+fs.writeFileSync(file, source.replace('return{settings}',
+  'let duplicateSettings=[{id:"autoCompact"},{id:"language"},{id:"editor"}];return{settings,duplicateSettings}'));
+NODE
+  output=$(runtime_exec check "$(fixture_entry "$root")" voice-mode 2>&1) || true
+  grep -Fq 'AMBIGUOUS_TARGET:settings-ui-schema:2' <<<"$output" ||
+    fail "voice-mode accepted ambiguous settings arrays: $output"
+}
+
+assert_voice_gate_non_call_leaf_rejected() {
+  local root="$tmp/voice-gate-non-call-leaf" output
+  fixture_make_dual_patch_package "$root" split-esm
+  node - "$root/chunks/voice-command.js" <<'NODE'
+const fs = require('fs'), file = process.argv[2], source = fs.readFileSync(file, 'utf8');
+fs.writeFileSync(file, source.replace('voiceAuthProbe()&&voiceFeatureFlag()',
+  'voiceAuthProbe()&&voiceFeatureFlag()&&voiceEnabled'));
+NODE
+  output=$(runtime_exec check "$(fixture_entry "$root")" voice-mode 2>&1) || true
+  grep -Fq 'MISSING_TARGET:entry-gate' <<<"$output" || fail "voice-mode accepted a gate with a non-call leaf: $output"
+}
+
 requested=("${@:-auto-mode keybindings}")
 for patch_id in ${requested[*]}; do
   case "$patch_id" in
-    auto-mode|keybindings|transcript-dialog|ultracode) ;;
+    auto-mode|keybindings|transcript-dialog|ultracode|voice-mode) ;;
     *) fail "unsupported lifecycle patch: $patch_id" ;;
   esac
   fixture_assert_lifecycle single-cjs "$patch_id"
   fixture_assert_lifecycle split-esm "$patch_id"
 done
+
+if [[ " ${requested[*]} " == *' voice-mode '* ]]; then
+  missing_voice="$tmp/voice-missing-assets"
+  fixture_make_dual_patch_package "$missing_voice" split-esm
+  missing_before=$(fixture_hash_tree "$missing_voice")
+  output=$(CC_PATCH_VOICE_ASSET_SOURCE="$tmp/does-not-exist" runtime_exec apply "$(fixture_entry "$missing_voice")" voice-mode 2>&1) || true
+  [[ "$output" == *'VoiceMode resource'* ]] || fail "voice-mode missing resource error lacked context: $output"
+  [[ "$(fixture_hash_tree "$missing_voice")" == "$missing_before" ]] || fail 'voice-mode missing resources changed the package'
+  assert_voice_adapter_behavior single-cjs
+  assert_voice_adapter_behavior split-esm
+  assert_voice_facade_lifecycle single-cjs
+  assert_voice_facade_lifecycle split-esm
+  assert_voice_restore_without_source
+  assert_voice_source_symlink_race_rejected
+  assert_voice_settings_ambiguity_rejected
+  assert_voice_gate_non_call_leaf_rejected
+fi
 
 # Preserve the exact original boolean spelling for baseline attribution.
 fixture_assert_lifecycle single-cjs keybindings "$KEY_FLAG_FALSE"
@@ -319,6 +468,8 @@ assert_patched_body_tamper_rejected transcript-dialog 'CC_DIALOG_FIX_HOST_CLEANU
 assert_patched_body_tamper_rejected ultracode 'CC_ULTRACODE_ELIGIBILITY:'
 assert_patched_body_tamper_rejected ultracode 'CC_ULTRACODE_EFFORT_FALLBACK:'
 assert_patched_body_tamper_rejected ultracode 'CC_ULTRACODE_ACTIVATION:'
+assert_patched_body_tamper_rejected voice-mode 'CC_COMETIX_VOICE_GATE:'
+assert_patched_body_tamper_rejected voice-mode 'CC_COMETIX_ASR_VOICE_STREAM:'
 assert_transcript_extra_factory_state_rejected
 assert_transcript_extra_request_effect_rejected
 assert_ultracode_decoy_ignored

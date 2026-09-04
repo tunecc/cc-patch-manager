@@ -590,7 +590,7 @@ git commit -m "feat: migrate transcript and ultracode analyzers"
 
 **Interfaces:** Produces seven targets `entry-gate`, `stream-capability`, `availability`, `settings-ui-schema`, `connection`, `auth-probe`, `feature-flag` and resource `vendor/cometix-asr`.
 
-- [ ] **Step 1: 写七目标和资源失败测试**
+- [x] **Step 1: 写七目标和资源失败测试**
 
 ```bash
 fixture_add_voice_surface "$tmp/new"
@@ -599,26 +599,26 @@ CC_PATCH_TEST_MISSING_ASSET=1 runtime_exec apply "$(fixture_entry "$tmp/new")" v
 fixture_assert_tree_equals "$before" "$(fixture_hash_tree "$tmp/new")"
 ```
 
-- [ ] **Step 2: 确认红灯**
+- [x] **Step 2: 确认红灯**
 
 Run: `bash tests/test_dual_layout_lifecycle.sh voice-mode && bash tests/test_voice_mode_gate.sh && bash tests/test_voice_mode_platform.sh`
 
 Expected: FAIL；资源不在计划事务，split-ESM 尚不可识别。
 
-- [ ] **Step 3: 实施 JS 和资源的同一计划**
+- [x] **Step 3: 实施 JS 和资源的同一计划**
 
 ```javascript
 plan.resources.push({kind: 'copy-tree', source: voiceAssetSource(), destination: 'vendor/cometix-asr', expectedBefore: 'absent-or-baselined'});
 requireExactTargets(plan, ['entry-gate','stream-capability','availability','settings-ui-schema','connection','auth-probe','feature-flag']);
 ```
 
-- [ ] **Step 4: 复跑**
+- [x] **Step 4: 复跑**
 
 Run: `bash tests/test_dual_layout_lifecycle.sh voice-mode && bash tests/test_voice_mode_gate.sh && bash tests/test_voice_mode_platform.sh`
 
 Expected: PASS；非 Darwin/arm64/缺资源零写入，JS 与 vendor 一起 apply/restore。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add cc-patch-manager.sh tests/test_dual_layout_lifecycle.sh tests/test_voice_mode_gate.sh tests/test_voice_mode_platform.sh

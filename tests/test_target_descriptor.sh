@@ -123,10 +123,11 @@ if voice_mode_supported; then
   fixture_make_package "$safety_root" split-esm '@cometix/anthropic-cc' 2.1.259
   CLI_PATH=$(fixture_entry "$safety_root")
   if run_node_patch voice-mode apply >/dev/null 2>&1; then
-    fail 'split package was sent through the legacy VoiceMode engine'
+    fail 'split package without VoiceMode targets was patched'
   fi
-  [[ ! -e "$safety_root/vendor/cometix-asr" ]] || fail 'rejected split package was mutated before analysis'
-  [[ "${MSG[voice-mode]:-}" == *'split-esm'* ]] || fail 'split rejection did not explain the incompatible engine path'
+  [[ ! -e "$safety_root/vendor/cometix-asr" ]] || fail 'invalid split package was mutated before analysis'
+  [[ "${LAST_OUTPUT:-}" == *'missing semantic target'* ]] || fail 'split analysis failure lacked target context'
+  [[ "${MSG[voice-mode]:-}" != *'split-esm'* ]] || fail 'split package was still rejected by layout'
 fi
 
 printf 'PASS: target resolution and structural layout inspection support both packages\n'

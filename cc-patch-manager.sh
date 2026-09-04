@@ -261,7 +261,8 @@ voice_mode_source_dir() {
 
 voice_mode_assets_ready() {
   local source="${1:-$(voice_mode_source_dir)}"
-  [[ -f "$source/index.js" ]] && compgen -G "$source/libcometix-asr*.node" >/dev/null
+  [[ -f "$source/index.js" && -f "$source/index.d.ts" && -f "$source/package.json" &&
+    -f "$source/libcometix-asr.darwin-arm64.node" ]]
 }
 
 voice_mode_assets_error() {
@@ -427,7 +428,27 @@ restore_baseline() {
 
 # 还原单个补丁：从备份还原后重打其它已应用补丁（保持「一份备份」模型）
 restore_patch() {
-  local id="$1" other kept=() x
+  local id="$1" other kept=() x output ec=0
+  if [[ "$id" == "voice-mode" ]]; then
+    if ! require_target_readable || ! ensure_node || ! ensure_acorn; then
+      error "VoiceMode 目标或 Node/acorn 不可用"
+      return 1
+    fi
+    set +e
+    output=$(runtime_exec restore "$CLI_PATH" "$id" 2>&1)
+    ec=$?
+    set -e
+    LAST_OUTPUT="$output"
+    if [[ "$ec" -ne 0 ]]; then
+      STATUS[$id]=error
+      MSG[$id]="VoiceMode 还原失败"
+      error "$MSG[$id]: $output"
+      return 1
+    fi
+    STATUS[$id]=idle
+    MSG[$id]="已还原"
+    return 0
+  fi
   if ! has_baseline; then
     # 兼容旧版按 suffix 的时间戳备份
     local suffix dir latest
@@ -500,6 +521,10 @@ parse_and_set_status() {
         has_success=1
         MSG[$id]="已修补 ${line#SUCCESS:} 处"
         ;;
+      PATCHED:*)
+        has_success=1
+        MSG[$id]="已应用事务补丁"
+        ;;
       BACKUP:*)
         LAST_BACKUP="${line#BACKUP:}"
         ;;
@@ -518,6 +543,10 @@ parse_and_set_status() {
       VERIFY_FAILED:*)
         has_err=1
         err_msg="校验失败: ${line#VERIFY_FAILED:}"
+        ;;
+      TARGET_ERROR:*)
+        has_err=1
+        err_msg="统一补丁失败: ${line#TARGET_ERROR:}"
         ;;
       FOUND:*|PATCH:*|STEP:*|VERSION:*|OQQ_NAME:*)
         # informational; keep last interesting in MSG if empty later
@@ -1160,7 +1189,7 @@ function reconstructedBodyMatch(program, fn, markerId, renderModifiedBody) {
   const before = decodeReversibleBody(after, markerId);
   if (before === null) return null;
   const parameters = fn.params.map(param => program.text.slice(param.start, param.end)).join(',');
-  const text = `function __CC_RECONSTRUCT(${parameters})${before}`;
+  const text = `${fn.async ? 'async ' : ''}function __CC_RECONSTRUCT(${parameters})${before}`;
   let ast;
   try {
     ast = acorn.parse(text, {ecmaVersion: 'latest', sourceType: 'script'});
@@ -1603,6 +1632,356 @@ function analyzeUltracode(target) {
   });
 }
 
+function voiceFunctionByName(program, name) {
+  return findAstNodes(program.ast, node => node.type === 'FunctionDeclaration' && node.id?.name === name)[0] || null;
+}
+
+function voiceAndCalls(node) {
+  if (node?.type === 'LogicalExpression' && node.operator === '&&') {
+    const left = voiceAndCalls(node.left), right = voiceAndCalls(node.right);
+    return left && right ? [...left, ...right] : null;
+  }
+  return node?.type === 'CallExpression' && node.callee?.type === 'Identifier' && node.arguments.length === 0 ?
+    [node.callee.name] : null;
+}
+
+function voiceUnlockBody(marker) {
+  return `{return!0/*${marker}*/}`;
+}
+
+function voiceSettingsBindings(program, fn) {
+  const bindingFor = (pattern, key) => {
+    if (pattern?.type !== 'ObjectPattern') return null;
+    const property = pattern.properties.find(item => item.type === 'Property' &&
+      (item.key?.name === key || item.key?.value === key));
+    if (property?.value?.type === 'Identifier') return property.value.name;
+    if (property?.value?.type === 'AssignmentPattern' && property.value.left?.type === 'Identifier') {
+      return property.value.left.name;
+    }
+    return null;
+  };
+  let pattern = fn.params[0];
+  if (pattern?.type === 'Identifier') {
+    pattern = findAstNodes(fn.body, node => node.type === 'VariableDeclarator' && node.id?.type === 'ObjectPattern' &&
+      node.init?.type === 'Identifier' && node.init.name === fn.params[0].name)[0]?.id;
+  }
+  const bindings = {
+    settingsData: bindingFor(pattern, 'settingsData'),
+    setAppState: bindingFor(pattern, 'setAppState'),
+    setSettingsData: bindingFor(pattern, 'setSettingsData'),
+    setChanges: bindingFor(pattern, 'setChanges'),
+  };
+  const writerCall = findAstNodes(fn.body, node => node.type === 'CallExpression' && node.callee?.type === 'Identifier' &&
+    node.arguments?.[0]?.type === 'Literal' && node.arguments[0].value === 'userSettings')[0];
+  if (!writerCall) return null;
+  const nestedWriter = functionLikeNodes(fn.body).filter(candidate => candidate !== fn && candidate.start <= writerCall.start &&
+    writerCall.end <= candidate.end && candidate.type === 'FunctionDeclaration' && candidate.id?.name)
+    .sort((left, right) => (left.end - left.start) - (right.end - right.start))[0];
+  bindings.writer = nestedWriter?.id.name || writerCall.callee.name;
+  bindings.writerTakesKind = !nestedWriter;
+  return Object.values(bindings).every(value => value !== null && value !== undefined) ? bindings : null;
+}
+
+function voiceSettingsArrays(fn) {
+  const arrays = findAstNodes(fn.body, node => node.type === 'ArrayExpression').filter(array => {
+    const ids = new Set(findAstNodes(array, node => node.type === 'Property' &&
+      (node.key?.name === 'id' || node.key?.value === 'id') && node.value?.type === 'Literal' &&
+      typeof node.value.value === 'string').map(node => node.value.value));
+    return ids.has('autoCompact') && ids.has('language') && ids.has('editor');
+  });
+  return arrays.filter(array => !arrays.some(other => other !== array && other.start < array.start && array.end < other.end));
+}
+
+function renderVoiceSettingSource(before, bindings) {
+  const writerCall = bindings.writerTakesKind ? `${bindings.writer}("userSettings",` : `${bindings.writer}(`;
+  const setting = `{id:"voiceMode",label:"Voice mode",value:((${bindings.settingsData}?.voice?.enabled??${bindings.settingsData}?.voiceEnabled)===!0?(${bindings.settingsData}?.voice?.mode??"hold"):"off"),options:["off","hold","tap"],type:"enum",async onChange(__mode){const __enabled=__mode!=="off",__voiceMode=__mode==="tap"?"tap":__mode==="hold"?"hold":(${bindings.settingsData}?.voice?.mode??"hold");const __result=await ${writerCall}{voiceEnabled:__enabled,voice:{...${bindings.settingsData}?.voice,enabled:__enabled,mode:__voiceMode}});if(__result?.error)return{error:__result.error};${bindings.setSettingsData}(__state=>({...__state,voiceEnabled:__enabled,voice:{...__state?.voice,enabled:__enabled,mode:__voiceMode}}));${bindings.setAppState}(__state=>({...__state,settings:{...__state.settings,voiceEnabled:__enabled,voice:{...__state.settings?.voice,enabled:__enabled,mode:__voiceMode}}}));${bindings.setChanges}(__state=>({...__state,"Voice mode":__mode}))}}/*COMETIX_VOICE_SETTING*/,`;
+  return `[${setting}${before.slice(1)}`;
+}
+
+function renderVoiceSetting(program, array, bindings) {
+  return renderVoiceSettingSource(program.text.slice(array.start, array.end), bindings);
+}
+
+function reconstructedVoiceSettingsMatch(program, fn, array) {
+  const after = program.text.slice(array.start, array.end);
+  const before = decodeReversibleBody(after, 'VOICE_SETTING');
+  if (before === null) return null;
+  const bindings = voiceSettingsBindings(program, fn);
+  if (!bindings) return null;
+  const modified = renderVoiceSettingSource(before, bindings);
+  const expected = `[${reversibleBodyMarker('VOICE_SETTING', before, modified)}${modified.slice(1)}`;
+  if (after !== expected) return null;
+  return {relativePath: program.relativePath, start: array.start, end: array.end, state: 'after', before, after};
+}
+
+function voiceAdapterBody(target, program, fn) {
+  if (fn.params[0]?.type !== 'Identifier') return null;
+  const callbacks = fn.params[0].name;
+  const vendorRelative = path.posix.relative(path.posix.dirname(program.relativePath), 'vendor/cometix-asr/index.js');
+  const vendorSpecifier = vendorRelative.startsWith('.') ? vendorRelative : `./${vendorRelative}`;
+  const loader = target.layout === 'split-esm' ?
+    `const [{createRequire:__createRequire},{fileURLToPath:__fileURLToPath}]=await Promise.all([import("node:module"),import("node:url")]),__require=__createRequire(import.meta.url),_path=__require("node:path"),_fs=__require("node:fs");function __loadCometixAsr(){try{const m=__require(__fileURLToPath(new URL(${JSON.stringify(vendorSpecifier)},import.meta.url)));return m&&typeof m.startSession==="function"?m:null}catch{return null}}` :
+    `const _path=require("path"),_fs=require("fs");function __loadCometixAsr(){const tryLoad=(p)=>{try{if(!p)return null;const m=require(p);if(m&&typeof m.startSession==="function")return m}catch{}return null};const dirs=[];try{dirs.push(_path.join(__dirname,"vendor","cometix-asr"))}catch{}for(const dir of dirs){if(!dir||!_fs.existsSync(dir))continue;let m=tryLoad(_path.join(dir,"index.js"));if(m)return m;m=tryLoad(dir);if(m)return m;try{for(const f of _fs.readdirSync(dir).filter(x=>x.startsWith("libcometix-asr")&&x.endsWith(".node"))){m=tryLoad(_path.join(dir,f));if(m)return m}}catch{}}return null}`;
+  return `{/*COMETIX_ASR_VOICE_STREAM*/
+/* CC voice bridge: cumulative Preview + one final result for the whole hold */
+${loader}
+const __asr=__loadCometixAsr();
+if(!__asr){try{${callbacks}.onError("cometix-asr vendor missing startSession",{fatal:true,connectFailureCode:"cometix_asr_missing"})}catch{}return null}
+let __handle=null,__connected=false,__finalized=false,__closed=false,__readyFired=false;
+let __finalText="",__previewText="",__previewBase="",__livePiece="";
+let __previewAcceptedAt=0;
+let __emittedFinal=false,__finResolve=null,__finTimer=null;
+let __audioChunks=0,__audioBytes=0;
+const __traceFile=String(process.env.COMETIX_ASR_TRACE_FILE||"").trim();
+const __traceId=String(process.pid)+"-"+String(Date.now())+"-"+Math.random().toString(36).slice(2,8);
+const __traceStartedAt=Date.now();
+let __traceLastAt=__traceStartedAt,__traceSeq=0,__traceWriteFailed=false;
+function __trace(kind,data){
+  if(!__traceFile)return;
+  const now=Date.now();
+  const row={schema:1,traceId:__traceId,seq:++__traceSeq,at:new Date(now).toISOString(),elapsedMs:now-__traceStartedAt,deltaMs:now-__traceLastAt,kind,...(data||{})};
+  __traceLastAt=now;
+  try{const line=JSON.stringify(row,(key,value)=>{if(typeof value==="string"&&value.length>2000)return value.slice(0,2000)+"...<len="+String(value.length)+">";return value});_fs.appendFileSync(__traceFile,line+String.fromCharCode(10),"utf8")}catch(err){if(!__traceWriteFailed){__traceWriteFailed=true;try{if(typeof v==="function")v("[cometix_asr_trace] write failed: "+String(err))}catch{}}}
+}
+function __previewState(){return{previewText:__previewText,previewBase:__previewBase,livePiece:__livePiece,previewAcceptedAt:__previewAcceptedAt,finalText:__finalText,emittedFinal:__emittedFinal}}
+function __cleanTranscript(text){return String(text||"").trim()}
+function __commonPrefixLength(a,b){let n=Math.min(a.length,b.length),i=0;while(i<n&&a.charCodeAt(i)===b.charCodeAt(i))i++;return i}
+function __sameLiveRewrite(a,b){a=__cleanTranscript(a);b=__cleanTranscript(b);if(!a||!b||a.startsWith(b)||b.startsWith(a))return true;const short=Math.min(a.length,b.length),common=__commonPrefixLength(a,b);return common>=Math.min(4,Math.max(1,Math.ceil(short*0.45)))}
+function __isStrictProjection(container,candidate){return Boolean(container&&candidate&&container!==candidate&&(container.startsWith(candidate)||container.endsWith(candidate)))}
+function __appendTranscript(base,tail){base=__cleanTranscript(base);tail=__cleanTranscript(tail);if(!base)return tail;if(!tail||base.endsWith(tail))return base;if(tail.startsWith(base))return tail;for(let n=Math.min(base.length,tail.length);n>0;n--){if(base.endsWith(tail.slice(0,n)))return base+tail.slice(n)}const sep=/[A-Za-z0-9]$/.test(base)&&/^[A-Za-z0-9]/.test(tail)?" ":"";return base+sep+tail}
+function __cumulativePreview(full,piece,stage){
+  full=__cleanTranscript(full);piece=__cleanTranscript(piece);const before=__previewState(),incoming=full||piece,previous=__previewText;const now=Date.now(),projectionAgeMs=__previewAcceptedAt?now-__previewAcceptedAt:null;
+  if(!incoming){__trace("preview.normalize",{stage,decision:"empty",full,piece,projectionAgeMs,before,after:__previewState(),output:__previewText});return __previewText}
+  let decision="",next=previous,accepted=false;const live=piece||incoming;
+  if(!previous){decision=stage+".first";next=incoming;accepted=true}
+  else if(incoming===previous){decision=stage+".ignore_duplicate";__previewAcceptedAt=now}
+  else if(__isStrictProjection(previous,incoming)&&projectionAgeMs!==null&&projectionAgeMs<=20){decision=stage+".ignore_parallel_projection";if(stage==="stable"&&previous.startsWith(incoming)){__previewBase=incoming;__livePiece=previous.slice(incoming.length)}}
+  else if(incoming.startsWith(previous)){decision=stage+".accept_extension";next=incoming;accepted=true}
+  else if(previous.startsWith(incoming)||__sameLiveRewrite(previous,incoming)){decision=stage+".accept_whole_rewrite";next=incoming;accepted=true}
+  else if(__previewBase){if(incoming.startsWith(__previewBase)&&incoming.length>__previewBase.length){decision=stage+".accept_cumulative_display";next=incoming}else if(__livePiece&&__sameLiveRewrite(__livePiece,live)){decision=stage+".rewrite_live_piece";next=__appendTranscript(__previewBase,live)}else{decision=stage+".rebuild_from_base";next=__appendTranscript(__previewBase,live)}accepted=true}
+  else{decision=stage+".new_phrase_reset";__previewBase=previous;__livePiece=live;next=__appendTranscript(__previewBase,live);accepted=true}
+  if(accepted){__previewText=next;__previewAcceptedAt=now;if(stage==="stable"){__previewBase=next;__livePiece=""}else if(__previewBase&&next.startsWith(__previewBase)){__livePiece=next.slice(__previewBase.length)}else{__livePiece=live}}
+  __trace("preview.normalize",{stage,decision,full,piece,projectionAgeMs,accepted,before,after:__previewState(),output:__previewText});return __previewText
+}
+function __emitFinalOnce(text,source){text=__cleanTranscript(text);source=source||"unknown";if(!text){__trace("final.skip",{source,reason:"empty",state:__previewState()});return}if(__emittedFinal){__trace("final.skip",{source,reason:"already_emitted",text,textLength:text.length,state:__previewState()});return}__emittedFinal=true;__finalText=text;__trace("cc.onTranscript",{source,isFinal:true,text,textLength:text.length,state:__previewState()});try{${callbacks}.onTranscript(text,true)}catch(err){__trace("cc.onTranscript.error",{source,isFinal:true,error:String(err)})}if(__finResolve){const r=__finResolve;__finResolve=null;if(__finTimer){clearTimeout(__finTimer);__finTimer=null}__trace("bridge.finalize.resolve",{source,result:"session_final",state:__previewState()});r("session_final")}}
+__trace("bridge.init",{pid:process.pid,traceFile:__traceFile});
+const __api={
+  send(k){if(!__connected||__finalized||__closed||__handle==null)return;const size=k&&typeof k.length==="number"?k.length:0;__audioChunks++;__audioBytes+=size;try{__asr.feedPcm(__handle,Buffer.from(k))}catch(err){__trace("audio.feed.error",{error:String(err),chunkBytes:size,audioChunks:__audioChunks,audioBytes:__audioBytes})}},
+  finalize(){if(__finalized||__closed){__trace("bridge.finalize.skip",{reason:"already_closed",finalized:__finalized,closed:__closed,state:__previewState()});return Promise.resolve("ws_already_closed")}__finalized=true;__trace("bridge.finalize.request",{audioChunks:__audioChunks,audioBytes:__audioBytes,state:__previewState()});return new Promise((resolve)=>{__finResolve=resolve;try{__asr.finalizeSession(__handle)}catch(err){__trace("addon.finalize.error",{error:String(err)})}__finTimer=setTimeout(()=>{__finTimer=null;__trace("bridge.finalize.timeout",{hasFinalText:Boolean(__finalText),state:__previewState()});if(!__emittedFinal&&__finalText)__emitFinalOnce(__finalText,"finalize_timeout_fallback");const r=__finResolve;__finResolve=null;if(r){const result=__emittedFinal?"session_final":"safety_timeout";__trace("bridge.finalize.resolve",{source:"timeout",result,state:__previewState()});r(result)}},12000)})},
+  close(){__trace("bridge.close.request",{audioChunks:__audioChunks,audioBytes:__audioBytes,state:__previewState()});__closed=true;__connected=false;try{if(__handle!=null)__asr.closeSession(__handle)}catch(err){__trace("addon.close.error",{error:String(err)})}__handle=null;if(__finResolve){const r=__finResolve;__finResolve=null;if(__finTimer){clearTimeout(__finTimer);__finTimer=null}__trace("bridge.finalize.resolve",{source:"api.close",result:"ws_close",state:__previewState()});r("ws_close")}try{${callbacks}.onClose&&${callbacks}.onClose()}catch(err){__trace("cc.onClose.error",{error:String(err)})}},
+  isConnected(){return __connected&&!__closed}
+};
+function __startLive(){__trace("addon.start.request",{});__handle=__asr.startSession("{}",(err,j)=>{if(err){__trace("addon.callback.error",{error:String(err)});try{${callbacks}.onError(String(err))}catch(callbackErr){__trace("cc.onError.error",{error:String(callbackErr)})}return}let ev;try{ev=JSON.parse(j)}catch(parseErr){__trace("addon.event.parse_error",{error:String(parseErr),raw:String(j||"")});return}if(ev.type==="ready"){__connected=true;__trace("addon.ready",{sessionId:ev.session_id||"",mode:ev.mode||""});if(!__readyFired){__readyFired=true;__trace("cc.onReady",{});try{${callbacks}.onReady(__api)}catch(callbackErr){__trace("cc.onReady.error",{error:String(callbackErr)})}}}else if(ev.type==="transcript"){const display=__cleanTranscript(ev.display),piece=__cleanTranscript(ev.text);const full=display||piece;const stage=ev.stage||((ev.is_vad_finished||ev.is_final)?"stable":"interim");__trace("addon.transcript",{rawStage:ev.stage||"",stage,isInterim:Boolean(ev.is_interim),isVadFinished:Boolean(ev.is_vad_finished),isFinal:Boolean(ev.is_final),text:piece,textLength:piece.length,display,displayLength:display.length,passCount:Number(ev.pass_count||0),stableText:__cleanTranscript(ev.stable_text),liveText:__cleanTranscript(ev.live_text),state:__previewState()});if(!full&&!__previewText){__trace("transcript.skip",{reason:"empty",stage,state:__previewState()});return}if(stage==="session_final"){__emitFinalOnce(full||__previewText,"addon.session_final")}else{const normalizedStage=stage==="stable"?"stable":"interim",previousPreview=__previewText,preview=__cumulativePreview(full,piece,normalizedStage);if(!preview){__trace("transcript.skip",{reason:"normalized_empty",stage,state:__previewState()});return}__finalText=preview;if(preview===previousPreview){__trace("cc.onTranscript.skip",{source:"preview."+normalizedStage,reason:"unchanged_projection",text:preview,textLength:preview.length,state:__previewState()});return}__trace("cc.onTranscript",{source:"preview."+normalizedStage,isFinal:false,text:preview,textLength:preview.length,state:__previewState()});try{${callbacks}.onTranscript(preview,false)}catch(callbackErr){__trace("cc.onTranscript.error",{source:"preview."+normalizedStage,isFinal:false,error:String(callbackErr)})}}}else if(ev.type==="processed"){__trace("addon.processed",{text:__cleanTranscript(ev.text),fmtText:__cleanTranscript(ev.fmt_text)});__emitFinalOnce(ev.text||ev.fmt_text||"","addon.processed")}else if(ev.type==="error"){__trace("addon.error",{message:ev.message||"asr error",code:ev.code||""});try{${callbacks}.onError(ev.message||"asr error")}catch(callbackErr){__trace("cc.onError.error",{error:String(callbackErr)})}}else if(ev.type==="close"){__connected=false;__trace("addon.close",{state:__previewState(),audioChunks:__audioChunks,audioBytes:__audioBytes});if(__finalText&&!__emittedFinal)__emitFinalOnce(__finalText,"addon.close_fallback");if(__finResolve){const r=__finResolve;__finResolve=null;if(__finTimer){clearTimeout(__finTimer);__finTimer=null}const result=__emittedFinal?"session_final":"close";__trace("bridge.finalize.resolve",{source:"addon.close",result,state:__previewState()});r(result)}try{${callbacks}.onClose&&${callbacks}.onClose()}catch(callbackErr){__trace("cc.onClose.error",{error:String(callbackErr)})}}else if(ev.type==="debug"){__trace("addon.debug",{message:ev.message||""})}else{__trace("addon.unknown",{event:ev})}})}
+try{__startLive()}catch(err){__trace("addon.start.error",{error:String(err)});try{${callbacks}.onError(String(err),{fatal:true,connectFailureCode:"cometix_start_failed"})}catch(callbackErr){__trace("cc.onError.error",{error:String(callbackErr)})}return null}
+return __api}`;
+}
+
+function voiceAssetResources(options = {}) {
+  const configured = process.env.CC_PATCH_VOICE_ASSET_SOURCE;
+  if (!configured) throw new Error('VoiceMode resource source is not configured');
+  const rootStat = lstatIfPresent(configured);
+  if (!rootStat || !rootStat.isDirectory() || rootStat.isSymbolicLink()) {
+    if (!options.allowMissingResources || rootStat) {
+      throw new Error(`VoiceMode resource directory is not safe: ${configured}`);
+    }
+  }
+  const root = rootStat ? fs.realpathSync(configured) : path.resolve(configured);
+  const names = ['index.js', 'index.d.ts', 'package.json', 'libcometix-asr.darwin-arm64.node'];
+  return names.map(name => {
+    const source = path.join(root, name), stat = lstatIfPresent(source);
+    if (!stat || !stat.isFile() || stat.isSymbolicLink() || path.dirname(source) !== root) {
+      if (!options.allowMissingResources || stat) {
+        throw new Error(`VoiceMode resource is not a regular file: ${name}`);
+      }
+    }
+    return {kind: 'copy', source, sourceKind: 'voice-asset', destination: `vendor/cometix-asr/${name}`,
+      expectedBefore: 'absent-or-baselined', sourceAvailable: Boolean(stat)};
+  });
+}
+
+function analyzeVoiceMode(target, options = {}) {
+  const files = new Map(), commandPrograms = candidatePrograms(target,
+    ['allow_voice_mode', 'name:"voice"', 'COMETIX_VOICE_GATE', 'COMETIX_VOICE_AVAIL']);
+  const entryMatches = [], availabilityMatches = [], authMatches = [], flagMatches = [];
+  for (const program of commandPrograms) {
+    for (const fn of findAstNodes(program.ast, node => node.type === 'FunctionDeclaration')) {
+      for (const [id, marker, list] of [
+        ['entry-gate', 'COMETIX_VOICE_GATE', entryMatches],
+        ['auth-probe', 'COMETIX_VOICE_AUTH', authMatches],
+        ['feature-flag', 'COMETIX_VOICE_FLAG', flagMatches],
+      ]) {
+        const patched = reconstructedBodyMatch(program, fn, marker,
+          () => voiceUnlockBody(marker));
+        if (patched) list.push(patched);
+      }
+    }
+    for (const object of findAstNodes(program.ast, node => node.type === 'ObjectExpression')) {
+      if (propertyNamed(object, 'name')?.value?.value !== 'voice') continue;
+      const availability = propertyNamed(object, 'availability')?.value;
+      const hidden = object.properties.find(property => property.type === 'Property' && property.kind === 'get' &&
+        (property.key?.name === 'isHidden' || property.key?.value === 'isHidden'));
+      const hiddenReturn = hidden && findAstNodes(hidden.value, node => node.type === 'ReturnStatement')[0];
+      const gateCall = hiddenReturn?.argument?.type === 'UnaryExpression' && hiddenReturn.argument.operator === '!' ?
+        hiddenReturn.argument.argument : null;
+      const gate = gateCall?.type === 'CallExpression' && gateCall.callee?.type === 'Identifier' ?
+        voiceFunctionByName(program, gateCall.callee.name) : null;
+      if (gate && !program.text.slice(gate.body.start, gate.body.end).includes('COMETIX_VOICE_GATE')) {
+        const returned = gate.body.body.length === 1 && gate.body.body[0].type === 'ReturnStatement' ? gate.body.body[0] : null;
+        const calledNames = voiceAndCalls(returned?.argument);
+        if (calledNames && [2, 3].includes(calledNames.length)) {
+          entryMatches.push(bodyPatch(files, program, gate, 'entry-gate', 'COMETIX_VOICE_GATE',
+            voiceUnlockBody('COMETIX_VOICE_GATE')));
+          for (const calledName of calledNames) {
+            const called = voiceFunctionByName(program, calledName);
+            if (!called) continue;
+            const source = program.text.slice(called.start, called.end);
+            if (source.includes('allow_voice_mode') && !source.includes('COMETIX_VOICE_FLAG')) {
+              flagMatches.push(bodyPatch(files, program, called, 'feature-flag', 'COMETIX_VOICE_FLAG',
+                voiceUnlockBody('COMETIX_VOICE_FLAG')));
+            }
+            const tryStatement = called.body.body.length === 1 && called.body.body[0].type === 'TryStatement' ? called.body.body[0] : null;
+            if (tryStatement && !source.includes('COMETIX_VOICE_AUTH')) {
+              const hasNegatedCall = findAstNodes(tryStatement.block, node => node.type === 'IfStatement' &&
+                node.test?.type === 'UnaryExpression' && node.test.operator === '!' &&
+                node.test.argument?.type === 'CallExpression').length === 1;
+              const hasReturnCall = findAstNodes(tryStatement.block, node => node.type === 'ReturnStatement' &&
+                node.argument?.type === 'CallExpression').length === 1;
+              if (hasNegatedCall && hasReturnCall) authMatches.push(bodyPatch(files, program, called, 'auth-probe',
+                'COMETIX_VOICE_AUTH', voiceUnlockBody('COMETIX_VOICE_AUTH')));
+            }
+          }
+        }
+      }
+      if (availability) {
+        const suffix = program.text.slice(availability.end, availability.end + 512);
+        const markerSuffix = suffix.match(/^\/\*COMETIX_VOICE_AVAIL\*\/\/\*CC_VOICE_AVAIL:[A-Za-z0-9+/=]+:[a-f0-9]{64}\*\//)?.[0] || '';
+        const afterEnd = availability.end + markerSuffix.length;
+        const after = program.text.slice(availability.start, afterEnd);
+        const before = markerSuffix ? decodeReversibleBody(after, 'VOICE_AVAIL') : null;
+        if (before !== null) {
+          const modified = 'void 0/*COMETIX_VOICE_AVAIL*/';
+          const expected = `${modified}${reversibleBodyMarker('VOICE_AVAIL', before, modified)}`;
+          if (after === expected) availabilityMatches.push({relativePath: program.relativePath, start: availability.start,
+            end: afterEnd, state: 'after', before, after});
+        } else if (availability.type === 'ArrayExpression' && availability.elements.some(item => item?.value === 'claude-ai')) {
+          const modified = 'void 0/*COMETIX_VOICE_AVAIL*/';
+          const replacement = `${modified}${reversibleBodyMarker('VOICE_AVAIL', after, modified)}`;
+          availabilityMatches.push({relativePath: program.relativePath, start: availability.start, end: availability.end,
+            state: 'before', before: after, after: replacement});
+          const commandBefore = program.text.slice(object.start, object.end);
+          const commandAfter = replaceNodeSource(object, availability, replacement, program.text);
+          addPlannedReplacement(files, program,
+            {start: availability.start, end: availability.end, text: replacement, semanticId: 'availability'},
+            commandBefore, commandAfter);
+        }
+      }
+    }
+  }
+
+  const capabilityIndex = new ModuleIndex(target);
+  const capabilityReferencePrograms = candidatePrograms(target, ['isVoiceStreamAvailable']);
+  const capabilityBindings = [];
+  for (const program of capabilityReferencePrograms) {
+    const absoluteFile = packageFile(target.packageRoot, program.relativePath);
+    for (const property of findAstNodes(program.ast, node => node.type === 'Property' &&
+      (node.key?.name === 'isVoiceStreamAvailable' || node.key?.value === 'isVoiceStreamAvailable'))) {
+      let reference = property.value;
+      if (reference?.type === 'ArrowFunctionExpression') reference = reference.body;
+      if (reference?.type === 'CallExpression' && reference.arguments.length === 0) reference = reference.callee;
+      if (reference?.type !== 'Identifier') continue;
+      try { capabilityBindings.push(capabilityIndex.resolveLocal(absoluteFile, reference.name)); } catch {}
+    }
+  }
+  const uniqueCapabilityBindings = [...new Map(capabilityBindings.map(binding => [bindingKey(binding), binding])).values()];
+  const capabilityPrograms = candidatePrograms(target,
+    ['isVoiceStreamAvailable', 'accessToken', 'COMETIX_VOICE_STREAM_AVAIL']);
+  const capabilityMatches = [];
+  for (const program of capabilityPrograms) {
+    const absoluteFile = packageFile(target.packageRoot, program.relativePath);
+    for (const fn of findAstNodes(program.ast, node => node.type === 'FunctionDeclaration' && node.params.length === 0)) {
+      let functionBinding = null;
+      try { functionBinding = capabilityIndex.resolveLocal(absoluteFile, fn.id.name); } catch {}
+      if (!functionBinding || uniqueCapabilityBindings.length !== 1 ||
+          bindingKey(functionBinding) !== bindingKey(uniqueCapabilityBindings[0])) continue;
+      const patched = reconstructedBodyMatch(program, fn, 'COMETIX_VOICE_STREAM_AVAIL',
+        () => voiceUnlockBody('COMETIX_VOICE_STREAM_AVAIL'));
+      if (patched) { capabilityMatches.push(patched); continue; }
+      const source = program.text.slice(fn.start, fn.end);
+      if (source.includes('COMETIX_VOICE_STREAM_AVAIL') || !memberNamed(fn, 'accessToken')) continue;
+      const negatedCall = findAstNodes(fn.body, node => node.type === 'IfStatement' &&
+        node.test?.type === 'UnaryExpression' && node.test.operator === '!' &&
+        node.test.argument?.type === 'CallExpression');
+      if (negatedCall.length !== 1) continue;
+      capabilityMatches.push(bodyPatch(files, program, fn, 'stream-capability', 'COMETIX_VOICE_STREAM_AVAIL',
+        voiceUnlockBody('COMETIX_VOICE_STREAM_AVAIL')));
+    }
+  }
+
+  const settingsPrograms = candidatePrograms(target,
+    ['id:"autoCompact"', 'id:"language"', 'id:"editor"', 'COMETIX_VOICE_SETTING']);
+  const settingsMatches = [];
+  for (const program of settingsPrograms) {
+    for (const fn of findAstNodes(program.ast, node => node.type === 'FunctionDeclaration' && node.params.length > 0)) {
+      const bindings = voiceSettingsBindings(program, fn);
+      for (const array of voiceSettingsArrays(fn)) {
+        const patched = reconstructedVoiceSettingsMatch(program, fn, array);
+        if (patched) { settingsMatches.push(patched); continue; }
+        if (!bindings || program.text.slice(array.start, array.end).includes('COMETIX_VOICE_SETTING')) continue;
+        const before = program.text.slice(array.start, array.end), modified = renderVoiceSetting(program, array, bindings);
+        const after = `[${reversibleBodyMarker('VOICE_SETTING', before, modified)}${modified.slice(1)}`;
+        settingsMatches.push({relativePath: program.relativePath, start: array.start, end: array.end,
+          state: 'before', before, after});
+        addPlannedReplacement(files, program,
+          {start: array.start, end: array.end, text: after, semanticId: 'settings-ui-schema'}, before, after);
+      }
+    }
+  }
+
+  const connectionPrograms = candidatePrograms(target,
+    ['speech_to_text/voice_stream', 'stt_provider', 'linear16', 'COMETIX_ASR_VOICE_STREAM']);
+  const connectionMatches = [];
+  for (const program of connectionPrograms) {
+    for (const fn of findAstNodes(program.ast, node => node.type === 'FunctionDeclaration' && node.async)) {
+      const patched = reconstructedBodyMatch(program, fn, 'COMETIX_ASR_VOICE_STREAM',
+        (originalProgram, originalFunction) => voiceAdapterBody(target, program, originalFunction));
+      if (patched) { connectionMatches.push(patched); continue; }
+      const source = program.text.slice(fn.start, fn.end), strings = findAstNodes(fn, node => node.type === 'Literal' &&
+        typeof node.value === 'string').map(node => node.value);
+      const hasVoiceTransport = strings.some(value => value === 'linear16' || value.includes('deepgram') ||
+        value.includes('speech_to_text/voice_stream'));
+      if (source.includes('COMETIX_ASR_VOICE_STREAM') || !hasVoiceTransport ||
+          (!memberNamed(fn, 'onTranscript') && !memberNamed(fn, 'onReady'))) continue;
+      const modified = voiceAdapterBody(target, program, fn);
+      if (modified !== null) connectionMatches.push(bodyPatch(files, program, fn, 'connection',
+        'COMETIX_ASR_VOICE_STREAM', modified));
+    }
+  }
+
+  const resources = voiceAssetResources(options);
+  const resourcesCurrent = resources.every(resource => {
+    const destination = managedDestination(target, resource.destination), stat = lstatIfPresent(destination);
+    return stat?.isFile() && !stat.isSymbolicLink() && (!resource.sourceAvailable ||
+      sha256(fs.readFileSync(destination)) === sha256(fs.readFileSync(resource.source)) &&
+      (stat.mode & 0o777) === (fs.statSync(resource.source).mode & 0o777));
+  });
+  const semanticTargets = [
+    {id: 'entry-gate', expectedCardinality: 1, matches: entryMatches},
+    {id: 'stream-capability', expectedCardinality: 1, matches: capabilityMatches},
+    {id: 'availability', expectedCardinality: 1, matches: availabilityMatches},
+    {id: 'settings-ui-schema', expectedCardinality: 1, matches: settingsMatches},
+    {id: 'connection', expectedCardinality: 1, matches: connectionMatches},
+    {id: 'auth-probe', expectedCardinality: 1, matches: authMatches},
+    {id: 'feature-flag', expectedCardinality: 1, matches: flagMatches},
+  ];
+  const plan = finishSemanticPlan('voice-mode', semanticTargets, files, {
+    candidateFiles: [...new Set([...commandPrograms, ...capabilityPrograms, ...settingsPrograms, ...connectionPrograms]
+      .map(item => item.relativePath))],
+  });
+  plan.resources = resources;
+  if (!resourcesCurrent) plan.state = 'needs-patch';
+  return plan;
+}
+
 function analyzeContractFixture(target, patchId = '__contract__') {
   if (process.env.CC_PATCH_TESTING !== '1') throw new Error('internal contract analyzer is disabled');
   const allDefinitions = [
@@ -1742,6 +2121,7 @@ function analyzerForPatch(patchId) {
   if (patchId === 'keybindings') return analyzeKeybindings;
   if (patchId === 'transcript-dialog') return analyzeTranscriptDialog;
   if (patchId === 'ultracode') return analyzeUltracode;
+  if (patchId === 'voice-mode') return analyzeVoiceMode;
   return null;
 }
 
@@ -1752,9 +2132,9 @@ function registeredPatchIdsFor(patchId) {
   return candidates.filter(candidate => analyzerForPatch(candidate));
 }
 
-function analyzePatch(target, patchId) {
+function analyzePatch(target, patchId, options = {}) {
   const analyzer = analyzerForPatch(patchId);
-  if (analyzer) return analyzer(target);
+  if (analyzer) return analyzer(target, options);
   throw new Error(`unsupported patch id: ${patchId}`);
 }
 
@@ -1919,20 +2299,20 @@ function assertManagedFilesAttributable(manifest, target, plan) {
     }
     assertManagedPathSafe(target.packageRoot, absolute);
     const stat = lstatIfPresent(absolute);
+    const resource = (plan.resources || []).find(candidate => candidate.destination === relativePath);
+    if (resource && stat?.isFile() && !stat.isSymbolicLink()) {
+      const currentHash = sha256(fs.readFileSync(absolute)), currentMode = stat.mode & 0o777;
+      if (item.patchSha256 && currentHash === item.patchSha256 && currentMode === item.patchMode) continue;
+      if (!item.patchSha256 && resource.sourceAvailable !== false) {
+        const source = resourceSourcePath(target, {...resource, patchId: plan.patchId});
+        const sourceStat = lstatIfPresent(source);
+        if (sourceStat?.isFile() && !sourceStat.isSymbolicLink() &&
+            currentHash === sha256(fs.readFileSync(source)) && currentMode === (sourceStat.mode & 0o777)) continue;
+      }
+    }
     if (!item.existed) {
       if (!stat) continue;
-      const resource = (plan.resources || []).find(candidate => candidate.destination === relativePath && candidate.source);
-      if (!resource || !stat.isFile() || stat.isSymbolicLink()) {
-        throw new Error(`managed path cannot be attributed to baseline: ${relativePath}`);
-      }
-      const source = managedDestination(target, resource.source);
-      const sourceStat = lstatIfPresent(source);
-      if (!sourceStat || !sourceStat.isFile() || sourceStat.isSymbolicLink() ||
-          sha256(fs.readFileSync(absolute)) !== sha256(fs.readFileSync(source)) ||
-          (stat.mode & 0o777) !== (sourceStat.mode & 0o777)) {
-        throw new Error(`managed resource cannot be attributed to known patch state: ${relativePath}`);
-      }
-      continue;
+      throw new Error(`managed resource cannot be attributed to known patch state: ${relativePath}`);
     }
     if (!stat || !stat.isFile()) throw new Error(`managed file no longer matches baseline: ${relativePath}`);
     assertManagedPathSafe(target.packageRoot, absolute);
@@ -2062,6 +2442,28 @@ function managedDestination(target, relativePath) {
   return absolute;
 }
 
+function resourceSourcePath(target, resource) {
+  if (resource.sourceKind !== 'voice-asset') return managedDestination(target, resource.source);
+  if (resource.kind !== 'copy' || resource.patchId && resource.patchId !== 'voice-mode' ||
+      !path.isAbsolute(resource.source)) throw new Error('invalid VoiceMode resource operation');
+  const configured = process.env.CC_PATCH_VOICE_ASSET_SOURCE;
+  if (!configured) throw new Error('VoiceMode resource source is not configured');
+  const rootStat = lstatIfPresent(configured);
+  if (!rootStat?.isDirectory() || rootStat.isSymbolicLink()) {
+    throw new Error(`VoiceMode resource source directory is not safe: ${configured}`);
+  }
+  const root = fs.realpathSync(configured), name = path.basename(resource.source);
+  if (!['index.js', 'index.d.ts', 'package.json', 'libcometix-asr.darwin-arm64.node'].includes(name)) {
+    throw new Error(`VoiceMode resource source escapes configured directory: ${resource.source}`);
+  }
+  const expected = path.join(root, name), sourceStat = lstatIfPresent(expected);
+  if (resource.source !== expected || !sourceStat?.isFile() || sourceStat.isSymbolicLink() ||
+      fs.realpathSync(expected) !== expected) {
+    throw new Error(`VoiceMode resource source is not a safe regular file: ${name}`);
+  }
+  return expected;
+}
+
 function transactionOperations(target, plan, renderedFiles) {
   const operations = renderedFiles.map(file => ({
     kind: 'write',
@@ -2073,7 +2475,7 @@ function transactionOperations(target, plan, renderedFiles) {
   }));
   for (const resource of plan.resources || []) {
     if (resource.kind !== 'copy' || !resource.source) throw new Error(`unsupported resource operation: ${resource.kind || 'missing'}`);
-    const source = managedDestination(target, resource.source);
+    const source = resourceSourcePath(target, {...resource, patchId: plan.patchId});
     const sourceStat = lstatIfPresent(source);
     if (!sourceStat || !sourceStat.isFile()) throw new Error(`resource source is not a regular file: ${resource.source}`);
     const sourceBytes = fs.readFileSync(source);
@@ -2082,7 +2484,7 @@ function transactionOperations(target, plan, renderedFiles) {
       relativePath: resource.destination,
       destination: managedDestination(target, resource.destination),
       source,
-      sourceRelativePath: resource.source,
+      sourceRelativePath: resource.sourceKind === 'voice-asset' ? path.basename(source) : resource.source,
       expectedSourceHash: sha256(sourceBytes),
       expectedSourceMode: sourceStat.mode & 0o777,
       bytes: sourceBytes,
@@ -2510,9 +2912,10 @@ function commitTransaction(target, operations) {
   }
 }
 
-function ensureBaselineForPlan(target, plan) {
+function ensureBaselineForPlan(target, plan, operations = [], publication = null) {
   let manifest = readBaselineManifest(target);
   const creating = !manifest;
+  const previousManifest = manifest ? JSON.parse(JSON.stringify(manifest)) : null;
   const entryPath = path.relative(target.packageRoot, target.entryPath);
   if (!manifest) {
     const hasManagedState = plan.semanticTargets.some(semanticTarget =>
@@ -2545,7 +2948,41 @@ function ensureBaselineForPlan(target, plan) {
     ...(plan.resources || []).map(resource => resource.destination),
   ])];
   const newPaths = managedPaths.filter(relativePath => !manifest.files[relativePath]);
-  if (!creating && newPaths.length === 0) return path.join(finalRoot, 'manifest.json');
+  const resourceOperations = new Map(operations.filter(operation => operation.kind === 'copy')
+    .map(operation => [operation.relativePath, operation]));
+  const recordResourcePatchState = (item, resource) => {
+    if (!resource?.source) return false;
+    const operation = resourceOperations.get(resource.destination);
+    let patchSha256, patchMode;
+    if (operation) {
+      patchSha256 = operation.expectedSourceHash;
+      patchMode = operation.expectedSourceMode;
+    } else {
+      const source = resourceSourcePath(target, {...resource, patchId: plan.patchId});
+      const sourceStat = fs.statSync(source);
+      patchSha256 = sha256(fs.readFileSync(source));
+      patchMode = sourceStat.mode & 0o777;
+    }
+    const changed = item.patchSha256 !== patchSha256 || item.patchMode !== patchMode;
+    item.patchSha256 = patchSha256;
+    item.patchMode = patchMode;
+    return changed;
+  };
+  let metadataChanged = false;
+  for (const resource of plan.resources || []) {
+    const item = manifest.files[resource.destination];
+    if (item && resourceOperations.has(resource.destination)) {
+      metadataChanged = recordResourcePatchState(item, resource) || metadataChanged;
+    }
+  }
+  if (!creating && newPaths.length === 0 && !metadataChanged) return path.join(finalRoot, 'manifest.json');
+  if (publication) {
+    publication.creating = creating;
+    publication.previousManifest = previousManifest;
+    publication.newPaths = [...newPaths];
+    publication.publishedMirrors = [];
+    publication.published = false;
+  }
   let stagingRoot = path.join(target.packageRoot, `.cc-patch-manager-baseline.stage-${process.pid}-${crypto.randomBytes(6).toString('hex')}`);
   const root = stagingRoot;
   const recordPath = (relativePath, requireExisting) => {
@@ -2570,6 +3007,8 @@ function ensureBaselineForPlan(target, plan) {
         if (!manifest.createdDirectories.includes(directory)) manifest.createdDirectories.push(directory);
       }
       manifest.files[relativePath] = {type: 'file', existed: false, sha256: null, mode: null, mirror: null};
+      const resource = (plan.resources || []).find(candidate => candidate.destination === relativePath);
+      recordResourcePatchState(manifest.files[relativePath], resource);
       return;
     }
     if (!stat.isFile()) throw new Error(`managed path is not a file: ${relativePath}`);
@@ -2579,6 +3018,8 @@ function ensureBaselineForPlan(target, plan) {
     const mirror = path.join(root, mirrorRelative);
     writeManagedFileAtomic(target.packageRoot, mirror, bytes, mode);
     manifest.files[relativePath] = {type: 'file', existed: true, sha256: sha256(bytes), mode, mirror: mirrorRelative};
+    const resource = (plan.resources || []).find(candidate => candidate.destination === relativePath);
+    recordResourcePatchState(manifest.files[relativePath], resource);
   };
   try {
     for (const relativePath of managedPaths) {
@@ -2604,6 +3045,7 @@ function ensureBaselineForPlan(target, plan) {
       fsyncDirectory(target.packageRoot);
       stagingRoot = null;
       assertManagedPathSafe(target.packageRoot, finalRoot);
+      if (publication) publication.published = true;
     } else {
       const publishedMirrors = [];
       const createdMirrorDirectories = [];
@@ -2634,6 +3076,10 @@ function ensureBaselineForPlan(target, plan) {
         writeManifestAtomic(target, manifest, finalRoot);
         manifestPublished = true;
         assertBaselineMirrors(manifest, target, finalRoot);
+        if (publication) {
+          publication.published = true;
+          publication.publishedMirrors = [...publishedMirrors];
+        }
       } catch (error) {
         if (!manifestPublished) {
           for (const mirror of publishedMirrors.reverse()) {
@@ -2660,6 +3106,39 @@ function ensureBaselineForPlan(target, plan) {
     if (stagingRoot) fs.rmSync(stagingRoot, {recursive: true, force: true});
     throw error;
   }
+}
+
+function rollbackBaselinePublication(target, publication) {
+  if (!publication?.published) return;
+  const root = baselineDirectory(target);
+  if (publication.creating) {
+    assertManagedPathSafe(target.packageRoot, root);
+    fs.rmSync(root, {recursive: true, force: true});
+    fsyncDirectory(target.packageRoot);
+    return;
+  }
+  writeManifestAtomic(target, publication.previousManifest, root);
+  for (const mirror of [...publication.publishedMirrors].reverse()) {
+    const stat = lstatIfPresent(mirror);
+    if (stat) {
+      assertManagedPathSafe(target.packageRoot, mirror);
+      if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`cannot roll back baseline mirror: ${mirror}`);
+      fs.unlinkSync(mirror);
+      fsyncDirectory(path.dirname(mirror));
+    }
+    let directory = path.dirname(mirror), filesRoot = path.join(root, 'files');
+    while (directory !== filesRoot && insideRoot(filesRoot, directory)) {
+      try {
+        fs.rmdirSync(directory);
+        fsyncDirectory(path.dirname(directory));
+      } catch (error) {
+        if (error.code !== 'ENOENT' && error.code !== 'ENOTEMPTY') throw error;
+        break;
+      }
+      directory = path.dirname(directory);
+    }
+  }
+  assertBaselineMirrors(publication.previousManifest, target);
 }
 
 function restoreOperationsFromBaseline(target, manifest) {
@@ -2714,10 +3193,32 @@ function applyRuntimePatch(target, patchId) {
   const plan = analyzePatch(target, patchId);
   const renderedFiles = validatePlan(target, plan);
   if (plan.state === 'already-patched') return false;
-  const operations = transactionOperations(target, plan, renderedFiles);
-  ensureBaselineForPlan(target, plan);
-  commitTransaction(target, operations);
+  commitPlanTransaction(target, plan, renderedFiles);
   return true;
+}
+
+function commitPlanTransaction(target, plan, renderedFiles) {
+  const operations = transactionOperations(target, plan, renderedFiles);
+  if (process.env.CC_PATCH_TESTING === '1' && process.env.CC_PATCH_TEST_MUTATE_RESOURCE_BEFORE_BASELINE) {
+    const mutated = managedDestination(target, process.env.CC_PATCH_TEST_MUTATE_RESOURCE_BEFORE_BASELINE);
+    fs.appendFileSync(mutated, '\n// CC_TEST_EXTERNAL_MUTATION\n');
+  }
+  const publication = {};
+  ensureBaselineForPlan(target, plan, operations, publication);
+  try {
+    if (process.env.CC_PATCH_TESTING === '1' && process.env.CC_PATCH_TEST_MUTATE_AFTER_ANALYSIS) {
+      const mutated = managedDestination(target, process.env.CC_PATCH_TEST_MUTATE_AFTER_ANALYSIS);
+      fs.appendFileSync(mutated, '\n// CC_TEST_EXTERNAL_MUTATION\n');
+    }
+    if (process.env.CC_PATCH_TESTING === '1' && process.env.CC_PATCH_TEST_CHMOD_AFTER_ANALYSIS) {
+      const mutated = managedDestination(target, process.env.CC_PATCH_TEST_CHMOD_AFTER_ANALYSIS);
+      fs.chmodSync(mutated, 0o600);
+    }
+    commitTransaction(target, operations);
+  } catch (error) {
+    if (incompleteTransactionEntries(target).length === 0) rollbackBaselinePublication(target, publication);
+    throw error;
+  }
 }
 
 function restoreOrchestrationPath(target) {
@@ -2769,13 +3270,18 @@ function restorePatchFromBaseline(target, removeId) {
   if (!candidates.includes(removeId)) {
     throw new Error(`unsupported restore patch id: ${removeId}`);
   }
-  const plans = candidates.map(patchId => ({patchId, plan: analyzePatch(target, patchId)}));
+  const plans = candidates.map(patchId => ({patchId,
+    plan: analyzePatch(target, patchId, {allowMissingResources: true})}));
   for (const {plan} of plans) validatePlan(target, plan);
   const manifest = readBaselineManifest(target);
   if (!manifest) throw new Error('patch restore requires a trusted baseline');
   assertBaselineIdentity(manifest, target);
   assertBaselineMirrors(manifest, target);
-  assertManagedFilesAttributable(manifest, target, attributionPlanForTarget(target, plans[0].plan));
+  assertManagedFilesAttributable(manifest, target, {
+    patchId: removeId,
+    attribution: {transformations: plans.flatMap(item => item.plan.attribution?.transformations || [])},
+    resources: plans.flatMap(item => item.plan.resources || []),
+  });
 
   let orchestration = readRestoreOrchestration(target);
   if (orchestration) {
@@ -2928,6 +3434,16 @@ if (command === 'inspect') {
   try {
     plan = analyzePatch(target, patchId);
     renderedFiles = validatePlan(target, plan);
+    if (process.env.CC_PATCH_TESTING === '1' && process.env.CC_PATCH_TEST_SWAP_VOICE_SOURCE_AFTER_ANALYSIS) {
+      const [sourceName, targetName] = process.env.CC_PATCH_TEST_SWAP_VOICE_SOURCE_AFTER_ANALYSIS.split(':');
+      const allowed = ['index.js', 'index.d.ts', 'package.json', 'libcometix-asr.darwin-arm64.node'];
+      if (patchId !== 'voice-mode' || !allowed.includes(sourceName) || !allowed.includes(targetName)) {
+        throw new Error('invalid injected VoiceMode source swap');
+      }
+      const sourceRoot = process.env.CC_PATCH_VOICE_ASSET_SOURCE;
+      fs.unlinkSync(path.join(sourceRoot, sourceName));
+      fs.symlinkSync(targetName, path.join(sourceRoot, sourceName));
+    }
   } catch (error) {
     fail(error.message);
   }
@@ -2949,17 +3465,7 @@ if (command === 'inspect') {
     console.log('PLAN_VALID');
   } else {
     try {
-      const operations = transactionOperations(target, plan, renderedFiles);
-      ensureBaselineForPlan(target, plan);
-      if (process.env.CC_PATCH_TESTING === '1' && process.env.CC_PATCH_TEST_MUTATE_AFTER_ANALYSIS) {
-        const mutated = managedDestination(target, process.env.CC_PATCH_TEST_MUTATE_AFTER_ANALYSIS);
-        fs.appendFileSync(mutated, '\n// CC_TEST_EXTERNAL_MUTATION\n');
-      }
-      if (process.env.CC_PATCH_TESTING === '1' && process.env.CC_PATCH_TEST_CHMOD_AFTER_ANALYSIS) {
-        const mutated = managedDestination(target, process.env.CC_PATCH_TEST_CHMOD_AFTER_ANALYSIS);
-        fs.chmodSync(mutated, 0o600);
-      }
-      commitTransaction(target, operations);
+      commitPlanTransaction(target, plan, renderedFiles);
     } catch (error) {
       fail(error.message);
     }
@@ -2973,13 +3479,14 @@ RUNTIME_EOF
 }
 
 runtime_exec() {
-  local command="$1" entry="$2" runtime output status
+  local command="$1" entry="$2" runtime output status voice_asset_source
   shift 2
   ensure_node || return 1
   ensure_acorn || return 1
   runtime=$(write_patch_runtime) || return 1
+  voice_asset_source="${CC_PATCH_VOICE_ASSET_SOURCE:-$(voice_mode_source_dir)}"
   set +e
-  output=$(node "$runtime" "$ACORN_PATH" "$command" "$entry" "$@" 2>&1)
+  output=$(CC_PATCH_VOICE_ASSET_SOURCE="$voice_asset_source" node "$runtime" "$ACORN_PATH" "$command" "$entry" "$@" 2>&1)
   status=$?
   set -e
   rm -f "$runtime"
@@ -5706,6 +6213,16 @@ run_node_patch() {
     return 1
   fi
 
+  if [[ "$id" == "voice-mode" ]]; then
+    set +e
+    output=$(runtime_exec "$mode" "$CLI_PATH" "$id" 2>&1)
+    ec=$?
+    set -e
+    LAST_OUTPUT="$output"
+    parse_and_set_status "$id" "$mode" "$output" "$ec"
+    return $?
+  fi
+
   set +e
   target_info=$(runtime_exec inspect "$CLI_PATH" 2>&1)
   ec=$?
@@ -5722,10 +6239,6 @@ run_node_patch() {
     STATUS[$id]=error
     MSG[$id]="cruce 目标结构检查失败，已拒绝旧单文件写入路径"
     LAST_OUTPUT="$target_info"
-    return 1
-  fi
-
-  if [[ "$id" == "voice-mode" && "$mode" == "apply" ]] && ! install_voice_mode_vendor; then
     return 1
   fi
 

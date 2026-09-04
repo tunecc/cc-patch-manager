@@ -345,6 +345,47 @@ fi
 [[ ! -e "$resource_source_mode_race/assets/copied.bin" ]] || fail 'resource-source-mode-race apply copied stale metadata'
 [[ -z "$(find "$resource_source_mode_race" -maxdepth 1 -name '.cc-patch-manager-transaction-*' -print -quit)" ]] || fail 'resource-source-mode-race rejection left a transaction directory'
 
+resource_baseline_race="$tmp/resource-baseline-race"
+make_contract_package "$resource_baseline_race"
+fixture_add_module "$resource_baseline_race" assets/model.bin 'snapshot-a'
+printf '\n// CC_CONTRACT_RESOURCE:assets/model.bin->assets/copied.bin\n' >>"$resource_baseline_race/cli.js"
+if CC_PATCH_TESTING=1 CC_PATCH_TEST_MUTATE_RESOURCE_BEFORE_BASELINE=assets/model.bin \
+    runtime_exec apply "$(fixture_entry "$resource_baseline_race")" __contract__ >/dev/null 2>&1; then
+  fail 'apply accepted a resource change between operation snapshot and baseline publication'
+fi
+[[ ! -e "$resource_baseline_race/.cc-patch-manager-baseline" ]] || fail 'resource-baseline-race rejection published a baseline'
+[[ ! -e "$resource_baseline_race/assets/copied.bin" ]] || fail 'resource-baseline-race rejection copied stale bytes'
+printf '%s\n' 'snapshot-c' >"$resource_baseline_race/assets/model.bin"
+CC_PATCH_TESTING=1 runtime_exec apply "$(fixture_entry "$resource_baseline_race")" __contract__ >/dev/null 2>&1 ||
+  fail 'resource-baseline-race apply was not retryable with a new source snapshot'
+node - "$resource_baseline_race" <<'NODE' || fail 'resource-baseline-race manifest did not match committed resource state'
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const root = process.argv[2];
+const manifest = JSON.parse(fs.readFileSync(path.join(root, '.cc-patch-manager-baseline', 'manifest.json')));
+const item = manifest.files['assets/copied.bin'];
+const copied = fs.readFileSync(path.join(root, 'assets/copied.bin'));
+const digest = crypto.createHash('sha256').update(copied).digest('hex');
+if (!item || item.patchSha256 !== digest || item.patchMode !== (fs.statSync(path.join(root, 'assets/copied.bin')).mode & 0o777)) process.exit(1);
+NODE
+CC_PATCH_TESTING=1 runtime_exec restore "$(fixture_entry "$resource_baseline_race")" __contract__ >/dev/null 2>&1 ||
+  fail 'resource-baseline-race resource could not be restored'
+[[ ! -e "$resource_baseline_race/assets/copied.bin" ]] || fail 'resource-baseline-race restore retained copied bytes'
+
+resource_baseline_refresh="$tmp/resource-baseline-refresh"
+make_contract_package "$resource_baseline_refresh"
+fixture_add_module "$resource_baseline_refresh" assets/model.bin 'snapshot-a'
+printf '\n// CC_CONTRACT_RESOURCE:assets/model.bin->assets/copied.bin\n' >>"$resource_baseline_refresh/cli.js"
+CC_PATCH_TESTING=1 runtime_exec apply "$(fixture_entry "$resource_baseline_refresh")" __contract__ >/dev/null 2>&1 ||
+  fail 'resource-baseline-refresh fixture could not apply resource snapshot A'
+printf '%s\n' 'snapshot-b' >"$resource_baseline_refresh/assets/model.bin"
+CC_PATCH_TESTING=1 runtime_exec baseline "$(fixture_entry "$resource_baseline_refresh")" __contract__ >/dev/null 2>&1 ||
+  fail 'resource-baseline-refresh baseline recheck failed'
+CC_PATCH_TESTING=1 runtime_exec restore "$(fixture_entry "$resource_baseline_refresh")" __contract__ >/dev/null 2>&1 ||
+  fail 'baseline recheck replaced the attribution hash for the applied resource snapshot'
+[[ ! -e "$resource_baseline_refresh/assets/copied.bin" ]] || fail 'resource-baseline-refresh restore retained copied bytes'
+
 resource_destination_race="$tmp/resource-destination-race"
 make_contract_package "$resource_destination_race"
 fixture_add_module "$resource_destination_race" assets/source.bin 'new-resource'
