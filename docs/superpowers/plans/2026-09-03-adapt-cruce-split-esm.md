@@ -803,19 +803,19 @@ git commit -m "test: continue apply-all after isolated failure"
 
 **Interfaces:** Consumes all preceding APIs; produces complete fast suite and old single-CJS parity.
 
-- [ ] **Step 1: 写并运行全套快速回归**
+- [x] **Step 1: 写并运行全套快速回归**
 
 ```bash
 for test_file in tests/test_*.sh; do bash "$test_file"; done
 ```
 
-- [ ] **Step 2: 确认失败可定位**
+- [x] **Step 2: 确认失败可定位**
 
 Run: `for test_file in tests/test_*.sh; do bash "$test_file"; done`
 
 Expected: 若失败，精确定位 facade、基线兼容或补丁语义，绝不忽略退出码。
 
-- [ ] **Step 3: 修复被断言覆盖的 facade 回归**
+- [x] **Step 3: 修复被断言覆盖的 facade 回归**
 
 ```bash
 run_node_patch() {
@@ -825,13 +825,13 @@ run_node_patch() {
 }
 ```
 
-- [ ] **Step 4: 复跑**
+- [x] **Step 4: 复跑**
 
 Run: `bash -n cc-patch-manager.sh && for test_file in tests/test_*.sh; do bash "$test_file"; done`
 
 Expected: PASS；全部 Bash 测试零失败且旧七补丁语义保留。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add cc-patch-manager.sh tests
