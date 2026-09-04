@@ -32,4 +32,4 @@
 
 - [x] 5.1 获取或构建 CometixSpace 2.1.224 package 临时副本，在副本中完成七补丁 check/apply/幂等/单补丁还原/全还原矩阵，并验证还原后逐文件哈希与基线一致及 CLI 冒烟通过（context-limit 在 2.1.224 单 CJS 上为 MISSING_TARGET，已记录为不适用；其余六补丁全矩阵通过）
 - [x] 5.2 复制本机 cruce 2.1.259 package 到临时目录，在副本中完成七补丁 check/apply/幂等/单补丁还原/全还原矩阵，并验证当前全局安装哈希未改变及 CLI 冒烟通过（七补丁全适用，源保护断言全局安装前后哈希一致）
-- [ ] 5.3 运行 Shell 语法检查、全部快速测试和双真实版本验收，记录每项命令与结果，并确认 Git diff 只包含获准的脚本、测试和 Comet/OpenSpec 产物
+- [x] 5.3 运行 Shell 语法检查、全部快速测试和双真实版本验收，记录每项命令与结果，并确认 Git diff 只包含获准的脚本、测试和 Comet/OpenSpec 产物（bash -n SYNTAX_OK；快速套件 14/14 PASS；cometixspace 2.1.224 6 适用/1 记录不适用 EXIT=0；cruce 2.1.259 7 适用 PASS；diff --check 无空白错误）
