@@ -858,6 +858,277 @@ function tokenMatches(text, token, relativePath, state) {
   return matches;
 }
 
+function findAstNodes(node, predicate, results = []) {
+  if (!node || typeof node !== 'object') return results;
+  if (predicate(node)) results.push(node);
+  for (const [key, value] of Object.entries(node)) {
+    if (key === 'start' || key === 'end') continue;
+    if (Array.isArray(value)) value.forEach(child => findAstNodes(child, predicate, results));
+    else if (value && typeof value === 'object') findAstNodes(value, predicate, results);
+  }
+  return results;
+}
+
+function sourceTypeForTarget(target) {
+  return target.layout === 'split-esm' ? 'module' : 'script';
+}
+
+function candidatePrograms(target, markers) {
+  const sourceType = sourceTypeForTarget(target);
+  const relativePaths = scanMarkerCandidates(target, JSON.stringify([markers]));
+  return relativePaths.map(relativePath => {
+    const absolute = packageFile(target.packageRoot, relativePath);
+    const parsed = parseProgram(absolute, sourceType);
+    return {relativePath, sourceType, ...parsed};
+  });
+}
+
+function propertyNamed(object, name) {
+  return object?.type === 'ObjectExpression' ? object.properties.find(property =>
+    property.type === 'Property' && (property.key?.name === name || property.key?.value === name)) : undefined;
+}
+
+function memberNamed(node, name) {
+  return findAstNodes(node, candidate => candidate.type === 'MemberExpression' &&
+    (candidate.property?.name === name || candidate.property?.value === name)).length > 0;
+}
+
+function enclosingNode(ast, target, type) {
+  const containers = findAstNodes(ast, node => node.type === type && node.start <= target.start && target.end <= node.end);
+  return containers.sort((left, right) => (left.end - left.start) - (right.end - right.start))[0] || null;
+}
+
+function booleanReturnCount(node, value) {
+  return findAstNodes(node, candidate => candidate.type === 'ReturnStatement' &&
+    candidate.argument?.type === 'UnaryExpression' && candidate.argument.operator === '!' &&
+    candidate.argument.argument?.type === 'Literal' && candidate.argument.argument.value === (value ? 0 : 1)).length;
+}
+
+function replaceNodeSource(container, node, replacement, text) {
+  const original = text.slice(container.start, container.end);
+  const start = node.start - container.start;
+  const end = node.end - container.start;
+  return original.slice(0, start) + replacement + original.slice(end);
+}
+
+function addPlannedReplacement(files, program, replacement, beforeContainer, afterContainer) {
+  if (!files.has(program.relativePath)) {
+    files.set(program.relativePath, {
+      relativePath: program.relativePath,
+      sourceHash: sha256(program.text),
+      sourceType: program.sourceType,
+      replacements: [],
+      postconditions: [],
+    });
+  }
+  const file = files.get(program.relativePath);
+  file.replacements.push(replacement);
+  file.postconditions.push({
+    absent: beforeContainer,
+    present: afterContainer,
+    semanticId: replacement.semanticId,
+  });
+}
+
+function finishSemanticPlan(patchId, semanticTargets, files, diagnostics) {
+  const transformations = semanticTargets.flatMap(target => target.matches)
+    .filter(match => match.attributable !== false)
+    .map(match => ({
+      semanticId: targetIdForMatch(semanticTargets, match),
+      relativePath: match.relativePath,
+      start: match.start,
+      state: match.state,
+      before: match.before,
+      after: match.after,
+    }));
+  return {
+    patchId,
+    state: semanticTargets.every(target => target.matches.length === 1 && target.matches[0].state === 'after') ?
+      'already-patched' : 'needs-patch',
+    semanticTargets,
+    files: [...files.values()],
+    resources: [],
+    attribution: {transformations},
+    diagnostics,
+  };
+}
+
+function targetIdForMatch(semanticTargets, match) {
+  return semanticTargets.find(target => target.matches.includes(match))?.id || 'unknown';
+}
+
+function analyzeAutoMode(target) {
+  const files = new Map();
+  const modelMatches = [];
+  const modelSentinel = '/*CC_AUTO_MODE_MODEL_ELIGIBILITY*/return !0;';
+  const modelPrograms = candidatePrograms(target, ['claude-3-', 'CC_AUTO_MODE_MODEL_ELIGIBILITY']);
+  for (const program of modelPrograms) {
+    const functions = findAstNodes(program.ast, node => node.type === 'FunctionDeclaration' && node.params.length === 1);
+    for (const fn of functions) {
+      const body = program.text.slice(fn.body.start, fn.body.end);
+      if (body.startsWith(`{${modelSentinel}`)) {
+        const before = `{${body.slice(1 + modelSentinel.length)}`;
+        modelMatches.push({relativePath: program.relativePath, start: fn.body.start, end: fn.body.end,
+          state: 'after', before, after: body});
+        continue;
+      }
+      if (fn.end - fn.start > 800 || !body.includes('claude-3-') || !body.includes('firstParty') ||
+          (!body.includes('claude-opus-4-') && !body.includes('claude-sonnet-4-')) ||
+          booleanReturnCount(fn, false) < 2 || booleanReturnCount(fn, true) !== 1) continue;
+      const after = `{${modelSentinel}${body.slice(1)}`;
+      const match = {relativePath: program.relativePath, start: fn.body.start, end: fn.body.end,
+        state: 'before', before: body, after};
+      modelMatches.push(match);
+      addPlannedReplacement(files, program,
+        {start: fn.body.start, end: fn.body.end, text: after, semanticId: 'model-eligibility'}, body, after);
+    }
+  }
+
+  const failClosedMatches = [];
+  const failOpenSentinel = '/*CC_AUTO_MODE_FAIL_OPEN*/';
+  const failPrograms = candidatePrograms(target,
+    ['Auto mode classifier unavailable, denying with retry guidance (fail closed)', 'CC_AUTO_MODE_FAIL_OPEN']);
+  for (const program of failPrograms) {
+    const anchors = findAstNodes(program.ast, node => node.type === 'Literal' && typeof node.value === 'string' &&
+      node.value.includes('Auto mode classifier unavailable, denying with retry guidance (fail closed)'));
+    for (const anchor of anchors) {
+      const returned = enclosingNode(program.ast, anchor, 'ReturnStatement');
+      const argument = returned?.argument;
+      const decision = argument?.type === 'SequenceExpression' ? argument.expressions.at(-1) : argument;
+      const behavior = propertyNamed(decision, 'behavior')?.value;
+      if (decision?.type !== 'ObjectExpression' || behavior?.type !== 'Literal' ||
+          !['deny', 'ask'].includes(behavior.value)) continue;
+      const decisionSource = program.text.slice(decision.start, decision.end);
+      if (behavior.value === 'deny') {
+        const replacement = `"ask"${failOpenSentinel}`;
+        const after = replaceNodeSource(decision, behavior, replacement, program.text);
+        failClosedMatches.push({relativePath: program.relativePath, start: decision.start, end: decision.end,
+          state: 'before', before: decisionSource, after});
+        addPlannedReplacement(files, program,
+          {start: behavior.start, end: behavior.end, text: replacement, semanticId: 'classifier-fail-closed'},
+          decisionSource, after);
+      } else {
+        const attributable = decisionSource.includes(failOpenSentinel);
+        const before = attributable ? decisionSource.replace(`"ask"${failOpenSentinel}`, '"deny"') : '';
+        failClosedMatches.push({relativePath: program.relativePath, start: decision.start, end: decision.end,
+          state: 'after', before, after: decisionSource, attributable});
+      }
+    }
+  }
+
+  const classifierMatches = [];
+  const classifierGuard = 'if(process.env.CLAUDE_CLASSIFIER_MODEL)return{value:process.env.CLAUDE_CLASSIFIER_MODEL,src:"env"};';
+  const classifierPrograms = candidatePrograms(target,
+    ['tengu_auto_mode_config', 'modelByMainModel', 'CLAUDE_CLASSIFIER_MODEL']);
+  for (const program of classifierPrograms) {
+    const functions = findAstNodes(program.ast, node => node.type === 'FunctionDeclaration' && node.params.length === 0 &&
+      node.end - node.start < 1000);
+    for (const fn of functions) {
+      const body = program.text.slice(fn.body.start, fn.body.end);
+      const classifierShape = memberNamed(fn, 'model') && (
+        (body.includes('tengu_auto_mode_config') && fn.body.body.at(-1)?.type === 'ReturnStatement') ||
+        (body.includes('modelByMainModel') && body.includes('src:"default"')));
+      if (!classifierShape) continue;
+      if (body.startsWith(`{${classifierGuard}`)) {
+        const before = `{${body.slice(1 + classifierGuard.length)}`;
+        classifierMatches.push({relativePath: program.relativePath, start: fn.body.start, end: fn.body.end,
+          state: 'after', before, after: body});
+      } else if (!body.includes('process.env.CLAUDE_CLASSIFIER_MODEL')) {
+        const after = `{${classifierGuard}${body.slice(1)}`;
+        classifierMatches.push({relativePath: program.relativePath, start: fn.body.start, end: fn.body.end,
+          state: 'before', before: body, after});
+        addPlannedReplacement(files, program,
+          {start: fn.body.start, end: fn.body.end, text: after, semanticId: 'classifier-model-source'}, body, after);
+      }
+    }
+  }
+
+  const semanticTargets = [
+    {id: 'model-eligibility', expectedCardinality: 1, matches: modelMatches},
+    {id: 'classifier-fail-closed', expectedCardinality: 1, matches: failClosedMatches},
+    {id: 'classifier-model-source', expectedCardinality: 1, matches: classifierMatches},
+  ];
+  return finishSemanticPlan('auto-mode', semanticTargets, files, {
+    candidateFiles: [...new Set([...modelPrograms, ...failPrograms, ...classifierPrograms].map(item => item.relativePath))],
+  });
+}
+
+function analyzeKeybindings(target) {
+  const files = new Map();
+  const flagMatches = [];
+  const flagNotOneSentinel = '/*CC_KEYBINDINGS_FLAG_NOT1*/';
+  const flagFalseSentinel = '/*CC_KEYBINDINGS_FLAG_FALSE*/';
+  const flagPrograms = candidatePrograms(target,
+    ['tengu_keybinding_customization_release', 'CC_KEYBINDINGS_FLAG_NOT1', 'CC_KEYBINDINGS_FLAG_FALSE']);
+  for (const program of flagPrograms) {
+    const calls = findAstNodes(program.ast, node => node.type === 'CallExpression' && node.arguments?.length === 2 &&
+      node.arguments[0]?.type === 'Literal' && node.arguments[0].value === 'tengu_keybinding_customization_release');
+    for (const call of calls) {
+      const value = call.arguments[1];
+      const callSource = program.text.slice(call.start, call.end);
+      const disabled = value.type === 'Literal' && value.value === false ||
+        value.type === 'UnaryExpression' && value.operator === '!' && value.argument?.type === 'Literal' && value.argument.value === 1;
+      const enabled = value.type === 'Literal' && value.value === true ||
+        value.type === 'UnaryExpression' && value.operator === '!' && value.argument?.type === 'Literal' && value.argument.value === 0;
+      if (disabled) {
+        const beforeValue = program.text.slice(value.start, value.end);
+        const replacement = beforeValue === 'false' ? `true${flagFalseSentinel}` : `!0${flagNotOneSentinel}`;
+        const after = replaceNodeSource(call, value, replacement, program.text);
+        flagMatches.push({relativePath: program.relativePath, start: call.start, end: call.end,
+          state: 'before', before: callSource, after});
+        addPlannedReplacement(files, program,
+          {start: value.start, end: value.end, text: replacement, semanticId: 'custom-keybindings-enabled'},
+          callSource, after);
+      } else if (enabled) {
+        const fromNotOne = callSource.includes(flagNotOneSentinel);
+        const fromFalse = callSource.includes(flagFalseSentinel);
+        const attributable = fromNotOne || fromFalse;
+        const before = fromNotOne ? callSource.replace(`!0${flagNotOneSentinel}`, '!1') :
+          fromFalse ? callSource.replace(`true${flagFalseSentinel}`, 'false') : '';
+        flagMatches.push({relativePath: program.relativePath, start: call.start, end: call.end,
+          state: 'after', before, after: callSource, attributable});
+      }
+    }
+  }
+
+  const ctrlMatches = [];
+  const ctrlSentinel = '/*CC_KEYBINDINGS_CTRL_C*/';
+  const ctrlPrograms = candidatePrograms(target, ['"ctrl+c"', 'CC_KEYBINDINGS_CTRL_C']);
+  for (const program of ctrlPrograms) {
+    const globals = findAstNodes(program.ast, node => node.type === 'ObjectExpression' &&
+      propertyNamed(node, 'context')?.value?.type === 'Literal' && propertyNamed(node, 'context').value.value === 'Global');
+    for (const global of globals) {
+      const bindings = propertyNamed(global, 'bindings')?.value;
+      const ctrl = propertyNamed(bindings, 'ctrl+c');
+      if (bindings?.type !== 'ObjectExpression' || ctrl?.value?.type !== 'Literal' ||
+          !['app:interrupt', 'app:exit'].includes(ctrl.value.value)) continue;
+      const globalSource = program.text.slice(global.start, global.end);
+      if (ctrl.value.value === 'app:interrupt') {
+        const replacement = `"app:exit"${ctrlSentinel}`;
+        const after = replaceNodeSource(global, ctrl.value, replacement, program.text);
+        ctrlMatches.push({relativePath: program.relativePath, start: global.start, end: global.end,
+          state: 'before', before: globalSource, after});
+        addPlannedReplacement(files, program,
+          {start: ctrl.value.start, end: ctrl.value.end, text: replacement, semanticId: 'ctrl-c-exit-binding'},
+          globalSource, after);
+      } else {
+        const attributable = globalSource.includes(ctrlSentinel);
+        const before = attributable ? globalSource.replace(`"app:exit"${ctrlSentinel}`, '"app:interrupt"') : '';
+        ctrlMatches.push({relativePath: program.relativePath, start: global.start, end: global.end,
+          state: 'after', before, after: globalSource, attributable});
+      }
+    }
+  }
+
+  const semanticTargets = [
+    {id: 'custom-keybindings-enabled', expectedCardinality: 1, matches: flagMatches},
+    {id: 'ctrl-c-exit-binding', expectedCardinality: 1, matches: ctrlMatches},
+  ];
+  return finishSemanticPlan('keybindings', semanticTargets, files, {
+    candidateFiles: [...new Set([...flagPrograms, ...ctrlPrograms].map(item => item.relativePath))],
+  });
+}
+
 function analyzeContractFixture(target, patchId = '__contract__') {
   if (process.env.CC_PATCH_TESTING !== '1') throw new Error('internal contract analyzer is disabled');
   const allDefinitions = [
@@ -987,10 +1258,13 @@ function analyzerForPatch(patchId) {
       ['auto-mode', 'keybindings', 'voice-mode'].includes(patchId)) {
     return target => analyzeContractFixture(target, patchId);
   }
+  if (patchId === 'auto-mode') return analyzeAutoMode;
+  if (patchId === 'keybindings') return analyzeKeybindings;
   return null;
 }
 
 function registeredPatchIdsFor(patchId) {
+  if (patchId === '__contract__') return [patchId];
   const internalPatchIds = ['__contract-alpha__', '__contract-resource__'];
   const candidates = internalPatchIds.includes(patchId) ? internalPatchIds : patchIds;
   return candidates.filter(candidate => analyzerForPatch(candidate));
@@ -1759,7 +2033,7 @@ function ensureBaselineForPlan(target, plan) {
   const entryPath = path.relative(target.packageRoot, target.entryPath);
   if (!manifest) {
     const hasManagedState = plan.semanticTargets.some(semanticTarget =>
-      semanticTarget.matches.some(match => match.state === 'after'));
+      semanticTarget.matches.some(match => match.state === 'after' && match.attributable !== false));
     if (hasManagedState) throw new Error('patched or unknown state has no trusted baseline');
     const sentinel = findUntrustedPatchSentinel(target);
     if (sentinel) {
@@ -3040,11 +3314,13 @@ const allFuncDecls0 = findNodes(ast, n =>
     n.type === 'FunctionDeclaration' && n.params.length === 0
 );
 
-// Find the classifier model function: 0-param FuncDecl containing
-// "tengu_auto_mode_config" literal AND ?.model member access
+// Find the classifier model function: legacy builds read tengu_auto_mode_config
+// directly; split builds use a config helper and expose modelByMainModel.
 const classifierModelCandidates = allFuncDecls0.filter(fn => {
     const bodySrc = src(fn.body);
-    if (!bodySrc.includes('tengu_auto_mode_config')) return false;
+    const legacyShape = bodySrc.includes('tengu_auto_mode_config');
+    const splitShape = bodySrc.includes('modelByMainModel') && bodySrc.includes('src:"default"');
+    if (!legacyShape && !splitShape) return false;
 
     // Must have ?.model or .model access
     const modelAccess = findNodes(fn.body, n =>
@@ -3059,8 +3335,8 @@ const classifierModelCandidates = allFuncDecls0.filter(fn => {
     const lastStmt = stmts[stmts.length - 1];
     if (lastStmt.type !== 'ReturnStatement') return false;
 
-    // Should be a relatively small function (< 500 bytes)
-    if (fn.end - fn.start > 500) return false;
+    // Should be a relatively small selector, not a classifier request function.
+    if (fn.end - fn.start > 1000) return false;
 
     return true;
 });

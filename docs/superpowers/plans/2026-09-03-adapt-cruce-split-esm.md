@@ -506,7 +506,7 @@ git commit -m "feat: restore one patch from package baseline"
 
 **Interfaces:** Produces Auto `model-eligibility`, `classifier-fail-closed`, `classifier-model-source`; Keybindings `custom-keybindings-enabled`, `ctrl-c-exit-binding`.
 
-- [ ] **Step 1: 写跨模块 fixture**
+- [x] **Step 1: 写跨模块 fixture**
 
 ```bash
 fixture_add_module "$tmp/new" chunks/auto-gate.js 'export function modelEligible(m){return m.includes("claude-3-")?false:true}'
@@ -515,13 +515,13 @@ fixture_assert_lifecycle "$tmp/new" auto-mode
 fixture_assert_lifecycle "$tmp/new" keybindings
 ```
 
-- [ ] **Step 2: 确认红灯**
+- [x] **Step 2: 确认红灯**
 
 Run: `bash tests/test_dual_layout_lifecycle.sh auto-mode keybindings && bash tests/test_auto_mode_engine.sh`
 
 Expected: FAIL；split chunks 未产生跨文件计划。
 
-- [ ] **Step 3: 迁移两个 analyzer**
+- [x] **Step 3: 迁移两个 analyzer**
 
 ```javascript
 const autoTargets = ['model-eligibility', 'classifier-fail-closed', 'classifier-model-source'];
@@ -529,13 +529,13 @@ const keyTargets = ['custom-keybindings-enabled', 'ctrl-c-exit-binding'];
 // 上游默认开启 custom keybindings 时，第一个 target 是 semantic-satisfied。
 ```
 
-- [ ] **Step 4: 复跑**
+- [x] **Step 4: 复跑**
 
 Run: `bash tests/test_dual_layout_lifecycle.sh auto-mode keybindings && bash tests/test_auto_mode_engine.sh`
 
 Expected: PASS；两种布局均完成 clean check、apply、复检、二次 apply 不变、restore 相同。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add cc-patch-manager.sh tests/test_dual_layout_lifecycle.sh tests/test_auto_mode_engine.sh

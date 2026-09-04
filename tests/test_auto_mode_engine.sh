@@ -129,5 +129,34 @@ rm -f "$generated"
 [[ "$(cat /tmp/failclosed-recheck.txt)" == *"ALREADY_PATCHED"* ]] || \
   fail "fail-closed recheck must report ALREADY_PATCHED (output: $(cat /tmp/failclosed-recheck.txt))"
 
+# cruce 2.1.259 moved classifier selection to a richer function that supports
+# modelByMainModel and returns {value,src}. The environment override must retain
+# that return shape so downstream callers can continue reading `.value`.
+cat >"$tmp/modern-classifier.js" <<'JS'
+function normalizeModel(e){return e}
+function currentProvider(){return "firstParty"}
+function providerEnabled(){return true}
+function modelEligible(e){let n=normalizeModel(e),r=currentProvider();if(!providerEnabled(r))return!1;if(n.includes("claude-3-")||n==="claude-opus-4-0"||n==="claude-sonnet-4-0")return!1;if(r!=="firstParty"&&n.includes("haiku"))return!1;return!0}
+function log(m,o){return m}
+function decide(ft,Ye,C){if(ft.unavailable){if(Ye)return log("Auto mode classifier unavailable for AskUserQuestion, falling back to the question dialog",{level:"warn"}),C;return log("Auto mode classifier unavailable, denying with retry guidance (fail closed)",{level:"warn"}),{behavior:"deny",decisionReason:{type:"classifier",classifier:"auto-mode",reason:"unavailable"},message:"retry"}}}
+function currentModel(){return "main"}
+function autoConfig(){return {modelByMainModel:{},model:"classifier"}}
+function selectModel(){return undefined}
+function validateModel(e){return e}
+function probeState(){return "demoted"}
+function externalDefault(){return undefined}
+function fallbackModel(e){return e}
+function classifierModel(){let e=currentModel(),n=autoConfig(),r=selectModel(n?.modelByMainModel)??validateModel(n?.model);if(r)return{value:r,src:"gb"};if(probeState()!=="demoted"){let o=externalDefault(e);if(o)return{value:o,src:"default",externalDefault:!0}}return{value:fallbackModel(e),src:"default"}}
+JS
+
+generated=$(write_patch_script auto-mode)
+CC_PATCH_SKIP_BACKUP=1 CC_PATCH_BASELINE="$tmp/modern-classifier.js.cc-patch-baseline" \
+  node "$generated" "$ACORN_PATH" "$tmp/modern-classifier.js" >/tmp/modern-classifier-out.txt 2>&1 || \
+  fail "modern classifier apply failed: $(cat /tmp/modern-classifier-out.txt)"
+rm -f "$generated"
+grep -Fq 'if(process.env.CLAUDE_CLASSIFIER_MODEL)return{value:process.env.CLAUDE_CLASSIFIER_MODEL,src:"env"}' \
+  "$tmp/modern-classifier.js" || fail 'modern classifier selector did not gain a shape-preserving env override'
+
 printf 'PASS: auto-mode retains legacy and flat model-gate detectors\n'
 printf 'PASS: auto-mode patches only the fail-closed deny path, never the fall-back\n'
+printf 'PASS: auto-mode supports the cruce modelByMainModel classifier selector\n'
