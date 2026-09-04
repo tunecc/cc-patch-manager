@@ -95,7 +95,13 @@ fixture_assert_real_lifecycle() {
 }
 
 accept_package() {
-  local source="$1" name="$2" version="$3" entry copy before output id
+  local source="$1" name="$2" version="$3" entry copy before output id source_before source_after
+  # Source-protection guard: the acceptance operates on a COPY, so the source
+  # package (e.g. the global cruce install) must be byte-for-byte unchanged before
+  # vs after. This catches any future refactor that points the entry at the source
+  # instead of the copy, or lets runtime_exec write baseline/transaction state
+  # into the wrong package root.
+  source_before=$(fixture_hash_package "$source")
   copy=$(mktemp -d)/package
   cp -R "$source" "$copy"
   entry="$copy/cli.js"
@@ -129,6 +135,8 @@ accept_package() {
   output=$(runtime_exec restore-all "$entry" 2>&1) || fail "restore-all failed: $output"
   grep -Fxq 'RESTORED:all' <<<"$output" || fail "restore-all did not report RESTORED:all: $output"
   fixture_assert_tree_equals "$before" "$(fixture_hash_package "$copy")"
+  source_after=$(fixture_hash_package "$source")
+  fixture_assert_tree_equals "$source_before" "$source_after"
 }
 
 accept_package "$source_root" "$expected_name" "$expected_version"
