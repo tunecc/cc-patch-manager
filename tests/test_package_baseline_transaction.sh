@@ -555,7 +555,7 @@ cmp -s "$restore_combo/assets/model.bin" "$restore_combo/vendor/cometix-asr/mode
 
 restore_shared="$tmp/restore-shared"
 fixture_make_package "$restore_shared" split-esm '@cometix/anthropic-cc' 2.1.259
-fixture_add_module "$restore_shared" chunks/shared.js 'export const alpha="CC_BEFORE_ALPHA",beta="CC_BEFORE_BETA",gamma="CC_BEFORE_GAMMA"'
+fixture_add_module "$restore_shared" chunks/shared.js 'export const alpha="CC_BEFORE_ALPHA",beta="CC_BEFORE_BETA",gamma="CC_BEFORE_GAMMA",delta="CC_BEFORE_DELTA",epsilon="CC_BEFORE_EPSILON"'
 fixture_add_module "$restore_shared" cli.js '#!/usr/bin/env node
 import "./chunks/shared.js"'
 fixture_add_module "$restore_shared" assets/model.bin 'voice-resource'
@@ -569,9 +569,45 @@ grep -Fq 'CC_AFTER_ALPHA' "$restore_shared/chunks/shared.js" || fail 'shared-fil
 grep -Fq 'CC_BEFORE_BETA' "$restore_shared/chunks/shared.js" || fail 'shared-file removed transformation was reapplied'
 [[ ! -e "$restore_shared/vendor/cometix-asr" ]] || fail 'production-id restore retained an absent-baseline resource directory'
 
+restore_new_ids="$tmp/restore-new-production-ids"
+fixture_make_package "$restore_new_ids" split-esm '@cometix/anthropic-cc' 2.1.259
+fixture_add_module "$restore_new_ids" chunks/shared.js 'export const alpha="CC_BEFORE_ALPHA",beta="CC_BEFORE_BETA",gamma="CC_BEFORE_GAMMA",delta="CC_BEFORE_DELTA",epsilon="CC_BEFORE_EPSILON"'
+fixture_add_module "$restore_new_ids" cli.js '#!/usr/bin/env node
+import "./chunks/shared.js"'
+fixture_add_module "$restore_new_ids" assets/model.bin 'voice-resource'
+printf '\n// CC_CONTRACT_RESOURCE:assets/model.bin->vendor/cometix-asr/model.bin\n' >>"$restore_new_ids/cli.js"
+for production_id in auto-mode transcript-dialog ultracode voice-mode; do
+  CC_PATCH_TESTING=1 CC_PATCH_TEST_PRODUCTION_IDS=1 runtime_exec apply "$(fixture_entry "$restore_new_ids")" "$production_id" >/dev/null 2>&1 ||
+    fail "production-id coexistence could not apply $production_id"
+done
+CC_PATCH_TESTING=1 CC_PATCH_TEST_PRODUCTION_IDS=1 runtime_exec restore "$(fixture_entry "$restore_new_ids")" transcript-dialog >/dev/null 2>&1 ||
+  fail 'production-id coexistence could not restore transcript-dialog'
+CC_PATCH_TESTING=1 CC_PATCH_TEST_PRODUCTION_IDS=1 runtime_exec check "$(fixture_entry "$restore_new_ids")" transcript-dialog | grep -Fxq 'NEEDS_PATCH' ||
+  fail 'production-id coexistence retained transcript-dialog'
+for retained_id in auto-mode ultracode voice-mode; do
+  CC_PATCH_TESTING=1 CC_PATCH_TEST_PRODUCTION_IDS=1 runtime_exec check "$(fixture_entry "$restore_new_ids")" "$retained_id" | grep -Fxq 'ALREADY_PATCHED' ||
+    fail "restoring transcript-dialog lost $retained_id"
+done
+CC_PATCH_TESTING=1 CC_PATCH_TEST_PRODUCTION_IDS=1 runtime_exec restore "$(fixture_entry "$restore_new_ids")" ultracode >/dev/null 2>&1 ||
+  fail 'production-id coexistence could not restore ultracode'
+CC_PATCH_TESTING=1 CC_PATCH_TEST_PRODUCTION_IDS=1 runtime_exec check "$(fixture_entry "$restore_new_ids")" ultracode | grep -Fxq 'NEEDS_PATCH' ||
+  fail 'production-id coexistence retained ultracode'
+for retained_id in auto-mode voice-mode; do
+  CC_PATCH_TESTING=1 CC_PATCH_TEST_PRODUCTION_IDS=1 runtime_exec check "$(fixture_entry "$restore_new_ids")" "$retained_id" | grep -Fxq 'ALREADY_PATCHED' ||
+    fail "restoring ultracode lost $retained_id"
+done
+for production_id in auto-mode voice-mode; do
+  CC_PATCH_TESTING=1 CC_PATCH_TEST_PRODUCTION_IDS=1 runtime_exec restore "$(fixture_entry "$restore_new_ids")" "$production_id" >/dev/null 2>&1 ||
+    fail "production-id coexistence could not restore $production_id"
+done
+grep -Fq 'CC_BEFORE_ALPHA' "$restore_new_ids/chunks/shared.js" || fail 'production-id coexistence did not restore auto-mode bytes'
+grep -Fq 'CC_BEFORE_DELTA' "$restore_new_ids/chunks/shared.js" || fail 'production-id coexistence did not restore transcript-dialog bytes'
+grep -Fq 'CC_BEFORE_EPSILON' "$restore_new_ids/chunks/shared.js" || fail 'production-id coexistence did not restore ultracode bytes'
+[[ ! -e "$restore_new_ids/vendor/cometix-asr" ]] || fail 'production-id coexistence did not restore VoiceMode resource absence'
+
 restore_reapply="$tmp/restore-reapply"
 fixture_make_package "$restore_reapply" split-esm '@cometix/anthropic-cc' 2.1.259
-fixture_add_module "$restore_reapply" chunks/shared.js 'export const alpha="CC_BEFORE_ALPHA",beta="CC_BEFORE_BETA",gamma="CC_BEFORE_GAMMA"'
+fixture_add_module "$restore_reapply" chunks/shared.js 'export const alpha="CC_BEFORE_ALPHA",beta="CC_BEFORE_BETA",gamma="CC_BEFORE_GAMMA",delta="CC_BEFORE_DELTA",epsilon="CC_BEFORE_EPSILON"'
 fixture_add_module "$restore_reapply" cli.js '#!/usr/bin/env node
 import "./chunks/shared.js"'
 fixture_add_module "$restore_reapply" assets/model.bin 'voice-resource'

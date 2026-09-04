@@ -1129,20 +1129,499 @@ function analyzeKeybindings(target) {
   });
 }
 
+function reversibleBodyMarker(id, original, modified) {
+  return `/*CC_${id}:${Buffer.from(original).toString('base64')}:${sha256(modified)}*/`;
+}
+
+function decodeReversibleBody(body, id) {
+  const matches = [...body.matchAll(new RegExp(`/\\*CC_${id}:([A-Za-z0-9+/=]+):([a-f0-9]{64})\\*/`, 'g'))];
+  if (matches.length !== 1) return null;
+  const match = matches[0];
+  try {
+    const original = Buffer.from(match[1], 'base64').toString('utf8');
+    if (Buffer.from(original).toString('base64') !== match[1] || sha256(body.replace(match[0], '')) !== match[2]) return null;
+    return original;
+  } catch {
+    return null;
+  }
+}
+
+function bodyPatch(files, program, fn, semanticId, markerId, modifiedBody) {
+  const before = program.text.slice(fn.body.start, fn.body.end);
+  const after = `{${reversibleBodyMarker(markerId, before, modifiedBody)}${modifiedBody.slice(1)}`;
+  addPlannedReplacement(files, program,
+    {start: fn.body.start, end: fn.body.end, text: after, semanticId}, before, after);
+  return {relativePath: program.relativePath, start: fn.body.start, end: fn.body.end,
+    state: 'before', before, after};
+}
+
+function reconstructedBodyMatch(program, fn, markerId, renderModifiedBody) {
+  const after = program.text.slice(fn.body.start, fn.body.end);
+  const before = decodeReversibleBody(after, markerId);
+  if (before === null) return null;
+  const parameters = fn.params.map(param => program.text.slice(param.start, param.end)).join(',');
+  const text = `function __CC_RECONSTRUCT(${parameters})${before}`;
+  let ast;
+  try {
+    ast = acorn.parse(text, {ecmaVersion: 'latest', sourceType: 'script'});
+  } catch {
+    return null;
+  }
+  const originalFunction = ast.body[0];
+  if (originalFunction?.type !== 'FunctionDeclaration') return null;
+  const modified = renderModifiedBody({...program, text, ast}, originalFunction);
+  if (typeof modified !== 'string') return null;
+  const expected = `{${reversibleBodyMarker(markerId, before, modified)}${modified.slice(1)}`;
+  if (after !== expected) return null;
+  return {relativePath: program.relativePath, start: fn.body.start, end: fn.body.end,
+    state: 'after', before, after};
+}
+
+function functionLikeNodes(ast) {
+  return findAstNodes(ast, node => ['FunctionDeclaration', 'FunctionExpression', 'ArrowFunctionExpression'].includes(node.type));
+}
+
+function propertyFunction(property) {
+  return property?.value && ['FunctionExpression', 'ArrowFunctionExpression'].includes(property.value.type) ? property.value : null;
+}
+
+function memberCall(node, objectName, propertyName) {
+  return node?.type === 'CallExpression' && node.callee?.type === 'MemberExpression' &&
+    node.callee.object?.type === 'Identifier' && node.callee.object.name === objectName &&
+    (node.callee.property?.name === propertyName || node.callee.property?.value === propertyName);
+}
+
+function dialogFactoryShape(program, fn) {
+  if (fn.params.length !== 0 || fn.body?.type !== 'BlockStatement') return null;
+  if (fn.body.body.length !== 2) return null;
+  const [declaration, returned] = fn.body.body;
+  if (declaration.type !== 'VariableDeclaration' || ![5, 6].includes(declaration.declarations.length) ||
+      !declaration.declarations.every(item => item.id?.type === 'Identifier') ||
+      returned.type !== 'ReturnStatement' || returned.argument?.type !== 'ObjectExpression') return null;
+  if (!declaration || !returned) return null;
+  const declarations = declaration.declarations;
+  if (!declarations.slice(0, 3).every(item => item.init?.type === 'CallExpression') ||
+      declarations[3].init?.type !== 'NewExpression' || declarations[3].init.callee?.name !== 'Map' ||
+      declarations[4].init?.type !== 'Literal' || declarations[4].init.value !== 0) return null;
+  const [eventSignal, cancelSignal, updateSignal, pendingMap, counter] = declarations.slice(0, 5).map(item => item.id.name);
+  const subscriber = declarations[5]?.init?.type === 'Literal' && declarations[5].init.value === 0 ? declarations[5].id?.name : null;
+  if (declarations.length === 6 && !subscriber) return null;
+  const properties = new Map(returned.argument.properties.map(property => [property.key?.name || property.key?.value, property]));
+  if (returned.argument.properties.length !== 5 || properties.size !== 5 ||
+      !['subscribe', 'onCancel', 'onUpdate', 'reply', 'request'].every(name => properties.has(name))) return null;
+  if (program.text.slice(properties.get('onCancel').value.start, properties.get('onCancel').value.end) !== `${cancelSignal}.subscribe` ||
+      program.text.slice(properties.get('onUpdate').value.start, properties.get('onUpdate').value.end) !== `${updateSignal}.subscribe`) return null;
+  const reply = propertyFunction(properties.get('reply'));
+  const request = propertyFunction(properties.get('request'));
+  if (!reply || !request || request.params.length !== 2 || request.params[1]?.type !== 'Identifier') return null;
+  const subscribeProperty = properties.get('subscribe');
+  const directSubscribe = program.text.slice(subscribeProperty.value.start, subscribeProperty.value.end) === `${eventSignal}.subscribe`;
+  const subscribe = propertyFunction(subscribeProperty);
+  if (directSubscribe ? subscriber !== null : !subscribe || !subscriber || subscribe.body?.body?.length !== 3 ||
+      findAstNodes(subscribe, node => memberCall(node, eventSignal, 'subscribe')).length !== 1 ||
+      findAstNodes(subscribe, node => node.type === 'AssignmentExpression' && node.left?.name === subscriber &&
+        node.operator === '+=').length !== 1 ||
+      findAstNodes(subscribe, node => node.type === 'AssignmentExpression' && node.left?.name === subscriber &&
+        node.operator === '-=').length !== 1) return null;
+  if (reply.body?.type !== 'BlockStatement' || reply.body.body.length !== 3 ||
+      findAstNodes(reply, node => memberCall(node, pendingMap, 'get')).length !== 1 ||
+      findAstNodes(reply, node => memberCall(node, pendingMap, 'delete')).length !== 1) return null;
+  if (request.body?.type !== 'BlockStatement' || request.body.body.length !== 6 ||
+      request.body.body[0].type !== 'ExpressionStatement' || request.body.body[1].type !== 'VariableDeclaration' ||
+      request.body.body[2].type !== 'IfStatement' || request.body.body[3].type !== 'VariableDeclaration' ||
+      request.body.body[4].type !== 'IfStatement' || request.body.body[5].type !== 'ReturnStatement' ||
+      findAstNodes(request.body.body[0], node => node.type === 'AssignmentExpression' &&
+        node.left?.name === counter && node.operator === '+=').length !== 1 ||
+      findAstNodes(request.body.body[4], node => memberCall(node, pendingMap, 'set')).length !== 1 ||
+      findAstNodes(request.body.body[4], node => memberCall(node, cancelSignal, 'emit')).length !== 1 ||
+      findAstNodes(request.body.body[4], node => node.type === 'CallExpression' &&
+        (node.callee?.property?.name === 'addEventListener' || node.callee?.property?.value === 'addEventListener')).length !== 1 ||
+      findAstNodes(request.body.body[5], node => memberCall(node, eventSignal, 'emit')).length !== 1 ||
+      findAstNodes(request.body.body[5], node => memberCall(node, updateSignal, 'emit')).length !== 1) return null;
+  const deferred = findAstNodes(request, node => node.type === 'VariableDeclarator' && node.id?.type === 'ObjectPattern' &&
+    node.id.properties.some(property => (property.key?.name || property.key?.value) === 'promise') &&
+    node.id.properties.some(property => (property.key?.name || property.key?.value) === 'resolve') &&
+    node.init?.type === 'CallExpression')[0];
+  const idDeclaration = findAstNodes(request, node => node.type === 'VariableDeclarator' && node.id?.type === 'Identifier' &&
+    node.init?.type === 'TemplateLiteral' && node.init.quasis?.some(quasi => quasi.value.raw.includes('dialog-')))[0];
+  const signalDeclaration = findAstNodes(request, node => node.type === 'VariableDeclarator' && node.id?.type === 'Identifier' &&
+    node.init?.type === 'ChainExpression' && memberNamed(node.init, 'signal'))[0] ||
+    findAstNodes(request, node => node.type === 'VariableDeclarator' && node.id?.type === 'Identifier' && memberNamed(node.init, 'signal'))[0];
+  const emit = findAstNodes(request, node => memberCall(node, eventSignal, 'emit') && node.arguments[0]?.type === 'ObjectExpression')[0];
+  if (!deferred || !idDeclaration || !signalDeclaration || !emit) return null;
+  const promiseProperty = deferred.id.properties.find(property => (property.key?.name || property.key?.value) === 'promise');
+  const resolveProperty = deferred.id.properties.find(property => (property.key?.name || property.key?.value) === 'resolve');
+  const promiseName = promiseProperty?.value?.name || promiseProperty?.key?.name;
+  const resolveName = resolveProperty?.value?.name || resolveProperty?.key?.name;
+  if (!promiseName || !resolveName) return null;
+  return {
+    declaration, eventSignal, cancelSignal, updateSignal, pendingMap, counter, subscriber,
+    factories: declarations.slice(0, 3).map(item => program.text.slice(item.init.start, item.init.end)),
+    reply, request, requestParams: request.params.map(param => program.text.slice(param.start, param.end)),
+    optionsName: request.params[1].name, idName: idDeclaration.id.name, promiseName, resolveName,
+    deferredFactory: program.text.slice(deferred.init.callee.start, deferred.init.callee.end),
+    signalName: signalDeclaration.id.name, eventSource: program.text.slice(emit.arguments[0].start, emit.arguments[0].end),
+  };
+}
+
+function renderDialogFactoryBody(shape) {
+  const [eventFactory, cancelFactory, updateFactory] = shape.factories;
+  const subscriberDeclaration = shape.subscriber ? `,${shape.subscriber}=0` : '';
+  const subscribeAccounting = shape.subscriber ?
+    `${shape.subscriber}+=1;let CC_DIALOG_FIX_unsub=${shape.eventSignal}.subscribe(CC_DIALOG_FIX_listener),CC_DIALOG_FIX_closed=!1;` :
+    `let CC_DIALOG_FIX_unsub=${shape.eventSignal}.subscribe(CC_DIALOG_FIX_listener);`;
+  const unsubscribe = shape.subscriber ?
+    `return()=>{if(CC_DIALOG_FIX_closed)return;CC_DIALOG_FIX_closed=!0,${shape.subscriber}-=1,CC_DIALOG_FIX_unsub()}` :
+    'return CC_DIALOG_FIX_unsub';
+  const [requestInput, requestOptions] = shape.requestParams;
+  return `{let ${shape.eventSignal}=${eventFactory},${shape.cancelSignal}=${cancelFactory},${shape.updateSignal}=${updateFactory},${shape.pendingMap}=new Map,${shape.counter}=0${subscriberDeclaration};return{subscribe(CC_DIALOG_FIX_listener){${subscribeAccounting}for(let CC_DIALOG_FIX_entry of ${shape.pendingMap}.values())queueMicrotask(()=>{if(${shape.pendingMap}.has(CC_DIALOG_FIX_entry.id))CC_DIALOG_FIX_listener(CC_DIALOG_FIX_entry.event)});${unsubscribe}},onCancel:${shape.cancelSignal}.subscribe,onUpdate:${shape.updateSignal}.subscribe,reply(CC_DIALOG_FIX_reply){let CC_DIALOG_FIX_entry=${shape.pendingMap}.get(CC_DIALOG_FIX_reply.id);if(!CC_DIALOG_FIX_entry)return;${shape.pendingMap}.delete(CC_DIALOG_FIX_reply.id),CC_DIALOG_FIX_entry.resolve(CC_DIALOG_FIX_reply)},request(${requestInput},${requestOptions}){${shape.counter}+=1;let ${shape.idName}=\`dialog-\${${shape.counter}}\`,{promise:${shape.promiseName},resolve:${shape.resolveName}}=${shape.deferredFactory}(),${shape.signalName}=${shape.optionsName}?.signal;if(${shape.signalName}?.aborted)return queueMicrotask(()=>${shape.resolveName}({id:${shape.idName},cancelled:!0})),{id:${shape.idName},replied:${shape.promiseName},update:()=>{}};let CC_DIALOG_FIX_abort,CC_DIALOG_FIX_event=${shape.eventSource};if(${shape.pendingMap}.set(${shape.idName},{id:${shape.idName},event:CC_DIALOG_FIX_event,resolve:(CC_DIALOG_FIX_value)=>{if(${shape.signalName}&&CC_DIALOG_FIX_abort)${shape.signalName}.removeEventListener("abort",CC_DIALOG_FIX_abort);${shape.resolveName}(CC_DIALOG_FIX_value)}}),${shape.signalName})CC_DIALOG_FIX_abort=()=>{if(${shape.pendingMap}.delete(${shape.idName}))${shape.resolveName}({id:${shape.idName},cancelled:!0}),${shape.cancelSignal}.emit(${shape.idName})},${shape.signalName}.addEventListener("abort",CC_DIALOG_FIX_abort,{once:!0});return ${shape.eventSignal}.emit(CC_DIALOG_FIX_event),{id:${shape.idName},replied:${shape.promiseName},update:(CC_DIALOG_FIX_payload)=>{let CC_DIALOG_FIX_entry=${shape.pendingMap}.get(${shape.idName});if(CC_DIALOG_FIX_entry){CC_DIALOG_FIX_entry.event={...CC_DIALOG_FIX_entry.event,payload:CC_DIALOG_FIX_payload};${shape.updateSignal}.emit({id:${shape.idName},payload:CC_DIALOG_FIX_payload})}}}}}}`;
+}
+
+function statementExpressionList(statement) {
+  if (statement?.type === 'ExpressionStatement') {
+    return statement.expression.type === 'SequenceExpression' ? statement.expression.expressions : [statement.expression];
+  }
+  if (statement?.type === 'BlockStatement' && statement.body.length === 1) return statementExpressionList(statement.body[0]);
+  return [];
+}
+
+function renderDialogCleanupBody(program, loop, loopVariable) {
+  const expressions = statementExpressionList(loop.body);
+  if (expressions.length !== 2) return null;
+  const dismiss = expressions.find(expression => memberCall(expression, expression.callee?.object?.name, 'dismiss') &&
+    expression.arguments.length === 1 && expression.arguments[0]?.name === loopVariable);
+  const reply = expressions.find(expression => memberCall(expression, expression.callee?.object?.name, 'reply') &&
+    propertyNamed(expression.arguments[0], 'id')?.value?.name === loopVariable &&
+    propertyNamed(expression.arguments[0], 'cancelled')?.value?.type === 'UnaryExpression' &&
+    propertyNamed(expression.arguments[0], 'cancelled').value.operator === '!' &&
+    propertyNamed(expression.arguments[0], 'cancelled').value.argument?.type === 'Literal' &&
+    propertyNamed(expression.arguments[0], 'cancelled').value.argument.value === 0);
+  if (!dismiss || !reply || dismiss === reply) return null;
+  return `{${program.text.slice(dismiss.start, dismiss.end)};}`;
+}
+
+function reconstructedDialogCleanupMatch(program, loop, loopVariable) {
+  const after = program.text.slice(loop.body.start, loop.body.end);
+  const before = decodeReversibleBody(after, 'DIALOG_FIX_HOST_CLEANUP');
+  if (before === null) return null;
+  const text = `for(const ${loopVariable} of [])${before}`;
+  let ast;
+  try {
+    ast = acorn.parse(text, {ecmaVersion: 'latest', sourceType: 'script'});
+  } catch {
+    return null;
+  }
+  const originalLoop = ast.body[0];
+  if (originalLoop?.type !== 'ForOfStatement') return null;
+  const modified = renderDialogCleanupBody({...program, text, ast}, originalLoop, loopVariable);
+  if (modified === null) return null;
+  const expected = `${modified.slice(0, -1)}${reversibleBodyMarker('DIALOG_FIX_HOST_CLEANUP', before, modified)}}`;
+  if (after !== expected) return null;
+  return {relativePath: program.relativePath, start: loop.body.start, end: loop.body.end,
+    state: 'after', before, after};
+}
+
+function enclosingFunctionWith(node, functions, predicate) {
+  return functions.filter(fn => fn.start <= node.start && node.end <= fn.end && predicate(fn))
+    .sort((left, right) => (left.end - left.start) - (right.end - right.start))[0] || null;
+}
+
+function analyzeTranscriptDialog(target) {
+  const files = new Map();
+  const factoryMatches = [];
+  const factoryPrograms = candidatePrograms(target, ['dialog-', 'CC_DIALOG_FIX_CHANNEL_FACTORY']);
+  for (const program of factoryPrograms) {
+    for (const fn of functionLikeNodes(program.ast)) {
+      const body = program.text.slice(fn.body.start, fn.body.end);
+      const patched = reconstructedBodyMatch(program, fn, 'DIALOG_FIX_CHANNEL_FACTORY',
+        (originalProgram, originalFunction) => {
+          const shape = dialogFactoryShape(originalProgram, originalFunction);
+          return shape ? renderDialogFactoryBody(shape) : null;
+        });
+      if (patched) {
+        factoryMatches.push(patched);
+        continue;
+      }
+      if (body.includes('CC_DIALOG_FIX_CHANNEL_FACTORY:')) continue;
+      const shape = dialogFactoryShape(program, fn);
+      if (!shape) continue;
+      factoryMatches.push(bodyPatch(files, program, fn, 'dialog-channel-factory',
+        'DIALOG_FIX_CHANNEL_FACTORY', renderDialogFactoryBody(shape)));
+    }
+  }
+
+  const cleanupMatches = [];
+  const cleanupPrograms = candidatePrograms(target, ['onClosed', 'CC_DIALOG_FIX_HOST_CLEANUP']);
+  for (const program of cleanupPrograms) {
+    const functions = functionLikeNodes(program.ast);
+    const seenLoops = new Set();
+    for (const loop of findAstNodes(program.ast, node => node.type === 'ForOfStatement')) {
+      if (seenLoops.has(loop.start)) continue;
+      const host = enclosingFunctionWith(loop, functions, fn => memberNamed(fn, 'onClosed') && memberNamed(fn, 'subscribe'));
+      if (!host) continue;
+      const loopBody = program.text.slice(loop.body.start, loop.body.end);
+      const loopVariable = loop.left?.type === 'VariableDeclaration' ? loop.left.declarations?.[0]?.id?.name : null;
+      if (!loopVariable) continue;
+      const patched = reconstructedDialogCleanupMatch(program, loop, loopVariable);
+      if (patched) {
+        cleanupMatches.push(patched);
+        seenLoops.add(loop.start);
+        continue;
+      }
+      if (loopBody.includes('CC_DIALOG_FIX_HOST_CLEANUP:')) {
+        seenLoops.add(loop.start);
+        continue;
+      }
+      const modified = renderDialogCleanupBody(program, loop, loopVariable);
+      if (modified === null) continue;
+      const before = loopBody;
+      const after = `${modified.slice(0, -1)}${reversibleBodyMarker('DIALOG_FIX_HOST_CLEANUP', before, modified)}}`;
+      cleanupMatches.push({relativePath: program.relativePath, start: loop.body.start, end: loop.body.end,
+        state: 'before', before, after});
+      addPlannedReplacement(files, program,
+        {start: loop.body.start, end: loop.body.end, text: after, semanticId: 'host-cleanup'}, before, after);
+      seenLoops.add(loop.start);
+    }
+  }
+
+  const semanticTargets = [
+    {id: 'dialog-channel-factory', expectedCardinality: 1, matches: factoryMatches},
+    {id: 'host-cleanup', expectedCardinality: 1, matches: cleanupMatches},
+  ];
+  return finishSemanticPlan('transcript-dialog', semanticTargets, files, {
+    candidateFiles: [...new Set([...factoryPrograms, ...cleanupPrograms].map(item => item.relativePath))],
+  });
+}
+
+function literalComparison(node, value) {
+  if (node?.type !== 'BinaryExpression' || node.operator !== '===') return false;
+  return node.left?.type === 'Literal' && node.left.value === value ||
+    node.right?.type === 'Literal' && node.right.value === value;
+}
+
+function bindingKey(binding) {
+  return binding ? `${binding.file}:${binding.exportedName}` : '';
+}
+
+function resolvedCallBinding(index, absoluteFile, call) {
+  if (call?.type !== 'CallExpression' || call.callee?.type !== 'Identifier') return null;
+  try {
+    return index.resolveLocal(absoluteFile, call.callee.name);
+  } catch {
+    return null;
+  }
+}
+
+function localNameForBinding(index, absoluteFile, binding) {
+  const record = index.load(absoluteFile);
+  for (const localName of record.locals.keys()) {
+    try {
+      if (bindingKey(index.resolveLocal(absoluteFile, localName)) === bindingKey(binding)) return localName;
+    } catch {}
+  }
+  return null;
+}
+
+function discoverEffortGate(target, index, literal) {
+  const programs = candidatePrograms(target, [literal]);
+  const matches = [];
+  for (const program of programs) {
+    const absoluteFile = packageFile(target.packageRoot, program.relativePath);
+    for (const fn of findAstNodes(program.ast, node => node.type === 'FunctionDeclaration' && node.id?.name && node.params.length === 1)) {
+      const calls = findAstNodes(fn.body, node => node.type === 'CallExpression' &&
+        node.arguments?.[1]?.type === 'Literal' && node.arguments[1].value === literal);
+      if (calls.length > 0) matches.push({program, fn, binding: index.resolveLocal(absoluteFile, fn.id.name)});
+    }
+  }
+  return {programs, matches};
+}
+
+function bindingCallsTarget(index, binding, targetBinding, remainingDepth, seen = new Set()) {
+  if (bindingKey(binding) === bindingKey(targetBinding)) return true;
+  if (!binding || remainingDepth === 0 || seen.has(bindingKey(binding))) return false;
+  const nextSeen = new Set(seen).add(bindingKey(binding));
+  let parsed;
+  try {
+    parsed = parseProgram(binding.file, 'module');
+  } catch {
+    return false;
+  }
+  const fn = findAstNodes(parsed.ast, node => node.type === 'FunctionDeclaration' &&
+    node.id?.name === binding.exportedName)[0];
+  if (!fn) return false;
+  return findAstNodes(fn.body, node => node.type === 'CallExpression' && node.callee?.type === 'Identifier')
+    .some(call => {
+      const called = resolvedCallBinding(index, binding.file, call);
+      return called && bindingCallsTarget(index, called, targetBinding, remainingDepth - 1, nextSeen);
+    });
+}
+
+function renderUltracodeEligibility(program, fn, index, absoluteFile, xhighBinding, maxLocalName) {
+  const eligibilityShape = fn.params.length === 1 && fn.body.body?.length === 1 &&
+    fn.body.body[0].type === 'ReturnStatement' && findAstNodes(fn.body, node =>
+      node.type === 'BinaryExpression' && node.operator === '===' &&
+      (node.left?.type === 'UnaryExpression' && node.left.operator === 'void' ||
+       node.right?.type === 'UnaryExpression' && node.right.operator === 'void')).length > 0;
+  if (!eligibilityShape || !maxLocalName) return null;
+  const xhighCalls = findAstNodes(fn.body, node => node.type === 'CallExpression').filter(call =>
+    bindingKey(resolvedCallBinding(index, absoluteFile, call)) === bindingKey(xhighBinding));
+  if (xhighCalls.length !== 1) return null;
+  const call = xhighCalls[0];
+  const argumentSource = program.text.slice(call.arguments[0].start, call.arguments[0].end);
+  const capabilityBranch = findAstNodes(fn.body, node => node.type === 'LogicalExpression' && node.operator === '&&' &&
+    node.start <= call.start && call.end <= node.end &&
+    findAstNodes(node, child => child.type === 'Literal' && child.value === 'xhigh').length > 0)
+    .sort((left, right) => (left.end - left.start) - (right.end - right.start))[0];
+  const supportCall = capabilityBranch && findAstNodes(capabilityBranch, node => node.type === 'CallExpression' &&
+    node !== call && node.arguments?.[0]?.type === 'Literal' && node.arguments[0].value === 'xhigh')[0];
+  if (!capabilityBranch || !supportCall) return null;
+  const branchSource = program.text.slice(capabilityBranch.start, capabilityBranch.end);
+  const supportSource = replaceNodeSource(supportCall, supportCall.arguments[0], '"max"', program.text);
+  return replaceNodeSource(fn.body, capabilityBranch,
+    `(${branchSource}||${maxLocalName}(${argumentSource})&&${supportSource})`, program.text);
+}
+
+function renderUltracodeFallbacks(program, fn, index, absoluteFile, xhighBinding, maxLocalName) {
+  const fallbackShape = fn.params.length === 2 && findAstNodes(fn.body, node =>
+    node.type === 'Literal' && node.value === 'xhigh').length > 0;
+  if (!fallbackShape || !maxLocalName) return [];
+  const modifiedBodies = [];
+  for (const statement of findAstNodes(fn.body, node => node.type === 'IfStatement' &&
+    node.test?.type === 'LogicalExpression' && node.test.operator === '&&')) {
+    if (!literalComparison(statement.test.left, 'xhigh') || statement.test.right?.type !== 'UnaryExpression' ||
+        statement.test.right.operator !== '!' ||
+        bindingKey(resolvedCallBinding(index, absoluteFile, statement.test.right.argument)) !== bindingKey(xhighBinding)) continue;
+    const consequent = statement.consequent?.type === 'BlockStatement' && statement.consequent.body.length === 1 ?
+      statement.consequent.body[0] : statement.consequent;
+    const high = consequent?.type === 'ReturnStatement' ? consequent.argument :
+      consequent?.type === 'ExpressionStatement' && consequent.expression?.type === 'AssignmentExpression' ?
+        consequent.expression.right : null;
+    if (high?.type !== 'Literal' || high.value !== 'high') continue;
+    const modelArgument = statement.test.right.argument.arguments[0];
+    const modelSource = program.text.slice(modelArgument.start, modelArgument.end);
+    modifiedBodies.push(replaceNodeSource(fn.body, high, `${maxLocalName}(${modelSource})?"max":"high"`, program.text));
+  }
+  return modifiedBodies;
+}
+
+function renderUltracodeActivation(program, fn, index, absoluteFile, fallbackBindings) {
+  if (fn.params.length !== 3 || fn.body.body?.length !== 1 || fn.body.body[0].type !== 'ReturnStatement') return null;
+  const comparisons = findAstNodes(fn.body, node => literalComparison(node, 'xhigh') &&
+    (node.left?.type === 'CallExpression' || node.right?.type === 'CallExpression'));
+  const enabledCheck = findAstNodes(fn.body, node => node.type === 'BinaryExpression' && node.operator === '===' &&
+    (node.left?.type === 'UnaryExpression' && node.left.operator === '!' && node.left.argument?.value === 0 ||
+     node.right?.type === 'UnaryExpression' && node.right.operator === '!' && node.right.argument?.value === 0));
+  if (comparisons.length !== 1 || enabledCheck.length === 0) return null;
+  const comparison = comparisons[0];
+  const call = comparison.left.type === 'CallExpression' ? comparison.left : comparison.right;
+  const resolverBinding = resolvedCallBinding(index, absoluteFile, call);
+  if (!resolverBinding || !fallbackBindings.some(binding =>
+    bindingCallsTarget(index, resolverBinding, binding, 2))) return null;
+  const callSource = program.text.slice(call.start, call.end);
+  const comparisonSource = program.text.slice(comparison.start, comparison.end);
+  return replaceNodeSource(fn.body, comparison, `(${comparisonSource}||${callSource}==="max")`, program.text);
+}
+
+function analyzeUltracode(target) {
+  const files = new Map();
+  const index = new ModuleIndex(target);
+  const xhighGate = discoverEffortGate(target, index, 'xhigh_effort');
+  const maxGate = discoverEffortGate(target, index, 'max_effort');
+  const consumerPrograms = candidatePrograms(target,
+    ['"xhigh"', '"max"', 'CC_ULTRACODE_ELIGIBILITY', 'CC_ULTRACODE_EFFORT_FALLBACK', 'CC_ULTRACODE_ACTIVATION']);
+  const eligibilityMatches = [], fallbackMatches = [], activationMatches = [], fallbackBindings = [];
+  const uniqueGates = xhighGate.matches.length === 1 && maxGate.matches.length === 1;
+  const xhighBinding = uniqueGates ? xhighGate.matches[0].binding : null;
+  const maxBinding = uniqueGates ? maxGate.matches[0].binding : null;
+
+  for (const program of consumerPrograms) {
+    const absoluteFile = packageFile(target.packageRoot, program.relativePath);
+    const maxLocalName = uniqueGates ? localNameForBinding(index, absoluteFile, maxBinding) : null;
+    for (const fn of findAstNodes(program.ast, node => node.type === 'FunctionDeclaration')) {
+      const body = program.text.slice(fn.body.start, fn.body.end);
+      const eligibilityPatched = uniqueGates ? reconstructedBodyMatch(program, fn, 'ULTRACODE_ELIGIBILITY',
+        (originalProgram, originalFunction) => renderUltracodeEligibility(
+          originalProgram, originalFunction, index, absoluteFile, xhighBinding, maxLocalName)) : null;
+      if (eligibilityPatched) eligibilityMatches.push(eligibilityPatched);
+      const fallbackPatched = uniqueGates ? reconstructedBodyMatch(program, fn, 'ULTRACODE_EFFORT_FALLBACK',
+        (originalProgram, originalFunction) => {
+          const modified = renderUltracodeFallbacks(
+            originalProgram, originalFunction, index, absoluteFile, xhighBinding, maxLocalName);
+          return modified.length === 1 ? modified[0] : null;
+        }) : null;
+      if (fallbackPatched) {
+        fallbackMatches.push(fallbackPatched);
+        fallbackBindings.push(index.resolveLocal(absoluteFile, fn.id.name));
+      }
+      if (body.includes('CC_ULTRACODE_')) continue;
+      if (!uniqueGates || eligibilityPatched || fallbackPatched) continue;
+
+      const eligibilityModified = renderUltracodeEligibility(
+        program, fn, index, absoluteFile, xhighBinding, maxLocalName);
+      if (eligibilityModified !== null) {
+        eligibilityMatches.push(bodyPatch(files, program, fn, 'ultracode-eligibility',
+          'ULTRACODE_ELIGIBILITY', eligibilityModified));
+        continue;
+      }
+
+      for (const modified of renderUltracodeFallbacks(
+        program, fn, index, absoluteFile, xhighBinding, maxLocalName)) {
+        fallbackMatches.push(bodyPatch(files, program, fn, 'ultracode-effort-fallback',
+          'ULTRACODE_EFFORT_FALLBACK', modified));
+        fallbackBindings.push(index.resolveLocal(absoluteFile, fn.id.name));
+      }
+    }
+  }
+
+  const uniqueFallbackBindings = [...new Map(fallbackBindings.map(binding => [bindingKey(binding), binding])).values()];
+  for (const program of consumerPrograms) {
+    const absoluteFile = packageFile(target.packageRoot, program.relativePath);
+    for (const fn of findAstNodes(program.ast, node => node.type === 'FunctionDeclaration')) {
+      const body = program.text.slice(fn.body.start, fn.body.end);
+      const activationPatched = reconstructedBodyMatch(program, fn, 'ULTRACODE_ACTIVATION',
+        (originalProgram, originalFunction) => renderUltracodeActivation(
+          originalProgram, originalFunction, index, absoluteFile, uniqueFallbackBindings));
+      if (activationPatched) {
+        activationMatches.push(activationPatched);
+        continue;
+      }
+      if (body.includes('CC_ULTRACODE_')) continue;
+      const modified = renderUltracodeActivation(program, fn, index, absoluteFile, uniqueFallbackBindings);
+      if (modified === null) continue;
+      activationMatches.push(bodyPatch(files, program, fn, 'ultracode-activation',
+        'ULTRACODE_ACTIVATION', modified));
+    }
+  }
+
+  const semanticTargets = [
+    {id: 'ultracode-eligibility', expectedCardinality: 1, matches: eligibilityMatches},
+    {id: 'ultracode-effort-fallback', expectedCardinality: 1, matches: fallbackMatches},
+    {id: 'ultracode-activation', expectedCardinality: 1, matches: activationMatches},
+  ];
+  return finishSemanticPlan('ultracode', semanticTargets, files, {
+    candidateFiles: [...new Set([...xhighGate.programs, ...maxGate.programs, ...consumerPrograms].map(item => item.relativePath))],
+  });
+}
+
 function analyzeContractFixture(target, patchId = '__contract__') {
   if (process.env.CC_PATCH_TESTING !== '1') throw new Error('internal contract analyzer is disabled');
   const allDefinitions = [
     {id: 'alpha', before: 'CC_BEFORE_ALPHA', after: 'CC_AFTER_ALPHA'},
     {id: 'beta', before: 'CC_BEFORE_BETA', after: 'CC_AFTER_BETA'},
     {id: 'gamma', before: 'CC_BEFORE_GAMMA', after: 'CC_AFTER_GAMMA'},
+    {id: 'delta', before: 'CC_BEFORE_DELTA', after: 'CC_AFTER_DELTA'},
+    {id: 'epsilon', before: 'CC_BEFORE_EPSILON', after: 'CC_AFTER_EPSILON'},
   ];
   const alphaOnly = patchId === '__contract-alpha__' ||
     (process.env.CC_PATCH_TEST_PRODUCTION_IDS === '1' && patchId === 'auto-mode');
   const resourceOnly = patchId === '__contract-resource__' ||
     (process.env.CC_PATCH_TEST_PRODUCTION_IDS === '1' && patchId === 'voice-mode');
   const gammaOnly = process.env.CC_PATCH_TEST_PRODUCTION_IDS === '1' && patchId === 'keybindings';
+  const deltaOnly = process.env.CC_PATCH_TEST_PRODUCTION_IDS === '1' && patchId === 'transcript-dialog';
+  const epsilonOnly = process.env.CC_PATCH_TEST_PRODUCTION_IDS === '1' && patchId === 'ultracode';
   const definitions = alphaOnly ? allDefinitions.slice(0, 1) : resourceOnly ? allDefinitions.slice(1, 2) :
-    gammaOnly ? allDefinitions.slice(2) : allDefinitions.slice(0, 2);
+    gammaOnly ? allDefinitions.slice(2, 3) : deltaOnly ? allDefinitions.slice(3, 4) :
+    epsilonOnly ? allDefinitions.slice(4, 5) : allDefinitions.slice(0, 2);
   const sourceType = target.layout === 'split-esm' ? 'module' : 'script';
   const files = new Map();
   const semanticTargets = definitions.map(definition => {
@@ -1175,7 +1654,8 @@ function analyzeContractFixture(target, patchId = '__contract__') {
     }
   }
   const entryText = fs.readFileSync(target.entryPath, 'utf8');
-  const resources = (alphaOnly || gammaOnly ? [] : [...entryText.matchAll(/CC_CONTRACT_RESOURCE:([^\s*]+)/g)])
+  const resources = (alphaOnly || gammaOnly || deltaOnly || epsilonOnly ? [] :
+    [...entryText.matchAll(/CC_CONTRACT_RESOURCE:([^\s*]+)/g)])
     .map(match => {
       const [source, destination] = match[1].includes('->') ? match[1].split('->', 2) : [null, match[1]];
       return {kind: 'copy', source, destination, expectedBefore: 'absent-or-baselined'};
@@ -1255,11 +1735,13 @@ function analyzerForPatch(patchId) {
     return target => analyzeContractFixture(target, patchId);
   }
   if (process.env.CC_PATCH_TESTING === '1' && process.env.CC_PATCH_TEST_PRODUCTION_IDS === '1' &&
-      ['auto-mode', 'keybindings', 'voice-mode'].includes(patchId)) {
+      ['auto-mode', 'keybindings', 'transcript-dialog', 'ultracode', 'voice-mode'].includes(patchId)) {
     return target => analyzeContractFixture(target, patchId);
   }
   if (patchId === 'auto-mode') return analyzeAutoMode;
   if (patchId === 'keybindings') return analyzeKeybindings;
+  if (patchId === 'transcript-dialog') return analyzeTranscriptDialog;
+  if (patchId === 'ultracode') return analyzeUltracode;
   return null;
 }
 
@@ -1392,6 +1874,7 @@ const knownPatchSentinels = [
   {patchId: 'context-limit', value: 'CLAUDE_CODE_CONTEXT_LIMIT'},
   {patchId: 'computer-use', value: 'computerUseEnabled'},
   {patchId: 'transcript-dialog', value: 'CC_DIALOG_FIX_'},
+  {patchId: 'ultracode', value: 'CC_ULTRACODE_'},
 ];
 
 function findUntrustedPatchSentinel(target) {

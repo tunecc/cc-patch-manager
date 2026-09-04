@@ -548,7 +548,7 @@ git commit -m "feat: support auto mode and keybindings in split esm"
 
 **Interfaces:** Produces Transcript `dialog-channel-factory`, `host-cleanup`; Ultracode `ultracode-eligibility`, `ultracode-effort-fallback`, `ultracode-activation`.
 
-- [ ] **Step 1: 写跨模块 fixture**
+- [x] **Step 1: 写跨模块 fixture**
 
 ```bash
 fixture_add_module "$tmp/new" chunks/dialog.js 'export function createChannel(){return {reply(){}}}'
@@ -558,26 +558,26 @@ fixture_assert_lifecycle "$tmp/new" transcript-dialog
 fixture_assert_lifecycle "$tmp/new" ultracode
 ```
 
-- [ ] **Step 2: 确认红灯**
+- [x] **Step 2: 确认红灯**
 
 Run: `bash tests/test_dual_layout_lifecycle.sh transcript-dialog ultracode`
 
 Expected: FAIL；旧 engine 假定目标共处一处。
 
-- [ ] **Step 3: 实施 analyzer**
+- [x] **Step 3: 实施 analyzer**
 
 ```javascript
 requireExactTargets(plan, ['dialog-channel-factory', 'host-cleanup']);
 requireExactTargets(plan, ['ultracode-eligibility', 'ultracode-effort-fallback', 'ultracode-activation']);
 ```
 
-- [ ] **Step 4: 复跑**
+- [x] **Step 4: 复跑**
 
 Run: `bash tests/test_dual_layout_lifecycle.sh transcript-dialog ultracode`
 
 Expected: PASS；Transcript 保留 reply/request 语义，Ultracode 只在确认调用链里处理 xhigh/max。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add cc-patch-manager.sh tests/test_dual_layout_lifecycle.sh
