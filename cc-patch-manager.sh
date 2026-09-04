@@ -429,7 +429,7 @@ restore_baseline() {
 # 还原单个补丁：从备份还原后重打其它已应用补丁（保持「一份备份」模型）
 restore_patch() {
   local id="$1" other kept=() x output ec=0
-  if [[ "$id" == "voice-mode" ]]; then
+  if [[ "$id" == "voice-mode" || ( "$id" == "context-limit" && -f "$(dirname "$CLI_PATH")/.cc-patch-manager-baseline/manifest.json" ) ]]; then
     if ! require_target_readable || ! ensure_node || ! ensure_acorn; then
       error "VoiceMode 目标或 Node/acorn 不可用"
       return 1
@@ -1982,6 +1982,169 @@ function analyzeVoiceMode(target, options = {}) {
   return plan;
 }
 
+function contextLimitValue() {
+  return '(+process.env.CLAUDE_CODE_CONTEXT_LIMIT||200000)';
+}
+
+function contextDefaultDeclarators(program, declaration) {
+  const declarators = declaration.declarations.filter(item => item.id?.type === 'Identifier' &&
+    item.init?.type === 'Literal' && item.init.value === 200000);
+  if (declarators.length !== 2) return null;
+  if (!memberNamed(program.ast, 'CLAUDE_CODE_DISABLE_1M_CONTEXT')) return null;
+  const functions = findAstNodes(program.ast, node => node.type === 'FunctionDeclaration' && node.id?.name);
+  const usesIdentifier = (node, name) => findAstNodes(node,
+    child => child.type === 'Identifier' && child.name === name).length > 0;
+  const callsFunction = (node, name) => findAstNodes(node,
+    child => child.type === 'CallExpression' && child.callee?.type === 'Identifier' && child.callee.name === name).length > 0;
+  const pairs = [];
+  for (const context of declarators) {
+    const maximumFunctions = functions.filter(fn =>
+      memberNamed(fn, 'CLAUDE_CODE_MAX_CONTEXT_TOKENS') && usesIdentifier(fn, context.id.name));
+    const compact = declarators.find(item => item !== context);
+    for (const maximum of maximumFunctions) {
+      if (functions.some(fn => fn !== maximum && usesIdentifier(fn, compact.id.name) &&
+          callsFunction(fn, maximum.id.name))) pairs.push({context, compact});
+    }
+  }
+  const unique = [...new Map(pairs.map(pair =>
+    [`${pair.context.id.name}:${pair.compact.id.name}`, pair])).values()];
+  return unique.length === 1 ? [unique[0].context, unique[0].compact] : null;
+}
+
+function renderContextDefault(program, declaration, target, declarators) {
+  let rendered = program.text.slice(declaration.start, declaration.end);
+  for (const item of [...declarators].sort((a, b) => b.init.start - a.init.start)) {
+    const start = item.init.start - declaration.start, end = item.init.end - declaration.start;
+    rendered = rendered.slice(0, start) + contextLimitValue() + rendered.slice(end);
+  }
+  const names = declarators.map(item => item.id.name);
+  const setter = `function __ccRefreshContextLimit(){${names.join('=')}=${contextLimitValue()}}`;
+  return `${rendered};${setter}${target.layout === 'split-esm' ? ';export{__ccRefreshContextLimit};' : ''}`;
+}
+
+function contextSettingsBody(program, fn, refreshName) {
+  const body = program.text.slice(fn.body.start, fn.body.end);
+  return `${body.slice(0, -1)};${refreshName}();}`;
+}
+
+function contextSetterSpecifier(settingsFile, defaultFile) {
+  let specifier = path.posix.relative(path.posix.dirname(settingsFile), defaultFile);
+  if (!specifier.startsWith('.')) specifier = `./${specifier}`;
+  return specifier;
+}
+
+function analyzeContextLimit(target) {
+  const files = new Map();
+  const defaultPrograms = candidatePrograms(target,
+    ['CLAUDE_CODE_DISABLE_1M_CONTEXT', 'CLAUDE_CODE_MAX_CONTEXT_TOKENS', 'CC_CONTEXT_DEFAULT']);
+  const defaultMatches = [];
+  for (const program of defaultPrograms) {
+    const marker = /\/\*CC_CONTEXT_DEFAULT:[A-Za-z0-9+/=]+:[a-f0-9]{64}\*\//g;
+    for (const match of program.text.matchAll(marker)) {
+      const declaration = [...program.ast.body].reverse().find(node => node.type === 'VariableDeclaration' && node.start < match.index);
+      if (!declaration) continue;
+      const start = declaration.start, end = match.index + match[0].length;
+      const after = program.text.slice(start, end), before = decodeReversibleBody(after, 'CONTEXT_DEFAULT');
+      if (before === null) continue;
+      let original;
+      try { original = acorn.parse(before, {ecmaVersion: 'latest', sourceType: program.sourceType}).body[0]; } catch { continue; }
+      const declarators = contextDefaultDeclarators(program, original);
+      if (!declarators) continue;
+      const originalProgram = {...program, text: before, ast: {body: [original]}};
+      const modified = renderContextDefault(originalProgram, original, target, declarators);
+      const expected = `${modified}${reversibleBodyMarker('CONTEXT_DEFAULT', before, modified)}`;
+      if (after === expected) defaultMatches.push({relativePath: program.relativePath, start, end, state: 'after', before, after});
+    }
+    if (defaultMatches.some(item => item.relativePath === program.relativePath)) continue;
+    for (const declaration of program.ast.body.filter(node => node.type === 'VariableDeclaration')) {
+      const before = program.text.slice(declaration.start, declaration.end);
+      const declarators = contextDefaultDeclarators(program, declaration);
+      if (!declarators) continue;
+      const modified = renderContextDefault(program, declaration, target, declarators);
+      const after = `${modified}${reversibleBodyMarker('CONTEXT_DEFAULT', before, modified)}`;
+      defaultMatches.push({relativePath: program.relativePath, start: declaration.start, end: declaration.end,
+        state: 'before', before, after});
+      addPlannedReplacement(files, program,
+        {start: declaration.start, end: declaration.end, text: after, semanticId: 'context-default'}, before, after);
+    }
+  }
+
+  const defaultFiles = [...new Set(defaultMatches.map(item => item.relativePath))];
+  const settingsPrograms = candidatePrograms(target,
+    ['applyConfigEnvironmentVariables', 'Object.assign(process.env', 'CC_CONTEXT_SETTINGS_REFRESH']);
+  const settingsMatches = [], importTransformations = [];
+  for (const program of settingsPrograms) {
+    const methods = findAstNodes(program.ast, node => node.type === 'MethodDefinition' &&
+      (node.key?.name === 'applyConfigEnvironmentVariables' || node.key?.value === 'applyConfigEnvironmentVariables') &&
+      findAstNodes(node.value, child => child.type === 'CallExpression' && child.callee?.type === 'MemberExpression' &&
+        child.callee.object?.name === 'Object' && child.callee.property?.name === 'assign' &&
+        child.arguments?.[0]?.type === 'MemberExpression' && child.arguments[0].object?.name === 'process' &&
+        child.arguments[0].property?.name === 'env').length > 0);
+    for (const method of methods) {
+      const refreshName = target.layout === 'split-esm' ? '__ccPatchRefreshContextLimit' : '__ccRefreshContextLimit';
+      const patched = reconstructedBodyMatch(program, method.value, 'CONTEXT_SETTINGS_REFRESH',
+        (originalProgram, originalFunction) => contextSettingsBody(originalProgram, originalFunction, refreshName));
+      if (patched) {
+        if (target.layout === 'split-esm') {
+          if (defaultMatches.length !== 1 || defaultFiles.length !== 1) continue;
+          const expectedSpecifier = contextSetterSpecifier(program.relativePath, defaultFiles[0]);
+          const imports = program.ast.body.filter(node => node.type === 'ImportDeclaration');
+          const setterImports = imports.filter(node => node.source.value === expectedSpecifier &&
+            node.specifiers.length === 1 && node.specifiers[0].type === 'ImportSpecifier' &&
+            node.specifiers[0].local?.name === refreshName &&
+            node.specifiers[0].imported?.name === '__ccRefreshContextLimit');
+          if (setterImports.length !== 1) continue;
+          const setterIndex = imports.indexOf(setterImports[0]);
+          const setterImport = imports[setterIndex], originalImport = imports[setterIndex + 1];
+          if (!originalImport || setterImport.end !== originalImport.start) continue;
+          try {
+            const binding = new ModuleIndex(target).resolveLocal(
+              packageFile(target.packageRoot, program.relativePath), refreshName);
+            if (binding.file !== packageFile(target.packageRoot, defaultFiles[0]) ||
+                binding.exportedName !== '__ccRefreshContextLimit') continue;
+          } catch { continue; }
+          const after = program.text.slice(setterImport.start, originalImport.end);
+          const before = program.text.slice(originalImport.start, originalImport.end).replace(/^import\s+/, 'import');
+          importTransformations.push({semanticId: 'settings-env-refresh-import', relativePath: program.relativePath,
+            start: setterImport.start, state: 'after', before, after});
+        }
+        settingsMatches.push(patched);
+        continue;
+      }
+      if (target.layout === 'split-esm') {
+        if (defaultMatches.length !== 1 || defaultFiles.length !== 1) continue;
+        if (findAstNodes(program.ast, node => node.type === 'Identifier' && node.name === refreshName).length > 0) continue;
+        const firstImport = program.ast.body.find(node => node.type === 'ImportDeclaration');
+        if (!firstImport) continue;
+        const match = bodyPatch(files, program, method.value, 'settings-env-refresh',
+          'CONTEXT_SETTINGS_REFRESH', contextSettingsBody(program, method.value, refreshName));
+        settingsMatches.push(match);
+        const specifier = contextSetterSpecifier(program.relativePath, defaultFiles[0]);
+        const before = program.text.slice(firstImport.start, firstImport.end);
+        const prefix = `import{__ccRefreshContextLimit as ${refreshName}}from${JSON.stringify(specifier)};`;
+        const after = `${prefix}import ${before.slice('import'.length)}`;
+        addPlannedReplacement(files, program,
+          {start: firstImport.start, end: firstImport.end, text: after, semanticId: 'settings-env-refresh-import'}, before, after);
+        importTransformations.push({semanticId: 'settings-env-refresh-import', relativePath: program.relativePath,
+          start: firstImport.start, state: 'before', before, after});
+      } else if (defaultMatches.length === 1) {
+        const match = bodyPatch(files, program, method.value, 'settings-env-refresh',
+          'CONTEXT_SETTINGS_REFRESH', contextSettingsBody(program, method.value, refreshName));
+        settingsMatches.push(match);
+      }
+    }
+  }
+  const semanticTargets = [
+    {id: 'context-default', expectedCardinality: 1, matches: defaultMatches},
+    {id: 'settings-env-refresh', expectedCardinality: 1, matches: settingsMatches},
+  ];
+  const plan = finishSemanticPlan('context-limit', semanticTargets, files, {
+    candidateFiles: [...new Set([...defaultPrograms, ...settingsPrograms].map(item => item.relativePath))],
+  });
+  plan.attribution.transformations.push(...importTransformations);
+  return plan;
+}
+
 function analyzeContractFixture(target, patchId = '__contract__') {
   if (process.env.CC_PATCH_TESTING !== '1') throw new Error('internal contract analyzer is disabled');
   const allDefinitions = [
@@ -2117,11 +2280,14 @@ function analyzerForPatch(patchId) {
       ['auto-mode', 'keybindings', 'transcript-dialog', 'ultracode', 'voice-mode'].includes(patchId)) {
     return target => analyzeContractFixture(target, patchId);
   }
+  if (process.env.CC_PATCH_TESTING === '1' && process.env.CC_PATCH_TEST_PRODUCTION_IDS === '1' &&
+      patchId === 'context-limit') return null;
   if (patchId === 'auto-mode') return analyzeAutoMode;
   if (patchId === 'keybindings') return analyzeKeybindings;
   if (patchId === 'transcript-dialog') return analyzeTranscriptDialog;
   if (patchId === 'ultracode') return analyzeUltracode;
   if (patchId === 'voice-mode') return analyzeVoiceMode;
+  if (patchId === 'context-limit') return analyzeContextLimit;
   return null;
 }
 
@@ -6229,6 +6395,15 @@ run_node_patch() {
   set -e
   if [[ "$ec" -eq 0 ]]; then
     target_layout=$(printf '%s\n' "$target_info" | sed -n 's/^TARGET_LAYOUT://p' | head -1)
+    if [[ "$id" == "context-limit" ]]; then
+      set +e
+      output=$(runtime_exec "$mode" "$CLI_PATH" "$id" 2>&1)
+      ec=$?
+      set -e
+      LAST_OUTPUT="$output"
+      parse_and_set_status "$id" "$mode" "$output" "$ec"
+      return $?
+    fi
     if [[ "$target_layout" == "split-esm" ]]; then
       STATUS[$id]=error
       MSG[$id]="split-esm 尚未接入统一补丁引擎，已拒绝旧单文件写入路径"

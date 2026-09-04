@@ -33,6 +33,8 @@ VOICE_COMMAND='function voiceAuthProbe(){try{if(!hasAccount())return!1;return to
 VOICE_CAPABILITY='function voiceStreamAvailable(){if(!hasAccount())return!1;let session=currentSession();return session!==null&&session.accessToken!==null}const voiceRuntime={isVoiceStreamAvailable:()=>voiceStreamAvailable()}'
 VOICE_CONNECTION='async function connectVoiceStream(callbacks,options){let query=new URLSearchParams({encoding:"linear16",stt_provider:"deepgram-nova3"}),endpoint="/api/ws/speech_to_text/voice_stream";callbacks.onReady();callbacks.onTranscript("hello",!0);return{endpoint,query}}'
 VOICE_SETTINGS='function writeUserSettings(kind,value){return{kind,value}}function voiceSettings({settingsData,setAppState,setSettingsData,setChanges}){writeUserSettings("userSettings",{});let settings=[{id:"autoCompact"},{id:"language"},{id:"editor"}];return{settings}}'
+CONTEXT_LIMIT='var contextWindow=200000,compactWindow=200000,outputLimit=32000;function contextDisabled(){return process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT}function configuredMaximum(){let configured=process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS;return configured||contextWindow}function compactBoundary(){return configuredMaximum()>compactWindow?compactWindow:configuredMaximum()}function readContextWindow(){return contextWindow}function readCompactWindow(){return compactWindow}'
+CONTEXT_SETTINGS='class SettingsLoader{applyConfigEnvironmentVariables(env){Object.assign(process.env,env)}}'
 
 fixture_make_dual_patch_package() {
   local root="$1" layout="$2" key_flag="${3:-}"
@@ -56,7 +58,9 @@ $VOICE_COMMAND
 $VOICE_CAPABILITY
 $VOICE_CONNECTION
 $VOICE_SETTINGS
-module.exports={modelEligible,decide,classifierModel,keybindingsEnabled,defaultKeybindings,createDialogChannel,ultracodeEligible,resolveEffort,ultracodeActive,voiceCommand,voiceStreamAvailable,connectVoiceStream,voiceSettings}"
+$CONTEXT_LIMIT
+$CONTEXT_SETTINGS
+module.exports={modelEligible,decide,classifierModel,keybindingsEnabled,defaultKeybindings,createDialogChannel,ultracodeEligible,resolveEffort,ultracodeActive,voiceCommand,voiceStreamAvailable,connectVoiceStream,voiceSettings,readContextWindow,readCompactWindow,SettingsLoader}"
   else
     fixture_make_package "$root" "$layout" '@cometix/anthropic-cc' 2.1.259
     printf '{"name":"@cometix/anthropic-cc","version":"2.1.259","type":"module"}\n' >"$root/package.json"
@@ -82,6 +86,10 @@ export{voiceStreamAvailable}"
 export{connectVoiceStream}"
     fixture_add_module "$root" chunks/voice-settings.js "$VOICE_SETTINGS
 export{voiceSettings}"
+    fixture_add_module "$root" chunks/context-limit.js "$CONTEXT_LIMIT
+export{readContextWindow,readCompactWindow}"
+    fixture_add_module "$root" chunks/context-settings.js "import{readContextWindow,readCompactWindow}from\"./context-limit.js\";$CONTEXT_SETTINGS
+export{SettingsLoader,readContextWindow,readCompactWindow}"
   fi
 }
 
@@ -270,6 +278,73 @@ assert_voice_source_symlink_race_rejected() {
   [[ "$(fixture_hash_tree "$root")" == "$before" ]] || fail 'voice-mode source symlink race changed the package'
 }
 
+assert_context_effects() {
+  local root="$1"
+  rg -l 'CC_CONTEXT_DEFAULT' "$root" --glob '*.js' >/dev/null || fail 'context-limit default marker missing'
+  rg -l 'CC_CONTEXT_SETTINGS_REFRESH' "$root" --glob '*.js' >/dev/null || fail 'context-limit settings refresh marker missing'
+}
+
+assert_context_behavior() {
+  local layout="$1" root="$tmp/context-behavior-$1" module
+  fixture_make_dual_patch_package "$root" "$layout"
+  runtime_exec apply "$(fixture_entry "$root")" context-limit >/dev/null 2>&1 || fail "$layout context-limit behavior apply failed"
+  if [[ "$layout" == single-cjs ]]; then module="$root/cli.js"; else module="$root/chunks/context-settings.js"; fi
+  node - "$layout" "$module" <<'NODE' || fail "$layout context-limit environment behavior changed"
+const {pathToFileURL} = require('url');
+(async () => {
+  delete process.env.CLAUDE_CODE_CONTEXT_LIMIT;
+  const layout = process.argv[2], modulePath = process.argv[3];
+  const loaded = layout === 'single-cjs' ? require(modulePath) : await import(pathToFileURL(modulePath));
+  if (loaded.readContextWindow() !== 200000 || loaded.readCompactWindow() !== 200000) process.exit(1);
+  new loaded.SettingsLoader().applyConfigEnvironmentVariables({CLAUDE_CODE_CONTEXT_LIMIT: '345678'});
+  if (loaded.readContextWindow() !== 345678 || loaded.readCompactWindow() !== 345678) process.exit(2);
+  new loaded.SettingsLoader().applyConfigEnvironmentVariables({CLAUDE_CODE_CONTEXT_LIMIT: '0'});
+  if (loaded.readContextWindow() !== 200000 || loaded.readCompactWindow() !== 200000) process.exit(3);
+})().catch(error => { console.error(error); process.exit(1); });
+NODE
+}
+
+assert_context_missing_import_rejected() {
+  local root="$tmp/context-missing-import" output
+  fixture_make_dual_patch_package "$root" split-esm
+  runtime_exec apply "$(fixture_entry "$root")" context-limit >/dev/null 2>&1 || fail 'context missing-import fixture apply failed'
+  node - "$root/chunks/context-settings.js" <<'NODE'
+const fs = require('fs'), file = process.argv[2], source = fs.readFileSync(file, 'utf8');
+fs.writeFileSync(file, source.replace(/import\{__ccRefreshContextLimit as __ccPatchRefreshContextLimit\}from[^;]+;/, ''));
+NODE
+  output=$(runtime_exec check "$(fixture_entry "$root")" context-limit 2>&1) || true
+  grep -Fq 'MISSING_TARGET:settings-env-refresh' <<<"$output" || fail "context-limit accepted a missing setter import: $output"
+}
+
+assert_context_negative_shapes_rejected() {
+  local kind root output before
+  for kind in no-import unrelated-default alias-collision wrong-source; do
+    root="$tmp/context-negative-$kind"
+    fixture_make_dual_patch_package "$root" split-esm
+    case "$kind" in
+      no-import)
+        fixture_add_module "$root" chunks/context-settings.js "$CONTEXT_SETTINGS
+export{SettingsLoader}"
+        ;;
+      unrelated-default)
+        fixture_add_module "$root" chunks/context-limit.js 'var unrelatedA=200000,unrelatedB=200000;function contextDisabled(){return process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT}function configuredMaximum(){return process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS}export{unrelatedA,unrelatedB}'
+        ;;
+      alias-collision)
+        sed -i '' 's/applyConfigEnvironmentVariables(env)/applyConfigEnvironmentVariables(env,__ccPatchRefreshContextLimit)/' "$root/chunks/context-settings.js"
+        ;;
+      wrong-source)
+        runtime_exec apply "$(fixture_entry "$root")" context-limit >/dev/null 2>&1 || fail 'wrong-source fixture apply failed'
+        fixture_add_module "$root" chunks/wrong-context.js 'export function __ccRefreshContextLimit(){}'
+        sed -i '' 's#./context-limit.js#./wrong-context.js#' "$root/chunks/context-settings.js"
+        ;;
+    esac
+    before=$(fixture_hash_tree "$root")
+    output=$(runtime_exec apply "$(fixture_entry "$root")" context-limit 2>&1) || true
+    [[ "$output" == *'MISSING_TARGET:'* || "$output" == *'AMBIGUOUS_TARGET:'* ]] || fail "context-limit accepted $kind: $output"
+    [[ "$(fixture_hash_tree "$root")" == "$before" ]] || fail "context-limit apply mutated $kind"
+  done
+}
+
 assert_patch_effects() {
   local root="$1" layout="$2" patch_id="$3"
   case "$patch_id" in
@@ -278,6 +353,7 @@ assert_patch_effects() {
     transcript-dialog) assert_dialog_effects "$root" "$layout" ;;
     ultracode) assert_ultracode_effects "$root" "$layout" ;;
     voice-mode) assert_voice_effects "$root" ;;
+    context-limit) assert_context_effects "$root" ;;
     *) fail "unsupported lifecycle effects: $patch_id" ;;
   esac
 }
@@ -437,7 +513,7 @@ NODE
 requested=("${@:-auto-mode keybindings}")
 for patch_id in ${requested[*]}; do
   case "$patch_id" in
-    auto-mode|keybindings|transcript-dialog|ultracode|voice-mode) ;;
+    auto-mode|keybindings|transcript-dialog|ultracode|voice-mode|context-limit) ;;
     *) fail "unsupported lifecycle patch: $patch_id" ;;
   esac
   fixture_assert_lifecycle single-cjs "$patch_id"
@@ -459,6 +535,12 @@ if [[ " ${requested[*]} " == *' voice-mode '* ]]; then
   assert_voice_source_symlink_race_rejected
   assert_voice_settings_ambiguity_rejected
   assert_voice_gate_non_call_leaf_rejected
+fi
+if [[ " ${requested[*]} " == *' context-limit '* ]]; then
+  assert_context_behavior single-cjs
+  assert_context_behavior split-esm
+  assert_context_missing_import_rejected
+  assert_context_negative_shapes_rejected
 fi
 
 # Preserve the exact original boolean spelling for baseline attribution.

@@ -631,7 +631,7 @@ git commit -m "feat: transact voicemode split esm patch"
 
 **Interfaces:** Produces `context-default`, `settings-env-refresh`; preserves `CLAUDE_CODE_CONTEXT_LIMIT` and 0 -> 200000.
 
-- [ ] **Step 1: 写跨模块与 settings env 测试**
+- [x] **Step 1: 写跨模块与 settings env 测试**
 
 ```bash
 fixture_add_module "$tmp/new" chunks/limit.js 'export let limit=200000;export const setLimit=n=>limit=n'
@@ -639,13 +639,13 @@ fixture_add_module "$tmp/new" chunks/settings.js 'import{setLimit}from"./limit.j
 fixture_assert_context_limit "$tmp/new" 345678
 ```
 
-- [ ] **Step 2: 确认红灯**
+- [x] **Step 2: 确认红灯**
 
 Run: `bash tests/test_context_limit_integration.sh && bash tests/test_dual_layout_lifecycle.sh context-limit`
 
 Expected: FAIL；旧逻辑仅替换同一文件中的数值。
 
-- [ ] **Step 3: 实施绑定安全刷新**
+- [x] **Step 3: 实施绑定安全刷新**
 
 ```javascript
 const defaultLimit = findContextLimitDefinition(context), settingsLoader = findSettingsEnvLoaderUsing(defaultLimit.binding);
@@ -653,13 +653,13 @@ plan.files.push(replaceDefaultWithEnvRead(defaultLimit));
 plan.files.push(insertRefreshAfterEnvLoad(settingsLoader, defaultLimit.binding));
 ```
 
-- [ ] **Step 4: 复跑**
+- [x] **Step 4: 复跑**
 
 Run: `bash tests/test_context_limit_integration.sh && bash tests/test_dual_layout_lifecycle.sh context-limit`
 
 Expected: PASS；环境和 settings env 生效，未设置/0 仍为 200000，幂等及还原成立。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add cc-patch-manager.sh tests/test_context_limit_integration.sh tests/test_dual_layout_lifecycle.sh
