@@ -4221,6 +4221,9 @@ if (command === 'inspect') {
   } else if (process.env.CC_PATCH_VALIDATE_ONLY === '1') {
     console.log('PLAN_VALID');
   } else {
+    if (process.env.CC_PATCH_TESTING === '1' && process.env.CC_PATCH_TEST_FAIL_PATCH === patchId) {
+      fail(`injected apply transaction failure: ${patchId}`);
+    }
     try {
       commitPlanTransaction(target, plan, renderedFiles);
     } catch (error) {

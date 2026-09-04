@@ -760,7 +760,7 @@ git commit -m "feat: report package layout and patch diagnostics"
 
 **Interfaces:** Consumes `PATCH_IDS`, `run_node_patch`, `STATUS`, `MSG`; produces a one-confirmation fixed-order loop and summary.
 
-- [ ] **Step 1: 写失败继续测试**
+- [x] **Step 1: 写失败继续测试**
 
 ```bash
 CC_PATCH_TEST_FAIL_PATCH=transcript-dialog apply_all_patches <<< $'\n'
@@ -768,13 +768,13 @@ assert_eq "${STATUS[transcript-dialog]}" error 'failing transaction reported'
 assert_eq "${STATUS[ultracode]}" applied 'next transaction continued'
 ```
 
-- [ ] **Step 2: 确认红灯**
+- [x] **Step 2: 确认红灯**
 
 Run: `bash tests/test_fast_apply_all.sh && bash tests/test_package_baseline_transaction.sh`
 
 Expected: FAIL；runtime 错误尚未按项隔离。
 
-- [ ] **Step 3: 实施固定循环**
+- [x] **Step 3: 实施固定循环**
 
 ```bash
 for id in "${PATCH_IDS[@]}"; do
@@ -784,13 +784,13 @@ done
 print_apply_all_summary
 ```
 
-- [ ] **Step 4: 复跑**
+- [x] **Step 4: 复跑**
 
 Run: `bash tests/test_fast_apply_all.sh && bash tests/test_package_baseline_transaction.sh`
 
 Expected: PASS；没有批量预检/复检，失败回滚，后续继续，计数正确。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add cc-patch-manager.sh tests/test_fast_apply_all.sh tests/test_package_baseline_transaction.sh
