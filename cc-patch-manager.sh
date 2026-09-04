@@ -726,6 +726,13 @@ function parseProgram(file, sourceType) {
   const text = fs.readFileSync(file, 'utf8');
   const cacheKey = `${file}:${sourceType}:${sha256(text)}`;
   if (astCache.has(cacheKey)) return astCache.get(cacheKey);
+  // Evict stale cache entries for this file (its content changed since the last
+  // parse) so the cache cannot grow unbounded across apply/restore cycles. Without
+  // this, restore-all on a large single-CJS bundle caches one full AST per
+  // intermediate content state and exhausts the Node heap.
+  for (const key of astCache.keys()) {
+    if (key.startsWith(`${file}:`)) astCache.delete(key);
+  }
   try {
     const record = {text, ast: acorn.parse(text, {ecmaVersion: 'latest', sourceType, allowHashBang: true})};
     astCache.set(cacheKey, record);
@@ -4024,24 +4031,39 @@ function restorePatchFromBaseline(target, removeId) {
   if (!candidates.includes(removeId)) {
     throw new Error(`unsupported restore patch id: ${removeId}`);
   }
-  const plans = candidates.map(patchId => ({patchId,
-    plan: analyzePatch(target, patchId, {allowMissingResources: true})}));
-  for (const {plan} of plans) validatePlan(target, plan);
+  const plans = candidates.map(patchId => {
+    try {
+      const plan = analyzePatch(target, patchId, {allowMissingResources: true});
+      validatePlan(target, plan);
+      return {patchId, plan};
+    } catch (error) {
+      // A patch whose semantic targets are absent in this layout (e.g. context-limit
+      // on single-CJS 2.1.224, where applyConfigEnvironmentVariables is a standalone
+      // export-map function rather than a class MethodDefinition) can be neither
+      // applied nor retained. The restore re-analyzes every registered patch to find
+      // retained ones; an unrelated missing target must be skipped — not abort the
+      // restore of the patch being removed. Only removeId itself must remain analyzable.
+      if (patchId !== removeId && /missing semantic target/.test(error.message)) {
+        return {patchId, plan: null};
+      }
+      throw error;
+    }
+  });
   const manifest = readBaselineManifest(target);
   if (!manifest) throw new Error('patch restore requires a trusted baseline');
   assertBaselineIdentity(manifest, target);
   assertBaselineMirrors(manifest, target);
   assertManagedFilesAttributable(manifest, target, {
     patchId: removeId,
-    attribution: {transformations: plans.flatMap(item => item.plan.attribution?.transformations || [])},
-    resources: plans.flatMap(item => item.plan.resources || []),
+    attribution: {transformations: plans.flatMap(item => item.plan?.attribution?.transformations || [])},
+    resources: plans.flatMap(item => item.plan?.resources || []),
   });
 
   let orchestration = readRestoreOrchestration(target);
   if (orchestration) {
     orchestration = validateRestoreOrchestration(orchestration, target, manifest, removeId, candidates);
   } else {
-    const retained = plans.filter(item => item.patchId !== removeId && item.plan.state === 'already-patched')
+    const retained = plans.filter(item => item.plan && item.patchId !== removeId && item.plan.state === 'already-patched')
       .map(item => item.patchId);
     orchestration = {schemaVersion: 1, target: transactionTargetIdentity(target, manifest), removeId, retained};
     writeRestoreOrchestration(target, orchestration);
@@ -4067,6 +4089,25 @@ function restorePatchFromBaseline(target, removeId) {
   fs.unlinkSync(restoreOrchestrationPath(target));
   fsyncDirectory(baselineDirectory(target));
   return {removed: removeId, reapplied};
+}
+
+// restore-all: reset every managed file to the trusted baseline and remove every
+// patch-created directory, with NO retained-patch reapply (nothing is retained when
+// the whole set is being removed). This is the tractable "全还原" path for large
+// single-CJS bundles where per-patch restore would re-parse the entry once per
+// retained patch (15 reapply parses of a 23 MB file on 2.1.224).
+function restoreAllFromBaseline(target) {
+  const manifest = readBaselineManifest(target);
+  if (!manifest) throw new Error('patch restore requires a trusted baseline');
+  assertBaselineIdentity(manifest, target);
+  assertBaselineMirrors(manifest, target);
+  const operations = restoreOperationsFromBaseline(target, manifest);
+  if (operations.length > 0) commitTransaction(target, operations);
+  removeBaselineCreatedDirectories(target, manifest);
+  const orchestrationPath = restoreOrchestrationPath(target);
+  if (lstatIfPresent(orchestrationPath)) fs.unlinkSync(orchestrationPath);
+  fsyncDirectory(baselineDirectory(target));
+  return {removed: 'all', reapplied: []};
 }
 
 function inspectTarget(entry) {
@@ -4115,13 +4156,13 @@ function inspectTarget(entry) {
 }
 
 const target = inspectTarget(requestedEntry);
-if (!['inspect', 'restore'].includes(command) && lstatIfPresent(restoreOrchestrationPath(target))) {
+if (!['inspect', 'restore', 'restore-all'].includes(command) && lstatIfPresent(restoreOrchestrationPath(target))) {
   fail('incomplete patch restore exists; retry the same restore operation first');
 }
 if (command === 'check' && incompleteTransactionEntries(target).length > 0) {
   fail('incomplete patch transaction exists; run an apply, baseline, or backup operation to recover it first');
 }
-if (command === 'backup' || command === 'baseline' || command === 'restore' ||
+if (command === 'backup' || command === 'baseline' || command === 'restore' || command === 'restore-all' ||
     (command === 'apply' && process.env.CC_PATCH_VALIDATE_ONLY !== '1')) {
   try {
     cleanupBaselineStagingDirectories(target);
@@ -4179,6 +4220,13 @@ if (command === 'inspect') {
     const result = restorePatchFromBaseline(target, runtimeArgs[0]);
     console.log(`RESTORED:${result.removed}`);
     for (const patchId of result.reapplied) console.log(`REAPPLIED:${patchId}`);
+  } catch (error) {
+    fail(error.message);
+  }
+} else if (command === 'restore-all') {
+  try {
+    const result = restoreAllFromBaseline(target);
+    console.log(`RESTORED:${result.removed}`);
   } catch (error) {
     fail(error.message);
   }
@@ -4246,7 +4294,7 @@ runtime_exec() {
   runtime=$(write_patch_runtime) || return 1
   voice_asset_source="${CC_PATCH_VOICE_ASSET_SOURCE:-$(voice_mode_source_dir)}"
   set +e
-  output=$(CC_PATCH_VOICE_ASSET_SOURCE="$voice_asset_source" node "$runtime" "$ACORN_PATH" "$command" "$entry" "$@" 2>&1)
+  output=$(CC_PATCH_VOICE_ASSET_SOURCE="$voice_asset_source" node --max-old-space-size="${CC_PATCH_NODE_MAX_OLD_SPACE:-8192}" "$runtime" "$ACORN_PATH" "$command" "$entry" "$@" 2>&1)
   status=$?
   set -e
   rm -f "$runtime"

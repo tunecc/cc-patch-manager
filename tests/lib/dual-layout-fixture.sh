@@ -53,3 +53,34 @@ visit(root);
 console.log(hash.digest('hex'));
 NODE
 }
+
+# Hash every regular file under root EXCLUDING .cc-patch-manager- tool metadata.
+# Used to prove managed sources return to baseline after a restore, without being
+# perturbed by baseline/transaction staging dirs the tool creates during apply.
+fixture_hash_sources() {
+  node - "$1" <<'NODE'
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const root = fs.realpathSync(process.argv[2]);
+const hash = crypto.createHash('sha256');
+function visit(directory) {
+  for (const entry of fs.readdirSync(directory, {withFileTypes: true}).sort((a, b) => a.name.localeCompare(b.name))) {
+    if (entry.name.startsWith('.cc-patch-manager-')) continue;
+    const absolute = path.join(directory, entry.name);
+    const relative = path.relative(root, absolute);
+    if (entry.isDirectory()) visit(absolute);
+    else if (entry.isFile()) hash.update(relative).update('\0').update(fs.readFileSync(absolute));
+  }
+}
+visit(root);
+console.log(hash.digest('hex'));
+NODE
+}
+
+# Assert two tree hashes match; surface a truncated preview so a mismatch is debuggable.
+fixture_assert_tree_equals() {
+  local expected="$1" actual="$2"
+  [[ "$expected" == "$actual" ]] ||
+    fail "tree hash mismatch: expected ${expected:0:12}…, got ${actual:0:12}…"
+}
