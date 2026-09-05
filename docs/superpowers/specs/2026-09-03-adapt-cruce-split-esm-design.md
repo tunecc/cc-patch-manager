@@ -2,6 +2,8 @@
 comet_change: adapt-cruce-split-esm
 role: technical-design
 canonical_spec: openspec
+archived-with: 2026-09-05-adapt-cruce-split-esm
+status: final
 ---
 
 # Claude Code 补丁管理器双布局适配技术设计

@@ -2,6 +2,7 @@
 change: adapt-cruce-split-esm
 design-doc: docs/superpowers/specs/2026-09-03-adapt-cruce-split-esm-design.md
 base-ref: 12a8af769933ae4388cc6c86bcd80d87f7685a63
+archived-with: 2026-09-05-adapt-cruce-split-esm
 ---
 
 # 双布局补丁管理器实施计划
