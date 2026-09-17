@@ -1,0 +1,264 @@
+schema: comet.native.v4
+name: fix-cc-2-1-273-patches
+language: zh-CN
+phase: archive
+status: done
+state_version: 8
+brief: brief.md
+shape_confirmation_hash: a8a514f4ff237d52618ef45c6934187c7e6e3ad23dc2a2e7e94073e10342c5c5
+spec_changes:
+  - capability: patch-engine
+    operation: create
+    source: specs/patch-engine/spec.md
+workspace:
+  isolation: current
+  change_branch: main
+  target_branch: main
+  finish: null
+loop:
+  stage: done
+  goal_cycle: 1
+  iteration: 1
+  attempt: 1
+  retry_epoch: 0
+  failed_iteration_count: 0
+  no_progress_count: 0
+  execution_failure_count: 0
+  previous_unresolved_ids: []
+  next_action: null
+acceptance:
+  - id: A1
+    source: brief.md
+    text: A1：对 2.1.273 新的 Auto 门禁形态执行 `check` 返回 `NEEDS_PATCH`，应用后返回
+      `ALREADY_PATCHED`；未知或无关的模型能力函数不被误匹配。
+    result: passed
+    reason:
+      text: Auto helper is constrained by same-module denylist plus supported and
+        tengu_auto_mode_config consumers; the 2.1.273 lifecycle and unconsumed
+        decoy cases pass.
+      truncated: false
+  - id: A2
+    source: brief.md
+    text: A2：Auto 补丁应用后仍同时实现模型资格放开、分类器环境变量覆盖，以及分类器不可用时从拒绝改为询问。
+    result: passed
+    reason:
+      text: Auto retains eligibility unlock, CLAUDE_CLASSIFIER_MODEL return-shape
+        override, and fail-closed deny-to-ask replacement; focused tests cover
+        fallback preservation and modelByMainModel.
+      truncated: false
+  - id: A3
+    source: brief.md
+    text: A3：对 2.1.273 四参数 Ultracode 激活函数执行 `check` 返回 `NEEDS_PATCH`，应用后 max-only
+      模型可通过资格、回退和激活三层判断，且 `turnEffort` 路径保留。
+    result: passed
+    reason:
+      text: Ultracode accepts three- and four-argument activation forms while
+        replacing only the xhigh comparison; runtime fixtures prove max-only
+        eligibility, fallback, activation, and preserved turnEffort.
+      truncated: false
+  - id: A4
+    source: brief.md
+    text: A4：对同时含旧 `setChanges` 和新 `changeLog` 设置宿主形态的 Voice
+      夹具，设置项均可唯一定位、应用后可重复检测，并维持写设置、更新内存状态和记录变更的行为。
+    result: passed
+    reason:
+      text: Voice supports setChanges and unshadowed changeLog.record hosts; fixtures
+        prove settings write, memory updates, change recording, idempotence, and
+        reject shadowed decoys.
+      truncated: false
+  - id: A5
+    source: brief.md
+    text: A5：在 `@cometix/anthropic-cc` 2.1.273 的临时完整副本上，全部七个补丁依次完成 `NEEDS_PATCH ->
+      apply -> ALREADY_PATCHED -> restore`，随后批量应用、`node cli.js --version` 启动检查和
+      `restore-all` 均成功，副本恢复到原始哈希。
+    result: passed
+    reason:
+      text: Runtime real-package acceptance passed on a temporary
+        @cometix/anthropic-cc 2.1.273 copy for all seven applicable patches,
+        including per-patch lifecycle, bulk apply, CLI startup, restore-all, and
+        final package hash restoration.
+      truncated: false
+  - id: A6
+    source: brief.md
+    text: A6：项目现有快速测试全部通过，且真实 `/opt/homebrew` 源包在验收前后哈希不变。
+    result: passed
+    reason:
+      text: Runtime fast-tests completed with exit code 0; real-package acceptance
+        asserts the installed source package hash is unchanged before and after,
+        and git diff --check passed.
+      truncated: false
+builder_handoff:
+  candidate_id: 4a149c5b-8fbf-4f12-badf-11b4668a5d4d
+  identity_provider: skill-coordinated
+  builder_execution_ref: skill-coordinated:builder:75fb52b2-0815-42b1-bc54-bd5f241ad13d
+  iteration: 1
+  summary:
+    text: Updated Auto, Ultracode, and Voice patch discovery for
+      @cometix/anthropic-cc 2.1.273 split-ESM shapes, added focused
+      compatibility regressions, and updated real-package acceptance to target
+      2.1.273.
+    truncated: false
+  addressed_acceptance_ids:
+    - A1
+    - A2
+    - A3
+    - A4
+    - A5
+    - A6
+  checks:
+    - name:
+        text: shell syntax
+        truncated: false
+      result: passed
+      note:
+        text: bash -n cc-patch-manager.sh tests/test_cc_2_1_273_compat.sh
+          tests/test_real_package_acceptance.sh
+        truncated: false
+    - name:
+        text: fast test suite
+        truncated: false
+      result: passed
+      note:
+        text: All tests/test_*.sh completed with exit code 0; real-package acceptance
+          skips without an explicit target as designed.
+        truncated: false
+    - name:
+        text: cruce 2.1.273 real-package acceptance
+        truncated: false
+      result: passed
+      note:
+        text: "PASS: cruce 2.1.273 real-package acceptance (7 applicable, 0 documented
+          inapplicable); ran against a temporary package copy restored to
+          baseline."
+        truncated: false
+    - name:
+        text: git diff hygiene
+        truncated: false
+      result: passed
+      note:
+        text: git diff --check completed with exit code 0.
+        truncated: false
+  checks_truncated: false
+  known_limits: []
+  known_limits_truncated: false
+  review: null
+  submitted_at: 2026-09-16T16:10:06.896Z
+blockers: []
+verification:
+  candidate_id: 4a149c5b-8fbf-4f12-badf-11b4668a5d4d
+  identity_provider: skill-coordinated
+  verifier_execution_ref: skill-coordinated:verifier:e474c549-6af2-470d-8dc2-e90c9d5ea00d
+  iteration: 1
+  attempt: 1
+  assurance: skill-coordinated
+  verdict: pass
+  checks:
+    - id: shell-syntax
+      name:
+        text: Shell syntax
+        truncated: false
+      argv_display:
+        - text: -n
+          truncated: false
+        - text: cc-patch-manager.sh
+          truncated: false
+        - text: tests/test_cc_2_1_273_compat.sh
+          truncated: false
+        - text: tests/test_real_package_acceptance.sh
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 10
+    - id: fast-tests
+      name:
+        text: All fast tests
+        truncated: false
+      argv_display:
+        - text: -lc
+          truncated: false
+        - text: export PATH=/opt/homebrew/bin:$PATH; for test_file in tests/test_*.sh; do
+            bash "$test_file"; done
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 48426
+    - id: real-package-2-1-273
+      name:
+        text: Cruce 2.1.273 real-package acceptance
+        truncated: false
+      argv_display:
+        - text: -lc
+          truncated: false
+        - text: export PATH=/opt/homebrew/bin:$PATH; acceptance_tmp=$(mktemp -d); trap 'rm
+            -rf "$acceptance_tmp"' EXIT; export TMPDIR="$acceptance_tmp/tmp";
+            mkdir -p "$TMPDIR"; cp -R
+            /opt/homebrew/lib/node_modules/@cometix/anthropic-cc
+            "$acceptance_tmp/source"; source ./cc-patch-manager.sh; runtime_exec
+            restore-all "$acceptance_tmp/source/cli.js";
+            CC_PATCH_CRUCE_PACKAGE="$acceptance_tmp/source" bash
+            tests/test_real_package_acceptance.sh cruce
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 627034
+    - id: diff-check
+      name:
+        text: Git diff whitespace check
+        truncated: false
+      argv_display:
+        - text: diff
+          truncated: false
+        - text: --check
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 21
+  summary:
+    text: Independent read-only verification passed A1-A6 with implementation,
+      focused regression, full Runtime suite, and real-package lifecycle
+      evidence; no blockers or additional checks are required.
+    truncated: false
+  risks:
+    - text: Shell syntax and diff-check logs are empty because successful commands
+        emit no output; Runtime records exit code 0 for both.
+      truncated: false
+    - text: Real-package acceptance uses a temporary copy and asserts source-package
+        hash invariance; no evidence of direct writes to the installed package
+        was found.
+      truncated: false
+  risks_truncated: false
+  completed_at: 2026-09-16T16:26:53.101Z
+history:
+  - goal_cycle: 1
+    iteration: 1
+    attempt: 1
+    outcome: pass
+    unresolved_ids: []
+    summary:
+      text: Independent read-only verification passed A1-A6 with implementation,
+        focused regression, full Runtime suite, and real-package lifecycle
+        evidence; no blockers or additional checks are required.
+      truncated: false
+    completed_at: 2026-09-16T16:26:53.101Z
+history_overflow:
+  dropped_entries: 0
+  first_dropped_at: null
+  last_dropped_at: null
+  outcome_counts:
+    pass: 0
+    fail: 0
+    blocked: 0
+    execution-error: 0
+    recovery: 0
+verification_result: pass
+verification_report: verification.md
+archived: true
+created_at: 2026-09-16T15:22:55.713Z
