@@ -1151,6 +1151,46 @@ function booleanReturnCount(node, value) {
     candidate.argument.argument?.type === 'Literal' && candidate.argument.argument.value === (value ? 0 : 1)).length;
 }
 
+function callsNamedFunction(program, node, name) {
+  return findAstNodes(node, candidate => candidate.type === 'CallExpression' &&
+    candidate.callee?.type === 'Identifier' && candidate.callee.name === name &&
+    !identifierIsLexicallyShadowed(program.ast, candidate.callee)).length > 0;
+}
+
+function autoModelEligibilityConsumed(program, fn) {
+  if (!fn.id?.name) return false;
+  const functions = findAstNodes(program.ast, node => node.type === 'FunctionDeclaration' && node.id?.name);
+  return functions.some(consumer => {
+    const supported = findAstNodes(consumer.body, node => node.type === 'Property' &&
+      (node.key?.name === 'supported' || node.key?.value === 'supported') &&
+      callsNamedFunction(program, node.value, fn.id.name));
+    if (supported.length === 0) return false;
+    return functions.some(parent => parent !== consumer &&
+      program.text.slice(parent.body.start, parent.body.end).includes('tengu_auto_mode_config') &&
+      callsNamedFunction(program, parent.body, consumer.id.name));
+  });
+}
+
+function autoModelDenylistShape(program, fn) {
+  const hasModelList = source => source.includes('claude-3-') &&
+    source.includes('claude-opus-4-') && source.includes('claude-sonnet-4-');
+  const body = program.text.slice(fn.body.start, fn.body.end);
+  if (hasModelList(body)) return true;
+  const localFunctions = new Map(findAstNodes(program.ast, node =>
+    node.type === 'FunctionDeclaration' && node.id?.name && node.params.length === 1)
+    .map(candidate => [candidate.id.name, candidate]));
+  return findAstNodes(fn.body, node => node.type === 'CallExpression' &&
+    node.callee?.type === 'Identifier' && node.arguments.length === 1)
+    .some(call => {
+      const helper = localFunctions.get(call.callee.name);
+      if (!helper || helper === fn || helper.end - helper.start > 800) return false;
+      const returned = helper.body.body?.length === 1 && helper.body.body[0].type === 'ReturnStatement' ?
+        helper.body.body[0] : null;
+      return returned?.argument && hasModelList(program.text.slice(returned.argument.start, returned.argument.end)) &&
+        autoModelEligibilityConsumed(program, fn);
+    });
+}
+
 function replaceNodeSource(container, node, replacement, text) {
   const original = text.slice(container.start, container.end);
   const start = node.start - container.start;
@@ -1219,8 +1259,7 @@ function analyzeAutoMode(target) {
           state: 'after', before, after: body});
         continue;
       }
-      if (fn.end - fn.start > 800 || !body.includes('claude-3-') || !body.includes('firstParty') ||
-          (!body.includes('claude-opus-4-') && !body.includes('claude-sonnet-4-')) ||
+      if (fn.end - fn.start > 800 || !body.includes('firstParty') || !autoModelDenylistShape(program, fn) ||
           booleanReturnCount(fn, false) < 2 || booleanReturnCount(fn, true) !== 1) continue;
       const after = `{${modelSentinel}${body.slice(1)}`;
       const match = {relativePath: program.relativePath, start: fn.body.start, end: fn.body.end,
@@ -1752,7 +1791,8 @@ function renderUltracodeFallbacks(program, fn, index, absoluteFile, xhighBinding
 }
 
 function renderUltracodeActivation(program, fn, index, absoluteFile, fallbackBindings) {
-  if (fn.params.length !== 3 || fn.body.body?.length !== 1 || fn.body.body[0].type !== 'ReturnStatement') return null;
+  if (![3, 4].includes(fn.params.length) || fn.body.body?.length !== 1 ||
+      fn.body.body[0].type !== 'ReturnStatement') return null;
   const comparisons = findAstNodes(fn.body, node => literalComparison(node, 'xhigh') &&
     (node.left?.type === 'CallExpression' || node.right?.type === 'CallExpression'));
   const enabledCheck = findAstNodes(fn.body, node => node.type === 'BinaryExpression' && node.operator === '===' &&
@@ -1867,6 +1907,29 @@ function voiceUnlockBody(marker) {
   return `{return!0/*${marker}*/}`;
 }
 
+function identifierIsShadowedInsideFunction(fn, identifier) {
+  if (identifier?.type !== 'Identifier') return true;
+  const pathToIdentifier = astPathToNode(fn.body, identifier);
+  if (!pathToIdentifier) return true;
+  const name = identifier.name;
+  for (const scope of pathToIdentifier) {
+    if (scope === fn.body) continue;
+    if (['FunctionDeclaration', 'FunctionExpression', 'ArrowFunctionExpression'].includes(scope.type)) {
+      if (scope.params.some(param => bindingPatternNames(param).includes(name)) ||
+          scope.type === 'FunctionExpression' && scope.id?.name === name || functionVarBindsName(scope, name)) return true;
+    }
+    if (scope.type === 'CatchClause' && bindingPatternNames(scope.param).includes(name)) return true;
+    if (scope.type === 'BlockStatement' && scope.body.some(statement =>
+      statement.type === 'VariableDeclaration' && statement.kind !== 'var' && declarationBindsName(statement, name) ||
+      ['FunctionDeclaration', 'ClassDeclaration'].includes(statement.type) && declarationBindsName(statement, name))) return true;
+    if (['ForStatement', 'ForInStatement', 'ForOfStatement'].includes(scope.type)) {
+      const declaration = scope.type === 'ForStatement' ? scope.init : scope.left;
+      if (declaration?.type === 'VariableDeclaration' && declaration.kind !== 'var' && declarationBindsName(declaration, name)) return true;
+    }
+  }
+  return false;
+}
+
 function voiceSettingsBindings(program, fn) {
   const bindingFor = (pattern, key) => {
     if (pattern?.type !== 'ObjectPattern') return null;
@@ -1888,6 +1951,7 @@ function voiceSettingsBindings(program, fn) {
     setAppState: bindingFor(pattern, 'setAppState'),
     setSettingsData: bindingFor(pattern, 'setSettingsData'),
     setChanges: bindingFor(pattern, 'setChanges'),
+    changeLog: bindingFor(pattern, 'changeLog'),
   };
   const writerCall = findAstNodes(fn.body, node => node.type === 'CallExpression' && node.callee?.type === 'Identifier' &&
     node.arguments?.[0]?.type === 'Literal' && node.arguments[0].value === 'userSettings')[0];
@@ -1897,7 +1961,14 @@ function voiceSettingsBindings(program, fn) {
     .sort((left, right) => (left.end - left.start) - (right.end - right.start))[0];
   bindings.writer = nestedWriter?.id.name || writerCall.callee.name;
   bindings.writerTakesKind = !nestedWriter;
-  return Object.values(bindings).every(value => value !== null && value !== undefined) ? bindings : null;
+  const required = [bindings.settingsData, bindings.setAppState, bindings.setSettingsData, bindings.writer];
+  const changeLogRecords = bindings.changeLog !== null && findAstNodes(fn.body, node =>
+    node.type === 'CallExpression' && node.callee?.type === 'MemberExpression' &&
+    node.callee.object?.type === 'Identifier' && node.callee.object.name === bindings.changeLog &&
+    (node.callee.property?.name === 'record' || node.callee.property?.value === 'record') &&
+    !identifierIsShadowedInsideFunction(fn, node.callee.object)).length > 0;
+  return required.every(value => value !== null && value !== undefined) &&
+    (bindings.setChanges !== null || changeLogRecords) ? bindings : null;
 }
 
 function voiceSettingsArrays(fn) {
@@ -1912,7 +1983,10 @@ function voiceSettingsArrays(fn) {
 
 function renderVoiceSettingSource(before, bindings) {
   const writerCall = bindings.writerTakesKind ? `${bindings.writer}("userSettings",` : `${bindings.writer}(`;
-  const setting = `{id:"voiceMode",label:"Voice mode",value:((${bindings.settingsData}?.voice?.enabled??${bindings.settingsData}?.voiceEnabled)===!0?(${bindings.settingsData}?.voice?.mode??"hold"):"off"),options:["off","hold","tap"],type:"enum",async onChange(__mode){const __enabled=__mode!=="off",__voiceMode=__mode==="tap"?"tap":__mode==="hold"?"hold":(${bindings.settingsData}?.voice?.mode??"hold");const __result=await ${writerCall}{voiceEnabled:__enabled,voice:{...${bindings.settingsData}?.voice,enabled:__enabled,mode:__voiceMode}});if(__result?.error)return{error:__result.error};${bindings.setSettingsData}(__state=>({...__state,voiceEnabled:__enabled,voice:{...__state?.voice,enabled:__enabled,mode:__voiceMode}}));${bindings.setAppState}(__state=>({...__state,settings:{...__state.settings,voiceEnabled:__enabled,voice:{...__state.settings?.voice,enabled:__enabled,mode:__voiceMode}}}));${bindings.setChanges}(__state=>({...__state,"Voice mode":__mode}))}}/*COMETIX_VOICE_SETTING*/,`;
+  const recordChange = bindings.setChanges !== null ?
+    `${bindings.setChanges}(__state=>({...__state,"Voice mode":__mode}))` :
+    `${bindings.changeLog}.record("Voice mode",__mode)`;
+  const setting = `{id:"voiceMode",label:"Voice mode",value:((${bindings.settingsData}?.voice?.enabled??${bindings.settingsData}?.voiceEnabled)===!0?(${bindings.settingsData}?.voice?.mode??"hold"):"off"),options:["off","hold","tap"],type:"enum",async onChange(__mode){const __enabled=__mode!=="off",__voiceMode=__mode==="tap"?"tap":__mode==="hold"?"hold":(${bindings.settingsData}?.voice?.mode??"hold");const __result=await ${writerCall}{voiceEnabled:__enabled,voice:{...${bindings.settingsData}?.voice,enabled:__enabled,mode:__voiceMode}});if(__result?.error)return{error:__result.error};${bindings.setSettingsData}(__state=>({...__state,voiceEnabled:__enabled,voice:{...__state?.voice,enabled:__enabled,mode:__voiceMode}}));${bindings.setAppState}(__state=>({...__state,settings:{...__state.settings,voiceEnabled:__enabled,voice:{...__state.settings?.voice,enabled:__enabled,mode:__voiceMode}}}));${recordChange}}}/*COMETIX_VOICE_SETTING*/,`;
   return `[${setting}${before.slice(1)}`;
 }
 

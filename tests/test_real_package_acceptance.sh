@@ -15,6 +15,15 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 source "$ROOT/tests/lib/dual-layout-fixture.sh"
 source "$ROOT/cc-patch-manager.sh"
 
+acceptance_tmp_dirs=()
+cleanup_acceptance_tmp() {
+  local directory
+  for directory in "${acceptance_tmp_dirs[@]}"; do
+    [[ -n "$directory" && -d "$directory" ]] && rm -rf "$directory"
+  done
+}
+trap cleanup_acceptance_tmp EXIT
+
 target_kind="${1:-}"
 
 if [[ -z "$target_kind" ]]; then
@@ -72,7 +81,7 @@ case "$target_kind" in
   cruce)
     source_root="${CC_PATCH_CRUCE_PACKAGE:-/opt/homebrew/lib/node_modules/@cometix/anthropic-cc}"
     expected_name='@cometix/anthropic-cc'
-    expected_version='2.1.259'
+    expected_version='2.1.273'
     applicable=(auto-mode keybindings transcript-dialog ultracode voice-mode context-limit computer-use)
     inapplicable=()
     ;;
@@ -95,14 +104,16 @@ fixture_assert_real_lifecycle() {
 }
 
 accept_package() {
-  local source="$1" name="$2" version="$3" entry copy before output id source_before source_after
+  local source="$1" name="$2" version="$3" entry copy copy_dir before output id source_before source_after
   # Source-protection guard: the acceptance operates on a COPY, so the source
   # package (e.g. the global cruce install) must be byte-for-byte unchanged before
   # vs after. This catches any future refactor that points the entry at the source
   # instead of the copy, or lets runtime_exec write baseline/transaction state
   # into the wrong package root.
   source_before=$(fixture_hash_package "$source")
-  copy=$(mktemp -d)/package
+  copy_dir=$(mktemp -d)
+  acceptance_tmp_dirs+=("$copy_dir")
+  copy="$copy_dir/package"
   cp -R "$source" "$copy"
   entry="$copy/cli.js"
   before=$(fixture_hash_package "$copy")
