@@ -1,0 +1,183 @@
+schema: comet.native.v4
+name: fix-cc-2-1-280-patches
+language: zh-CN
+phase: archive
+status: done
+state_version: 10
+brief: brief.md
+document_constraints_version: 1
+shape_confirmation_hash: f527e9651bac39891cf2b0f6073eae53fa656eae5939e109d229ca6c1c2c9fed
+spec_changes:
+  - capability: patch-engine
+    operation: modify
+    source: specs/patch-engine/spec.md
+workspace:
+  isolation: current
+  change_branch: main
+  target_branch: main
+  finish: null
+loop:
+  stage: done
+  goal_cycle: 1
+  iteration: 2
+  attempt: 1
+  retry_epoch: 0
+  failed_iteration_count: 0
+  no_progress_count: 0
+  execution_failure_count: 0
+  previous_unresolved_ids: []
+  next_action: null
+acceptance:
+  - id: A1
+    source: brief.md
+    text: A1：对 2.1.280 形态夹具（provider 门禁为 0 参 helper、黑名单为 opus-4-6/sonnet-4-6/haiku
+      三元组、`supported:` 属性消费门禁且被 `tengu_auto_mode_config` 消费者调用）执行 auto-mode
+      `check` 返回 `NEEDS_PATCH`，应用后返回 `ALREADY_PATCHED`；`firstParty`
+      内联旧形态夹具继续匹配，缺消费链或缺三元组的诱饵不被匹配。
+    result: passed
+    reason:
+      text: test_cc_2_1_280_compat.sh 退出码 0：2.1.280 夹具（0 参 helper 含
+        firstParty、opus-4-6/sonnet-4-6/haiku 三元组、supported 被
+        tengu_auto_mode_config 消费）check 为 NEEDS_PATCH，apply 后 ALREADY_PATCHED
+        且标记写入 auto-gate.js；缺消费链诱饵报告 MISSING_TARGET:model-eligibility；独立探针确认缺
+        haiku 的三元组不匹配、firstParty 内联旧形态返回 NEEDS_PATCH、跨模块 helper 不误匹配。
+      truncated: false
+  - id: A2
+    source: brief.md
+    text: A2：对 voice 命令对象与门禁/auth/flag 函数分属两个 chunk 的夹具执行 voice-mode `check` 返回
+      `NEEDS_PATCH`，应用后返回 `ALREADY_PATCHED`，且 entry-gate 补丁写入门禁定义所在
+      chunk；门禁与命令对象同 chunk 的旧形态夹具继续匹配。
+    result: passed
+    reason:
+      text: 2.1.280 测试退出码 0：命令对象与门禁分属两个 chunk，check 为 NEEDS_PATCH，apply 后
+        ALREADY_PATCHED，COMETIX_VOICE_GATE 只出现在门禁定义 chunk；2.1.273 同 chunk 夹具由
+        test_cc_2_1_273_compat.sh 覆盖并退出码 0。
+      truncated: false
+  - id: A3
+    source: brief.md
+    text: A3：在 `@cometix/anthropic-cc` 2.1.280 真实包的临时完整副本上，全部七个补丁依次完成 `NEEDS_PATCH
+      -> apply -> ALREADY_PATCHED -> restore`，随后批量应用、`node cli.js --version`
+      启动检查和 `restore-all` 均成功，副本恢复到原始哈希。
+    result: passed
+    reason:
+      text: CC_PATCH_CRUCE_PACKAGE=/tmp/cc-clean-2.1.280 真实包验收退出码
+        0：TARGET_VERSION:2.1.280，七补丁逐项 NEEDS_PATCH 到 apply 到 ALREADY_PATCHED 到
+        restore，再批量 apply、node cli.js --version、restore-all，副本与源包哈希前后一致。
+      truncated: false
+  - id: A4
+    source: brief.md
+    text: A4：项目现有快速测试全部通过（含 2.1.273 兼容测试与 dual-layout 生命周期），且真实 `/opt/homebrew`
+      源包在验收前后哈希不变。
+    result: passed
+    reason:
+      text: test_cc_2_1_273_compat.sh、test_dual_layout_lifecycle.sh、test_restore_all_baseline.sh、test_restore_skips_missing_target.sh
+        均退出码 0；/opt/homebrew 源包在验收窗口内无文件 mtime 变化。
+      truncated: false
+builder_handoff:
+  candidate_id: 69da41fb-23e6-43ee-86bf-7faadb3983fd
+  identity_provider: skill-coordinated
+  builder_execution_ref: skill-coordinated:builder:1f74d487-2c04-4e4f-8425-b491be1fb7de
+  iteration: 2
+  summary:
+    text: 与上一候选实现相同（2.1.280 auto-mode provider helper 形态 + 三元组黑名单、voice-mode 跨 chunk
+      门禁解析、AST 缓存性能修复、cruce 验收目标升至 2.1.280）。上一轮 Verify
+      因检查包装脚本写入仓库被判定候选变更而退回，包装脚本已移出仓库并删除，代码无变化。
+    truncated: false
+  addressed_acceptance_ids:
+    - A1
+    - A2
+    - A3
+    - A4
+  checks:
+    - name:
+        text: test_cc_2_1_280_compat.sh
+        truncated: false
+      result: passed
+      note:
+        text: 2.1.280 auto helper 形态与跨 chunk voice 形态，含诱饵
+        truncated: false
+    - name:
+        text: tests/test_*.sh 全套 16 项
+        truncated: false
+      result: passed
+      note:
+        text: 含 2.1.273 兼容、dual-layout、restore 回归
+        truncated: false
+    - name:
+        text: test_real_package_acceptance.sh cruce
+        truncated: false
+      result: passed
+      note:
+        text: 2.1.280 干净副本七补丁生命周期通过
+        truncated: false
+  checks_truncated: false
+  known_limits:
+    - text: 真实 /opt/homebrew 安装包带有用户之前一键应用的 5 个补丁与基线目录，验收在从基线还原的干净副本
+        /tmp/cc-clean-2.1.280 上进行；源包未被修改
+      truncated: false
+  known_limits_truncated: false
+  review: null
+  submitted_at: 2026-09-23T01:46:31.548Z
+blockers: []
+verification:
+  candidate_id: 69da41fb-23e6-43ee-86bf-7faadb3983fd
+  identity_provider: skill-coordinated
+  verifier_execution_ref: skill-coordinated:verifier:373020b6-9e9b-4298-9806-adb7bbafbbe2
+  iteration: 2
+  attempt: 1
+  assurance: skill-coordinated
+  verdict: pass
+  checks: []
+  summary:
+    text: A1-A4 全部通过：2.1.280 auto-mode helper/三元组与 voice-mode 跨 chunk
+      门禁按规格匹配且诱饵快速失败；真实包七补丁生命周期、CLI 启动与 restore-all 成功；快速测试全部退出码 0，Homebrew
+      源包验收窗口内未被写入。
+    truncated: false
+  risks:
+    - text: legacy hasModelList 从三家族收成 claude-3- 加 claude-opus-4-，sonnet-4-
+        不再是必要条件；现有夹具与真实包均含 opus-4-，未观察到回归
+      truncated: false
+    - text: 2.1.280 测试断言 entry-gate 写入定义 chunk，auth-probe 与 feature-flag
+        的写入位置由代码审查确认（同走 gateProgram）
+      truncated: false
+    - text: provider helper 只认同模块 0 参 FunctionDeclaration，不跟随 import；跨模块探针按规格返回
+        MISSING_TARGET
+      truncated: false
+  risks_truncated: false
+  completed_at: 2026-09-23T02:08:32.051Z
+history:
+  - goal_cycle: 1
+    iteration: 1
+    attempt: 0
+    outcome: recovery
+    unresolved_ids: []
+    summary:
+      text: Native check input changed after the candidate was built; a new Builder
+        candidate is required before checks can run again.
+      truncated: false
+    completed_at: 2026-09-23T01:44:29.849Z
+  - goal_cycle: 1
+    iteration: 2
+    attempt: 1
+    outcome: pass
+    unresolved_ids: []
+    summary:
+      text: A1-A4 全部通过：2.1.280 auto-mode helper/三元组与 voice-mode 跨 chunk
+        门禁按规格匹配且诱饵快速失败；真实包七补丁生命周期、CLI 启动与 restore-all 成功；快速测试全部退出码 0，Homebrew
+        源包验收窗口内未被写入。
+      truncated: false
+    completed_at: 2026-09-23T02:08:32.051Z
+history_overflow:
+  dropped_entries: 0
+  first_dropped_at: null
+  last_dropped_at: null
+  outcome_counts:
+    pass: 0
+    fail: 0
+    blocked: 0
+    execution-error: 0
+    recovery: 0
+verification_result: pass
+verification_report: verification.md
+archived: true
+created_at: 2026-09-22T23:57:24.170Z
