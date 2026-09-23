@@ -1082,8 +1082,27 @@ function bindingPatternNames(pattern, names = []) {
   return names;
 }
 
+function astPathIndex(root) {
+  const index = new WeakMap();
+  const visit = (node, path) => {
+    if (!node || typeof node !== 'object') return;
+    const next = [...path, node];
+    index.set(node, next);
+    for (const [key, value] of Object.entries(node)) {
+      if (key === 'start' || key === 'end') continue;
+      if (Array.isArray(value)) value.forEach(child => visit(child, next));
+      else if (value && typeof value === 'object') visit(value, next);
+    }
+  };
+  visit(root, []);
+  return index;
+}
+
 function astPathToNode(root, target, path = []) {
   if (!root || typeof root !== 'object') return null;
+  const cached = root.__ccAstPathIndex || (root.__ccAstPathIndex = astPathIndex(root));
+  const indexed = cached.get(target);
+  if (indexed) return indexed;
   const next = [...path, root];
   if (root === target) return next;
   for (const [key, value] of Object.entries(root)) {
@@ -1157,28 +1176,59 @@ function callsNamedFunction(program, node, name) {
     !identifierIsLexicallyShadowed(program.ast, candidate.callee)).length > 0;
 }
 
+function autoProviderGateShape(program, fn) {
+  const body = program.text.slice(fn.body.start, fn.body.end);
+  if (body.includes('firstParty')) return true;
+  // 2.1.280 extracted the provider comparison into a same-module zero-argument
+  // helper, so the eligibility body no longer mentions firstParty directly.
+  const localFunctions = program.__ccZeroArgFunctions || (program.__ccZeroArgFunctions = new Map(
+    findAstNodes(program.ast, node =>
+      node.type === 'FunctionDeclaration' && node.id?.name && node.params.length === 0)
+      .map(candidate => [candidate.id.name, candidate])));
+  return findAstNodes(fn.body, node => node.type === 'CallExpression' &&
+    node.callee?.type === 'Identifier' && node.arguments.length === 0)
+    .some(call => {
+      const helper = localFunctions.get(call.callee.name);
+      return helper && helper !== fn && helper.end - helper.start <= 800 &&
+        program.text.slice(helper.body.start, helper.body.end).includes('firstParty');
+    });
+}
+
 function autoModelEligibilityConsumed(program, fn) {
   if (!fn.id?.name) return false;
-  const functions = findAstNodes(program.ast, node => node.type === 'FunctionDeclaration' && node.id?.name);
-  return functions.some(consumer => {
-    const supported = findAstNodes(consumer.body, node => node.type === 'Property' &&
-      (node.key?.name === 'supported' || node.key?.value === 'supported') &&
-      callsNamedFunction(program, node.value, fn.id.name));
-    if (supported.length === 0) return false;
-    return functions.some(parent => parent !== consumer &&
-      program.text.slice(parent.body.start, parent.body.end).includes('tengu_auto_mode_config') &&
-      callsNamedFunction(program, parent.body, consumer.id.name));
-  });
+  const functions = program.__ccNamedFunctions || (program.__ccNamedFunctions = findAstNodes(program.ast, node =>
+    node.type === 'FunctionDeclaration' && node.id?.name));
+  const supportedConsumers = [];
+  const configConsumers = [];
+  for (const candidate of functions) {
+    const body = program.text.slice(candidate.body.start, candidate.body.end);
+    if (body.includes('tengu_auto_mode_config')) configConsumers.push(candidate);
+    if (findAstNodes(candidate.body, node => node.type === 'Property' &&
+        (node.key?.name === 'supported' || node.key?.value === 'supported') &&
+        callsNamedFunction(program, node.value, fn.id.name)).length > 0) {
+      supportedConsumers.push(candidate);
+    }
+  }
+  return supportedConsumers.some(consumer => configConsumers.some(parent =>
+    parent !== consumer && callsNamedFunction(program, parent.body, consumer.id.name)));
 }
 
 function autoModelDenylistShape(program, fn) {
-  const hasModelList = source => source.includes('claude-3-') &&
-    source.includes('claude-opus-4-') && source.includes('claude-sonnet-4-');
+  const hasModelList = source => source.includes('claude-3-') && source.includes('claude-opus-4-');
+  // 2.1.273 introduced a second denylist condition and 2.1.280 removed the
+  // legacy claude-3- family entirely, leaving only this shared triple.
+  const hasModelTriple = source => source.includes('claude-opus-4-6') &&
+    source.includes('claude-sonnet-4-6') && source.includes('haiku');
   const body = program.text.slice(fn.body.start, fn.body.end);
+  // The legacy claude-3- denylist is distinctive on its own. The 2.1.273/2.1.280
+  // triple is shared with unrelated model checks, so it also needs the Auto
+  // consumption chain to count.
   if (hasModelList(body)) return true;
-  const localFunctions = new Map(findAstNodes(program.ast, node =>
-    node.type === 'FunctionDeclaration' && node.id?.name && node.params.length === 1)
-    .map(candidate => [candidate.id.name, candidate]));
+  if (hasModelTriple(body) && autoModelEligibilityConsumed(program, fn)) return true;
+  const localFunctions = program.__ccOneArgFunctions || (program.__ccOneArgFunctions = new Map(
+    findAstNodes(program.ast, node =>
+      node.type === 'FunctionDeclaration' && node.id?.name && node.params.length === 1)
+      .map(candidate => [candidate.id.name, candidate])));
   return findAstNodes(fn.body, node => node.type === 'CallExpression' &&
     node.callee?.type === 'Identifier' && node.arguments.length === 1)
     .some(call => {
@@ -1248,7 +1298,7 @@ function analyzeAutoMode(target) {
   const files = new Map();
   const modelMatches = [];
   const modelSentinel = '/*CC_AUTO_MODE_MODEL_ELIGIBILITY*/return !0;';
-  const modelPrograms = candidatePrograms(target, ['claude-3-', 'CC_AUTO_MODE_MODEL_ELIGIBILITY']);
+  const modelPrograms = candidatePrograms(target, ['claude-3-', 'claude-sonnet-4-6', 'CC_AUTO_MODE_MODEL_ELIGIBILITY']);
   for (const program of modelPrograms) {
     const functions = findAstNodes(program.ast, node => node.type === 'FunctionDeclaration' && node.params.length === 1);
     for (const fn of functions) {
@@ -1259,7 +1309,7 @@ function analyzeAutoMode(target) {
           state: 'after', before, after: body});
         continue;
       }
-      if (fn.end - fn.start > 800 || !body.includes('firstParty') || !autoModelDenylistShape(program, fn) ||
+      if (fn.end - fn.start > 800 || !autoProviderGateShape(program, fn) || !autoModelDenylistShape(program, fn) ||
           booleanReturnCount(fn, false) < 2 || booleanReturnCount(fn, true) !== 1) continue;
       const after = `{${modelSentinel}${body.slice(1)}`;
       const match = {relativePath: program.relativePath, start: fn.body.start, end: fn.body.end,
@@ -1894,6 +1944,26 @@ function voiceFunctionByName(program, name) {
   return findAstNodes(program.ast, node => node.type === 'FunctionDeclaration' && node.id?.name === name)[0] || null;
 }
 
+// 2.1.280 split the voice command object and the gate function it calls into
+// different chunks. When the gate is imported, follow the binding to the
+// defining module and return a parsed program for it.
+function voiceGateProgram(target, index, program, gateName) {
+  const local = voiceFunctionByName(program, gateName);
+  if (local) return {program, gate: local};
+  let binding = null;
+  try {
+    binding = index.resolveLocal(packageFile(target.packageRoot, program.relativePath), gateName);
+  } catch {
+    return null;
+  }
+  const relativePath = path.relative(target.packageRoot, binding.file);
+  if (relativePath.startsWith('..') || path.isAbsolute(relativePath)) return null;
+  const parsed = parseProgram(binding.file, program.sourceType);
+  const gateProgram = {relativePath, sourceType: program.sourceType, ...parsed};
+  const gate = voiceFunctionByName(gateProgram, binding.exportedName);
+  return gate ? {program: gateProgram, gate} : null;
+}
+
 function voiceAndCalls(node) {
   if (node?.type === 'LogicalExpression' && node.operator === '&&') {
     const left = voiceAndCalls(node.left), right = voiceAndCalls(node.right);
@@ -2094,6 +2164,7 @@ function voiceAssetResources(options = {}) {
 function analyzeVoiceMode(target, options = {}) {
   const files = new Map(), commandPrograms = candidatePrograms(target,
     ['allow_voice_mode', 'name:"voice"', 'COMETIX_VOICE_GATE', 'COMETIX_VOICE_AVAIL']);
+  const voiceIndex = new ModuleIndex(target);
   const entryMatches = [], availabilityMatches = [], authMatches = [], flagMatches = [];
   for (const program of commandPrograms) {
     for (const fn of findAstNodes(program.ast, node => node.type === 'FunctionDeclaration')) {
@@ -2115,20 +2186,22 @@ function analyzeVoiceMode(target, options = {}) {
       const hiddenReturn = hidden && findAstNodes(hidden.value, node => node.type === 'ReturnStatement')[0];
       const gateCall = hiddenReturn?.argument?.type === 'UnaryExpression' && hiddenReturn.argument.operator === '!' ?
         hiddenReturn.argument.argument : null;
-      const gate = gateCall?.type === 'CallExpression' && gateCall.callee?.type === 'Identifier' ?
-        voiceFunctionByName(program, gateCall.callee.name) : null;
-      if (gate && !program.text.slice(gate.body.start, gate.body.end).includes('COMETIX_VOICE_GATE')) {
+      const resolved = gateCall?.type === 'CallExpression' && gateCall.callee?.type === 'Identifier' ?
+        voiceGateProgram(target, voiceIndex, program, gateCall.callee.name) : null;
+      const gate = resolved?.gate || null;
+      const gateProgram = resolved?.program || program;
+      if (gate && !gateProgram.text.slice(gate.body.start, gate.body.end).includes('COMETIX_VOICE_GATE')) {
         const returned = gate.body.body.length === 1 && gate.body.body[0].type === 'ReturnStatement' ? gate.body.body[0] : null;
         const calledNames = voiceAndCalls(returned?.argument);
         if (calledNames && [2, 3].includes(calledNames.length)) {
-          entryMatches.push(bodyPatch(files, program, gate, 'entry-gate', 'COMETIX_VOICE_GATE',
+          entryMatches.push(bodyPatch(files, gateProgram, gate, 'entry-gate', 'COMETIX_VOICE_GATE',
             voiceUnlockBody('COMETIX_VOICE_GATE')));
           for (const calledName of calledNames) {
-            const called = voiceFunctionByName(program, calledName);
+            const called = voiceFunctionByName(gateProgram, calledName);
             if (!called) continue;
-            const source = program.text.slice(called.start, called.end);
+            const source = gateProgram.text.slice(called.start, called.end);
             if (source.includes('allow_voice_mode') && !source.includes('COMETIX_VOICE_FLAG')) {
-              flagMatches.push(bodyPatch(files, program, called, 'feature-flag', 'COMETIX_VOICE_FLAG',
+              flagMatches.push(bodyPatch(files, gateProgram, called, 'feature-flag', 'COMETIX_VOICE_FLAG',
                 voiceUnlockBody('COMETIX_VOICE_FLAG')));
             }
             const tryStatement = called.body.body.length === 1 && called.body.body[0].type === 'TryStatement' ? called.body.body[0] : null;
@@ -2138,7 +2211,7 @@ function analyzeVoiceMode(target, options = {}) {
                 node.test.argument?.type === 'CallExpression').length === 1;
               const hasReturnCall = findAstNodes(tryStatement.block, node => node.type === 'ReturnStatement' &&
                 node.argument?.type === 'CallExpression').length === 1;
-              if (hasNegatedCall && hasReturnCall) authMatches.push(bodyPatch(files, program, called, 'auth-probe',
+              if (hasNegatedCall && hasReturnCall) authMatches.push(bodyPatch(files, gateProgram, called, 'auth-probe',
                 'COMETIX_VOICE_AUTH', voiceUnlockBody('COMETIX_VOICE_AUTH')));
             }
           }

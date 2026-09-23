@@ -81,7 +81,7 @@ case "$target_kind" in
   cruce)
     source_root="${CC_PATCH_CRUCE_PACKAGE:-/opt/homebrew/lib/node_modules/@cometix/anthropic-cc}"
     expected_name='@cometix/anthropic-cc'
-    expected_version='2.1.273'
+    expected_version='2.1.280'
     applicable=(auto-mode keybindings transcript-dialog ultracode voice-mode context-limit computer-use)
     inapplicable=()
     ;;
