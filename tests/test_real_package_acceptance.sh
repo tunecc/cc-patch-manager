@@ -10,6 +10,7 @@ set -euo pipefail
 #
 #   bash tests/test_real_package_acceptance.sh cometixspace   # needs CC_PATCH_COMETIXSPACE_PACKAGE
 #   bash tests/test_real_package_acceptance.sh cruce           # needs CC_PATCH_CRUCE_PACKAGE (default: global install)
+#   bash tests/test_real_package_acceptance.sh cometixcode     # needs CC_PATCH_COMETIXCODE_PACKAGE (default: global install)
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 source "$ROOT/tests/lib/dual-layout-fixture.sh"
@@ -81,12 +82,23 @@ case "$target_kind" in
   cruce)
     source_root="${CC_PATCH_CRUCE_PACKAGE:-/opt/homebrew/lib/node_modules/@cometix/anthropic-cc}"
     expected_name='@cometix/anthropic-cc'
-    expected_version='2.1.280'
+    expected_version='2.1.284'
     applicable=(auto-mode keybindings transcript-dialog ultracode voice-mode context-limit computer-use)
     inapplicable=()
     ;;
+  cometixcode)
+    # The CometixSpace-distributed @cometix/claude-code package after its own
+    # upstream patcher ran: live code carries /*@cc:*#*/ markers and the
+    # package root keeps the .claude-patcher/ state directory. Patches whose
+    # anchors were consumed upstream converge as already applied; the rest
+    # still apply on top. The tree hash covers .claude-patcher so the
+    # acceptance proves the upstream state stays untouched.
+    source_root="${CC_PATCH_COMETIXCODE_PACKAGE:-/opt/homebrew/lib/node_modules/@cometix/claude-code}"
+    expected_name='@cometix/claude-code'
+    expected_version='2.1.284'
+    ;;
   *)
-    fail "usage: ${BASH_SOURCE[0]##*/} {cometixspace|cruce}";;
+    fail "usage: ${BASH_SOURCE[0]##*/} {cometixspace|cruce|cometixcode}";;
 esac
 
 # Per-patch lifecycle on an existing real package: check NEEDS_PATCH → apply →
@@ -150,6 +162,58 @@ accept_package() {
   fixture_assert_tree_equals "$source_before" "$source_after"
 }
 
-accept_package "$source_root" "$expected_name" "$expected_version"
-printf 'PASS: %s %s real-package acceptance (%d applicable, %d documented inapplicable)\n' \
-  "$target_kind" "$expected_version" "${#applicable[@]}" "${#inapplicable[@]}"
+# Convergence acceptance for packages the upstream CometixSpace patcher already
+# patched: every patch must converge without errors (apply or already-applied),
+# the patched CLI must load, and restore-all must return the copy to the exact
+# pre-run tree — which includes the upstream .claude-patcher/ state.
+accept_converging_package() {
+  local source="$1" name="$2" version="$3" entry copy copy_dir before output id source_before source_after converged=0
+  source_before=$(fixture_hash_package "$source")
+  copy_dir=$(mktemp -d)
+  acceptance_tmp_dirs+=("$copy_dir")
+  copy="$copy_dir/package"
+  cp -R "$source" "$copy"
+  entry="$copy/cli.js"
+  before=$(fixture_hash_package "$copy")
+
+  runtime_exec inspect "$entry" | grep -Fx "TARGET_PACKAGE:$name"
+  runtime_exec inspect "$entry" | grep -Fx "TARGET_VERSION:$version"
+
+  for id in auto-mode keybindings transcript-dialog ultracode voice-mode context-limit computer-use; do
+    output=$(runtime_exec check "$entry" "$id" 2>&1) ||
+      fail "$id check must converge cleanly on $name $version: $output"
+    if grep -Fxq 'ALREADY_PATCHED' <<<"$output"; then
+      converged=$((converged + 1))
+    elif ! grep -Fxq 'NEEDS_PATCH' <<<"$output"; then
+      fail "$id neither NEEDS_PATCH nor ALREADY_PATCHED on $name $version: $output"
+    fi
+    runtime_exec apply "$entry" "$id" >/dev/null 2>&1 || fail "$id apply failed on $name $version"
+    output=$(runtime_exec check "$entry" "$id" 2>&1) ||
+      fail "$id post-apply check failed on $name $version: $output"
+    grep -Fxq 'ALREADY_PATCHED' <<<"$output" ||
+      fail "$id did not converge to ALREADY_PATCHED on $name $version: $output"
+  done
+  [[ "$converged" -gt 0 ]] || fail "no patch was externally satisfied on $name $version; marker recognition looks broken"
+
+  output=$(node "$entry" --version </dev/null 2>&1) || fail "patched --version smoke failed: $output"
+  [[ -n "$output" ]] || fail 'patched --version smoke produced no output'
+  output=$(runtime_exec restore-all "$entry" 2>&1) || fail "restore-all failed: $output"
+  grep -Fxq 'RESTORED:all' <<<"$output" || fail "restore-all did not report RESTORED:all: $output"
+  fixture_assert_tree_equals "$before" "$(fixture_hash_package "$copy")"
+  source_after=$(fixture_hash_package "$source")
+  fixture_assert_tree_equals "$source_before" "$source_after"
+  printf 'INFO: %d of 7 patches converged as externally satisfied\n' "$converged"
+}
+
+if [[ "$target_kind" == "cometixcode" ]]; then
+  if [[ ! -d "$source_root" ]]; then
+    printf 'SKIP: set CC_PATCH_COMETIXCODE_PACKAGE to a @cometix/claude-code install patched by the upstream patcher\n'
+    exit 0
+  fi
+  accept_converging_package "$source_root" "$expected_name" "$expected_version"
+  printf 'PASS: %s %s real-package acceptance (convergence, 7 patches)\n' "$target_kind" "$expected_version"
+else
+  accept_package "$source_root" "$expected_name" "$expected_version"
+  printf 'PASS: %s %s real-package acceptance (%d applicable, %d documented inapplicable)\n' \
+    "$target_kind" "$expected_version" "${#applicable[@]}" "${#inapplicable[@]}"
+fi

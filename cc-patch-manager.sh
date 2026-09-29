@@ -841,6 +841,7 @@ function hasCommonJsShape(ast) {
 function excludedPackagePath(relativePath) {
   const parts = relativePath.split(path.sep);
   return parts.includes('node_modules') || parts.includes('vendor') ||
+    parts.includes('.claude-patcher') ||
     parts.includes('.cc-patch-manager-baseline') ||
     parts.some(part => part.startsWith('.cc-patch-manager-baseline.stage-')) ||
     parts.some(part => part.startsWith('.cc-patch-manager-transaction') || part.startsWith('.cc-patch-manager-tx'));
@@ -1267,8 +1268,44 @@ function addPlannedReplacement(files, program, replacement, beforeContainer, aft
   });
 }
 
-function finishSemanticPlan(patchId, semanticTargets, files, diagnostics) {
-  const transformations = semanticTargets.flatMap(target => target.matches)
+// Upstream CometixSpace patch ids that satisfy one of our patches when their
+// /*@cc:<id>#<site>*/ markers are present in live code. Only live-code markers
+// are consulted; the upstream .claude-patcher/ state directory stays excluded
+// from scans and is never read.
+const EXTERNAL_PATCH_EQUIVALENTS = {
+  'auto-mode': ['classifier-model', 'classifier-fail-open', 'chrome-local-socket'],
+  'keybindings': ['enable-keybindings'],
+  'transcript-dialog': ['transcript-dialog-replay'],
+  'ultracode': ['unlock-ultracode'],
+  'voice-mode': ['enable-voice-mode', 'voice-asr-backend'],
+  'context-limit': ['context-limit'],
+  'computer-use': ['computer-use'],
+};
+
+const externalMarkerCache = new Map();
+
+function externalEquivalentsPresent(target, patchId) {
+  if (externalMarkerCache.has(patchId)) return externalMarkerCache.get(patchId);
+  const equivalents = EXTERNAL_PATCH_EQUIVALENTS[patchId];
+  const present = !!equivalents && equivalents.some(id =>
+    scanMarkerCandidates(target, `/*@cc:${id}#`).length > 0);
+  externalMarkerCache.set(patchId, present);
+  return present;
+}
+
+function externallySatisfiedTargets(target, patchId, semanticTargets) {
+  const equivalents = EXTERNAL_PATCH_EQUIVALENTS[patchId];
+  const unconsumed = semanticTargets.filter(item =>
+    item.expectedCardinality !== 0 && item.matches.length === 0);
+  if (!equivalents || !equivalents.length || unconsumed.length === 0) return semanticTargets;
+  if (!externalEquivalentsPresent(target, patchId)) return semanticTargets;
+  return semanticTargets.map(item => unconsumed.includes(item) ?
+    {...item, expectedCardinality: 0, externallySatisfied: true} : item);
+}
+
+function finishSemanticPlan(target, patchId, semanticTargets, files, diagnostics) {
+  semanticTargets = externallySatisfiedTargets(target, patchId, semanticTargets);
+  const transformations = semanticTargets.flatMap(semanticTarget => semanticTarget.matches)
     .filter(match => match.attributable !== false)
     .map(match => ({
       semanticId: targetIdForMatch(semanticTargets, match),
@@ -1280,14 +1317,21 @@ function finishSemanticPlan(patchId, semanticTargets, files, diagnostics) {
     }));
   return {
     patchId,
-    state: semanticTargets.every(target => target.matches.length === 1 && target.matches[0].state === 'after') ?
-      'already-patched' : 'needs-patch',
+    state: semanticTargets.every(targetSatisfied) ? 'already-patched' : 'needs-patch',
     semanticTargets,
     files: [...files.values()],
     resources: [],
     attribution: {transformations},
     diagnostics,
   };
+}
+
+// Targets whose requirement is satisfied structurally by the package shape
+// (expectedCardinality 0, e.g. 2.1.284 alias-based ultracode activation)
+// neither contribute matches nor block the already-patched state.
+function targetSatisfied(target) {
+  return target.expectedCardinality === 0 ? target.matches.length === 0 :
+    target.matches.length === 1 && target.matches[0].state === 'after';
 }
 
 function targetIdForMatch(semanticTargets, match) {
@@ -1384,7 +1428,7 @@ function analyzeAutoMode(target) {
     {id: 'classifier-fail-closed', expectedCardinality: 1, matches: failClosedMatches},
     {id: 'classifier-model-source', expectedCardinality: 1, matches: classifierMatches},
   ];
-  return finishSemanticPlan('auto-mode', semanticTargets, files, {
+  return finishSemanticPlan(target, 'auto-mode', semanticTargets, files, {
     candidateFiles: [...new Set([...modelPrograms, ...failPrograms, ...classifierPrograms].map(item => item.relativePath))],
   });
 }
@@ -1460,7 +1504,7 @@ function analyzeKeybindings(target) {
     {id: 'custom-keybindings-enabled', expectedCardinality: 1, matches: flagMatches},
     {id: 'ctrl-c-exit-binding', expectedCardinality: 1, matches: ctrlMatches},
   ];
-  return finishSemanticPlan('keybindings', semanticTargets, files, {
+  return finishSemanticPlan(target, 'keybindings', semanticTargets, files, {
     candidateFiles: [...new Set([...flagPrograms, ...ctrlPrograms].map(item => item.relativePath))],
   });
 }
@@ -1724,7 +1768,7 @@ function analyzeTranscriptDialog(target) {
     {id: 'dialog-channel-factory', expectedCardinality: 1, matches: factoryMatches},
     {id: 'host-cleanup', expectedCardinality: 1, matches: cleanupMatches},
   ];
-  return finishSemanticPlan('transcript-dialog', semanticTargets, files, {
+  return finishSemanticPlan(target, 'transcript-dialog', semanticTargets, files, {
     candidateFiles: [...new Set([...factoryPrograms, ...cleanupPrograms].map(item => item.relativePath))],
   });
 }
@@ -1817,6 +1861,41 @@ function renderUltracodeEligibility(program, fn, index, absoluteFile, xhighBindi
     `(${branchSource}||${maxLocalName}(${argumentSource})&&${supportSource})`, program.text);
 }
 
+// 2.1.284 staged shape: the eligibility function delegates to the xhigh gate
+// through wrapper calls and carries no xhigh/max literal of its own, e.g.
+//   function ZT(e){return Tf()&&(e===void 0||Q(e))}  with Q(e){return n9e(e)}
+// The void-0 comparison and the single gate-reaching call identify it; the
+// patch makes max-capable models pass by OR-ing the max gate onto that call.
+function renderUltracodeStagedEligibility(program, fn, index, absoluteFile, xhighBinding, maxLocalName) {
+  const stagedShape = fn.params.length === 1 && fn.body.body?.length === 1 &&
+    fn.body.body[0].type === 'ReturnStatement' &&
+    findAstNodes(fn.body, node => node.type === 'Literal' &&
+      (node.value === 'xhigh' || node.value === 'max')).length === 0 &&
+    findAstNodes(fn.body, node => node.type === 'BinaryExpression' && node.operator === '===' &&
+      (node.left?.type === 'UnaryExpression' && node.left.operator === 'void' ||
+       node.right?.type === 'UnaryExpression' && node.right.operator === 'void')).length > 0;
+  if (!stagedShape || !maxLocalName) return null;
+  const gateCalls = findAstNodes(fn.body, node => node.type === 'CallExpression' &&
+    node.arguments.length === 1 && node.arguments[0].type === 'Identifier').filter(call =>
+    bindingCallsTarget(index, resolvedCallBinding(index, absoluteFile, call), xhighBinding, 2));
+  if (gateCalls.length !== 1) return null;
+  const call = gateCalls[0];
+  const argumentSource = program.text.slice(call.arguments[0].start, call.arguments[0].end);
+  const callSource = program.text.slice(call.start, call.end);
+  return replaceNodeSource(fn.body, call, `(${callSource}||${maxLocalName}(${argumentSource}))`, program.text);
+}
+
+// 2.1.284 derives "ultracode active" from the requested effort alias or the
+// settings flag (A3n-style) instead of comparing the resolved effort, so the
+// activation requirement is structurally satisfied whenever the alias mapping
+// ({ultracode:"xhigh"}) exists. Presence of that mapping is the evidence.
+function hasUltracodeAliasMapping(target) {
+  return candidatePrograms(target, ['ultracode', '"xhigh"']).some(program =>
+    findAstNodes(program.ast, node => node.type === 'Property' &&
+      (node.key?.name || node.key?.value) === 'ultracode' &&
+      node.value?.type === 'Literal' && node.value.value === 'xhigh').length > 0);
+}
+
 function renderUltracodeFallbacks(program, fn, index, absoluteFile, xhighBinding, maxLocalName) {
   const fallbackShape = fn.params.length === 2 && findAstNodes(fn.body, node =>
     node.type === 'Literal' && node.value === 'xhigh').length > 0;
@@ -1878,7 +1957,9 @@ function analyzeUltracode(target) {
       const body = program.text.slice(fn.body.start, fn.body.end);
       const eligibilityPatched = uniqueGates ? reconstructedBodyMatch(program, fn, 'ULTRACODE_ELIGIBILITY',
         (originalProgram, originalFunction) => renderUltracodeEligibility(
-          originalProgram, originalFunction, index, absoluteFile, xhighBinding, maxLocalName)) : null;
+          originalProgram, originalFunction, index, absoluteFile, xhighBinding, maxLocalName) ??
+          renderUltracodeStagedEligibility(
+            originalProgram, originalFunction, index, absoluteFile, xhighBinding, maxLocalName)) : null;
       if (eligibilityPatched) eligibilityMatches.push(eligibilityPatched);
       const fallbackPatched = uniqueGates ? reconstructedBodyMatch(program, fn, 'ULTRACODE_EFFORT_FALLBACK',
         (originalProgram, originalFunction) => {
@@ -1894,7 +1975,9 @@ function analyzeUltracode(target) {
       if (!uniqueGates || eligibilityPatched || fallbackPatched) continue;
 
       const eligibilityModified = renderUltracodeEligibility(
-        program, fn, index, absoluteFile, xhighBinding, maxLocalName);
+        program, fn, index, absoluteFile, xhighBinding, maxLocalName) ??
+        renderUltracodeStagedEligibility(
+          program, fn, index, absoluteFile, xhighBinding, maxLocalName);
       if (eligibilityModified !== null) {
         eligibilityMatches.push(bodyPatch(files, program, fn, 'ultracode-eligibility',
           'ULTRACODE_ELIGIBILITY', eligibilityModified));
@@ -1930,12 +2013,15 @@ function analyzeUltracode(target) {
     }
   }
 
+  const aliasActivation = hasUltracodeAliasMapping(target);
   const semanticTargets = [
     {id: 'ultracode-eligibility', expectedCardinality: 1, matches: eligibilityMatches},
     {id: 'ultracode-effort-fallback', expectedCardinality: 1, matches: fallbackMatches},
-    {id: 'ultracode-activation', expectedCardinality: 1, matches: activationMatches},
+    {id: 'ultracode-activation',
+      expectedCardinality: aliasActivation && activationMatches.length === 0 ? 0 : 1,
+      matches: activationMatches},
   ];
-  return finishSemanticPlan('ultracode', semanticTargets, files, {
+  return finishSemanticPlan(target, 'ultracode', semanticTargets, files, {
     candidateFiles: [...new Set([...xhighGate.programs, ...maxGate.programs, ...consumerPrograms].map(item => item.relativePath))],
   });
 }
@@ -2338,7 +2424,7 @@ function analyzeVoiceMode(target, options = {}) {
     {id: 'auth-probe', expectedCardinality: 1, matches: authMatches},
     {id: 'feature-flag', expectedCardinality: 1, matches: flagMatches},
   ];
-  const plan = finishSemanticPlan('voice-mode', semanticTargets, files, {
+  const plan = finishSemanticPlan(target, 'voice-mode', semanticTargets, files, {
     candidateFiles: [...new Set([...commandPrograms, ...capabilityPrograms, ...settingsPrograms, ...connectionPrograms]
       .map(item => item.relativePath))],
   });
@@ -2503,7 +2589,7 @@ function analyzeContextLimit(target) {
     {id: 'context-default', expectedCardinality: 1, matches: defaultMatches},
     {id: 'settings-env-refresh', expectedCardinality: 1, matches: settingsMatches},
   ];
-  const plan = finishSemanticPlan('context-limit', semanticTargets, files, {
+  const plan = finishSemanticPlan(target, 'context-limit', semanticTargets, files, {
     candidateFiles: [...new Set([...defaultPrograms, ...settingsPrograms].map(item => item.relativePath))],
   });
   plan.attribution.transformations.push(...importTransformations);
@@ -2512,8 +2598,14 @@ function analyzeContextLimit(target) {
 
 function unwrapComputerSchemaExpression(expression) {
   let current = expression;
-  while (current?.type === 'SequenceExpression' || current?.type === 'ParenthesizedExpression') {
-    current = current.type === 'SequenceExpression' ? current.expressions.at(-1) : current.expression;
+  while (current?.type === 'SequenceExpression' || current?.type === 'ParenthesizedExpression' ||
+      current?.type === 'ArrowFunctionExpression') {
+    if (current.type === 'ArrowFunctionExpression') {
+      if (current.params.length !== 0 || current.body.type === 'BlockStatement') break;
+      current = current.body;
+    } else {
+      current = current.type === 'SequenceExpression' ? current.expressions.at(-1) : current.expression;
+    }
   }
   return current;
 }
@@ -2531,9 +2623,11 @@ function computerSchemaShape(program, property) {
   const parent = enclosingNode(program.ast, property, 'ObjectExpression');
   const valueSource = program.text.slice(property.value.start, property.value.end).toLowerCase();
   if (!parent || parent.properties.length < 50 || !valueSource.includes('compact conversation')) return null;
+  const lazy = property.value.type === 'ArrowFunctionExpression' &&
+    property.value.params.length === 0 && property.value.body.type !== 'BlockStatement';
   const root = computerSchemaRoot(property.value);
   if (root?.type === 'Identifier') {
-    return {property, parent, direct: true, boolean: root.name, object: root.name, enumeration: root.name};
+    return {property, parent, direct: true, lazy: false, boolean: root.name, object: root.name, enumeration: root.name};
   }
   if (root?.type !== 'CallExpression' || root.callee?.type !== 'Identifier') return null;
   const objects = new Set(), enumerations = new Set();
@@ -2548,20 +2642,21 @@ function computerSchemaShape(program, property) {
     }
   }
   if (objects.size !== 1 || enumerations.size !== 1) return null;
-  return {property, parent, direct: false, boolean: root.callee.name,
+  return {property, parent, direct: false, lazy, boolean: root.callee.name,
     object: [...objects][0], enumeration: [...enumerations][0]};
 }
 
 function computerSchemaInsertion(shape, keys) {
+  const wrap = value => shape.lazy ? `()=>${value}` : value;
   const boolean = shape.direct ? `${shape.boolean}.boolean()` : `${shape.boolean}()`;
   const object = shape.direct ? `${shape.object}.object` : shape.object;
   const enumeration = shape.direct ? `${shape.enumeration}.enum` : shape.enumeration;
   const parts = [];
   if (keys.includes('computerUseEnabled')) {
-    parts.push(`computerUseEnabled:${boolean}.optional().describe("Enable computer use MCP server for desktop control (macOS only, default off)")`);
+    parts.push(`computerUseEnabled:${wrap(`${boolean}.optional().describe("Enable computer use MCP server for desktop control (macOS only, default off)")`)}`);
   }
   if (keys.includes('computerUseConfig')) {
-    parts.push(`computerUseConfig:${object}({mouseAnimation:${boolean}.optional(),hideBeforeAction:${boolean}.optional(),clipboardGuard:${boolean}.optional(),coordinateMode:${enumeration}(["pixels","normalized_0_100"]).optional()}).optional().describe("Computer use sub-configuration overrides")`);
+    parts.push(`computerUseConfig:${wrap(`${object}({mouseAnimation:${boolean}.optional(),hideBeforeAction:${boolean}.optional(),clipboardGuard:${boolean}.optional(),coordinateMode:${enumeration}(["pixels","normalized_0_100"]).optional()}).optional().describe("Computer use sub-configuration overrides")`)}`);
   }
   return parts.length > 0 ? `,${parts.join(',')}` : '';
 }
@@ -2923,7 +3018,7 @@ function analyzeComputerUse(target) {
     {id: 'enable-gate', expectedCardinality: 1, matches: gateMatches},
     {id: 'config-merge', expectedCardinality: 1, matches: configMatches},
   ];
-  const plan = finishSemanticPlan('computer-use', semanticTargets, files, {
+  const plan = finishSemanticPlan(target, 'computer-use', semanticTargets, files, {
     candidateFiles: [...new Set([...schema.programs, ...(helpers?.programs || []), ...configPrograms, ...gatePrograms]
       .map(item => item.relativePath))],
   });
@@ -3026,7 +3121,7 @@ function renderReplacements(source, replacements) {
 function validatePlan(target, plan) {
   for (const semanticTarget of plan.semanticTargets) {
     const count = semanticTarget.matches.length;
-    if (count === 0) {
+    if (count === 0 && semanticTarget.expectedCardinality !== 0) {
       console.error(`MISSING_TARGET:${semanticTarget.id}`);
       for (const file of (plan.diagnostics && plan.diagnostics.candidateFiles) || []) {
         console.error(`CANDIDATE_FILE:${JSON.stringify(file)}`);
@@ -3218,9 +3313,16 @@ const knownPatchSentinels = [
 ];
 
 function findUntrustedPatchSentinel(target) {
+  // Sentinels belonging to patches whose equivalent upstream markers are
+  // present in live code are attributable to the external patcher, not to an
+  // unknown writer: baselining the current tree is safe because restore
+  // returns to exactly this externally patched state.
+  const externallyTrusted = new Set(Object.keys(EXTERNAL_PATCH_EQUIVALENTS)
+    .filter(patchId => externalEquivalentsPresent(target, patchId)));
   for (const relativePath of packageModulePaths(target.packageRoot)) {
     const text = fs.readFileSync(path.join(target.packageRoot, relativePath), 'utf8');
     for (const sentinel of knownPatchSentinels) {
+      if (externallyTrusted.has(sentinel.patchId)) continue;
       if (text.includes(sentinel.value)) return {...sentinel, relativePath};
     }
     const unknown = text.match(/\bCC_[A-Z0-9_]*(?:PATCH|PATCHED)\b/);
@@ -3878,8 +3980,12 @@ function ensureBaselineForPlan(target, plan, operations = [], publication = null
   const previousManifest = manifest ? JSON.parse(JSON.stringify(manifest)) : null;
   const entryPath = path.relative(target.packageRoot, target.entryPath);
   if (!manifest) {
+    // After-state matches are externally attributable when the equivalent
+    // upstream markers are present: the state is the upstream patcher's, not
+    // an untracked writer of our own markers.
     const hasManagedState = plan.semanticTargets.some(semanticTarget =>
-      semanticTarget.matches.some(match => match.state === 'after' && match.attributable !== false));
+      semanticTarget.matches.some(match => match.state === 'after' && match.attributable !== false)) &&
+      !externalEquivalentsPresent(target, plan.patchId);
     if (hasManagedState) throw new Error('patched or unknown state has no trusted baseline');
     const sentinel = findUntrustedPatchSentinel(target);
     if (sentinel) {
