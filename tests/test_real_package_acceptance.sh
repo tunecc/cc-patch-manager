@@ -10,6 +10,7 @@ set -euo pipefail
 #
 #   bash tests/test_real_package_acceptance.sh cometixspace   # needs CC_PATCH_COMETIXSPACE_PACKAGE
 #   bash tests/test_real_package_acceptance.sh cruce           # needs CC_PATCH_CRUCE_PACKAGE (default: global install)
+#   bash tests/test_real_package_acceptance.sh cruce-launcher  # @cometix/anthropic-cc 2.1.296+ launcher + generated runtime tree
 #   bash tests/test_real_package_acceptance.sh cometixcode     # needs CC_PATCH_COMETIXCODE_PACKAGE (default: global install)
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -28,7 +29,7 @@ trap cleanup_acceptance_tmp EXIT
 target_kind="${1:-}"
 
 if [[ -z "$target_kind" ]]; then
-  printf 'SKIP: %s needs a target kind (cometixspace|cruce) and a real package source\n' "${BASH_SOURCE[0]##*/}"
+  printf 'SKIP: %s needs a target kind (cometixspace|cruce|cruce-launcher|cometixcode) and a real package source\n' "${BASH_SOURCE[0]##*/}"
   exit 0
 fi
 
@@ -86,6 +87,32 @@ case "$target_kind" in
     applicable=(auto-mode keybindings transcript-dialog ultracode voice-mode context-limit computer-use)
     inapplicable=()
     ;;
+  cruce-launcher)
+    # @cometix/anthropic-cc 2.1.296+ moved the real JavaScript out of the npm
+    # package: package/cli.js is a launcher that materialises a runtime tree
+    # under <versions-root>/<version>/<build-*>/ and runs its runtime-entry.js.
+    # The acceptance therefore operates on a copy of that runtime tree, and the
+    # source guard covers both the package and the tree the launcher generated.
+    source_root="${CC_PATCH_CRUCE_PACKAGE:-/opt/homebrew/lib/node_modules/@cometix/anthropic-cc}"
+    [[ -d "$source_root" ]] || fail "cruce-launcher needs a @cometix/anthropic-cc install at $source_root"
+    expected_name='@cometix/anthropic-cc'
+    expected_version=$(json_scalar_field "$source_root/package.json" version) ||
+      fail "cannot read version from $source_root/package.json"
+    json_scalar_field "$source_root/package.json" runtimeBuild >/dev/null 2>&1 ||
+      fail "$source_root is not a launcher-layout package (no runtimeBuild)"
+    versions_root=$(anthropic_cc_versions_root)
+    launcher_pointer="$versions_root/$expected_version/current.json"
+    [[ -f "$launcher_pointer" ]] ||
+      fail "no runtime tree pointer at $launcher_pointer; start the CLI once first"
+    launcher_build=$(json_scalar_field "$launcher_pointer" build) ||
+      fail "cannot read build from $launcher_pointer"
+    source_root="$versions_root/$expected_version/$launcher_build"
+    [[ -f "$source_root/runtime-entry.js" ]] ||
+      fail "runtime tree $source_root has no runtime-entry.js"
+    entry_name='runtime-entry.js'
+    applicable=(auto-mode keybindings transcript-dialog ultracode voice-mode context-limit computer-use)
+    inapplicable=()
+    ;;
   cometixcode)
     # The CometixSpace-distributed @cometix/claude-code package after its own
     # upstream patcher ran: live code carries /*@cc:*#*/ markers and the
@@ -98,7 +125,7 @@ case "$target_kind" in
     expected_version='2.1.284'
     ;;
   *)
-    fail "usage: ${BASH_SOURCE[0]##*/} {cometixspace|cruce|cometixcode}";;
+    fail "usage: ${BASH_SOURCE[0]##*/} {cometixspace|cruce|cruce-launcher|cometixcode}";;
 esac
 
 # Per-patch lifecycle on an existing real package: check NEEDS_PATCH → apply →
@@ -118,16 +145,17 @@ fixture_assert_real_lifecycle() {
 accept_package() {
   local source="$1" name="$2" version="$3" entry copy copy_dir before output id source_before source_after
   # Source-protection guard: the acceptance operates on a COPY, so the source
-  # package (e.g. the global cruce install) must be byte-for-byte unchanged before
-  # vs after. This catches any future refactor that points the entry at the source
-  # instead of the copy, or lets runtime_exec write baseline/transaction state
-  # into the wrong package root.
+  # package (e.g. the global cruce install, or the runtime tree its launcher
+  # generated) must be byte-for-byte unchanged before vs after. This catches any
+  # future refactor that points the entry at the source instead of the copy, or
+  # lets runtime_exec write baseline/transaction state into the wrong package root.
   source_before=$(fixture_hash_package "$source")
   copy_dir=$(mktemp -d)
   acceptance_tmp_dirs+=("$copy_dir")
   copy="$copy_dir/package"
   cp -R "$source" "$copy"
-  entry="$copy/cli.js"
+  # Launcher-layout distributions keep the real entry under a different name.
+  entry="$copy/${entry_name:-cli.js}"
   before=$(fixture_hash_package "$copy")
 
   # Identity.

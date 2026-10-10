@@ -193,35 +193,255 @@ EOF
 }
 
 # ---------- target resolution ----------
-find_cli_js() {
-  local locations=(
-    "$HOME/.claude/local/node_modules/@anthropic-ai/claude-code/cli.js"
-    "$HOME/.claude/local/node_modules/@cometix/claude-code/cli.js"
-    "$HOME/.claude/local/node_modules/@cometix/anthropic-cc/cli.js"
-  )
+# 候选安装根：每个发行版在 npm 全局根、用户本地根与系统根下各有一份 cli.js。
+# 顺序只影响并列时的展示顺序，不再决定"只修第一个"。
+candidate_package_roots() {
+  local roots=()
   if command -v npm >/dev/null 2>&1; then
     local npm_root
     npm_root=$(npm root -g 2>/dev/null || true)
-    if [[ -n "${npm_root:-}" ]]; then
-      locations+=(
-        "$npm_root/@anthropic-ai/claude-code/cli.js"
-        "$npm_root/@cometix/claude-code/cli.js"
-        "$npm_root/@cometix/anthropic-cc/cli.js"
-      )
+    [[ -n "${npm_root:-}" ]] && roots+=("$npm_root")
+  fi
+  roots+=(
+    "$HOME/.claude/local/node_modules"
+    "/usr/local/lib/node_modules"
+    "/usr/lib/node_modules"
+  )
+  printf '%s\n' "${roots[@]}"
+}
+
+patchable_package_names() {
+  printf '%s\n' '@anthropic-ai/claude-code' '@cometix/claude-code' '@cometix/anthropic-cc'
+}
+
+# @cometix/anthropic-cc 2.1.296 起，包内 cli.js 只是启动器：真实 JS 在运行时
+# 生成的运行树里。语义与上游 runtime.mjs 的 launch() 保持一致。
+anthropic_cc_versions_root() {
+  if [[ -n "${ANTHROPIC_CC_DATA_DIR:-}" ]]; then
+    printf '%s/versions\n' "${ANTHROPIC_CC_DATA_DIR}"
+    return 0
+  fi
+  local data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
+  printf '%s/anthropic-cc/versions\n' "$data_home"
+}
+
+# 提取 JSON 里的顶层字符串字段（version / runtimeBuild / build / source）。
+# 只用于本工具与上游已知形状的清单文件，不是通用 JSON 解析；这样目标发现不
+# 依赖 node 在 PATH 中（测试会在裁剪过的 PATH 下运行发现逻辑）。
+json_scalar_field() {
+  local file="$1" field="$2" value
+  [[ -f "$file" && -r "$file" ]] || return 1
+  value=$(sed -n "s/.*[[:space:]{,]\"${field}\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$file" | head -1)
+  [[ -n "$value" ]] || return 1
+  printf '%s\n' "$value"
+}
+
+# 解析 @cometix/anthropic-cc 启动器形态的当前运行树，语义与上游 runtime.mjs
+# 的 launch() 一致。单行输出 "<真实入口>\t<失败原因>"：
+#   成功 → 入口非空、原因为空
+#   失败 → 入口为空、原因为失败码（missing-current-json / stale-runtime-build / ...）
+# 两个字段必须走同一行 stdout：调用方都在命令替换里取结果，写在全局变量里的
+# 原因会随子 shell 一起丢失，调用方就只能看到空备注并把启动器交给引擎。
+resolve_anthropic_cc_runtime_entry() {
+  local package_dir="$1" package_version="$2"
+  local versions_root manifest build source tree entry="" expected_build reason=""
+  if [[ -z "$package_version" ]]; then
+    reason="missing-package-version"
+  else
+    versions_root=$(anthropic_cc_versions_root)
+    manifest="$versions_root/$package_version/current.json"
+    if [[ ! -f "$manifest" ]]; then
+      reason="missing-current-json"
+    elif ! build=$(json_scalar_field "$manifest" build); then
+      reason="invalid-current-json"
+    elif ! expected_build=$(json_scalar_field "$package_dir/package.json" runtimeBuild); then
+      reason="missing-runtime-build"
+    else
+      source=$(json_scalar_field "$manifest" source) || source=""
+      if [[ "$source" != "$expected_build" ]]; then
+        reason="stale-runtime-build"
+      else
+        tree="$versions_root/$package_version/$build"
+        if [[ ! -f "$tree/cli.js" ]]; then
+          reason="missing-runtime-tree"
+        else
+          entry="$tree/runtime-entry.js"
+          if [[ ! -f "$entry" ]]; then
+            reason="missing-runtime-entry"
+            entry=""
+          fi
+        fi
+      fi
     fi
   fi
-  locations+=(
-    "/usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js"
-    "/usr/local/lib/node_modules/@cometix/claude-code/cli.js"
-    "/usr/local/lib/node_modules/@cometix/anthropic-cc/cli.js"
-    "/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js"
-    "/usr/lib/node_modules/@cometix/claude-code/cli.js"
-    "/usr/lib/node_modules/@cometix/anthropic-cc/cli.js"
-  )
-  local p
-  for p in "${locations[@]}"; do
-    if [[ -f "$p" ]]; then
-      printf '%s\n' "$p"
+  printf '%s\t%s\n' "$entry" "$reason"
+}
+
+# 只取真实入口；解析失败时返回 1（供 launcher_real_entry / redirect_launcher_entry 使用）
+anthropic_cc_runtime_entry_only() {
+  local resolved entry reason
+  resolved=$(resolve_anthropic_cc_runtime_entry "$1" "$2") || return 1
+  entry="${resolved%%$'\t'*}"
+  reason="${resolved#*$'\t'}"
+  [[ -n "$entry" ]] || return 1
+  printf '%s\n' "$entry"
+}
+
+# 枚举本机全部可补丁目标，每行输出：
+#   <包名>\t<版本>\t<入口路径>\t<布局形态>\t<备注>
+# 布局形态：direct（包内 cli.js 即真实入口）| launcher（启动器 + 生成运行树）。
+# 备注为空表示正常；否则是目标暂不可补丁的原因（如 stale-runtime-build）。
+discover_targets() {
+  local root name dir cli package_version entry reason resolved real
+  local seen=""
+  while IFS= read -r root; do
+    [[ -d "$root" ]] || continue
+    while IFS= read -r name; do
+      dir="$root/$name"
+      cli="$dir/cli.js"
+      [[ -f "$cli" ]] || continue
+      # 去重：npm 全局根与用户本地根可能指向同一目录
+      real=$(cd "$dir" 2>/dev/null && pwd -P) || continue
+      case "$seen" in *"|$real|"*) continue ;; esac
+      seen="$seen|$real|"
+      package_version=$(json_scalar_field "$dir/package.json" version) || package_version=""
+      if [[ "$name" == "@cometix/anthropic-cc" ]] &&
+         json_scalar_field "$dir/package.json" runtimeBuild >/dev/null 2>&1; then
+        # 启动器形态：真实入口在生成运行树内，包内 cli.js 不是补丁目标。
+        # 解析失败时入口留空、只带原因，让上层给出可操作提示，而不是把启动器
+        # 交给引擎去撞一句"entry has neither split-ESM imports nor a single-CJS shape"。
+        resolved=$(resolve_anthropic_cc_runtime_entry "$dir" "$package_version")
+        entry="${resolved%%$'\t'*}"
+        reason="${resolved#*$'\t'}"
+        if [[ -n "$entry" ]]; then
+          printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$package_version" "$entry" "launcher" ""
+        else
+          printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$package_version" "$cli" "launcher" "$reason"
+        fi
+      else
+        printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$package_version" "$cli" "direct" ""
+      fi
+    done < <(patchable_package_names)
+  done < <(candidate_package_roots)
+}
+
+find_cli_js() {
+  local line
+  # 只返回第一个"当前可补丁"的目标，保持旧调用方语义；不可补丁的启动器目标跳过。
+  while IFS=$'\t' read -r _name _version entry _kind note; do
+    [[ -n "${note:-}" ]] && continue
+    [[ -n "${entry:-}" ]] || continue
+    printf '%s\n' "$entry"
+    return 0
+  done < <(discover_targets)
+  return 1
+}
+
+# 目标清单（ discover_targets 的结果缓存）
+TARGET_NAMES=()
+TARGET_VERSIONS=()
+TARGET_ENTRIES=()
+TARGET_KINDS=()
+TARGET_NOTES=()
+SELECTED_TARGET=-1
+
+load_targets() {
+  TARGET_NAMES=(); TARGET_VERSIONS=(); TARGET_ENTRIES=(); TARGET_KINDS=(); TARGET_NOTES=()
+  SELECTED_TARGET=-1
+  local name version entry kind note
+  while IFS=$'\t' read -r name version entry kind note; do
+    [[ -n "${entry:-}" ]] || continue
+    TARGET_NAMES+=("$name")
+    TARGET_VERSIONS+=("$version")
+    TARGET_ENTRIES+=("$entry")
+    TARGET_KINDS+=("$kind")
+    TARGET_NOTES+=("${note:-}")
+  done < <(discover_targets)
+}
+
+target_count() {
+  printf '%s\n' "${#TARGET_ENTRIES[@]}"
+}
+
+# 选中第 idx 个目标（0 基）；同步 CLI_PATH 与身份/状态缓存。
+# 身份三字段必须一起清空：draw_header 只在 TARGET_PACKAGE 为空时才重新探测，
+# 不清就会把上一个目标的包名版本继续显示在新目标上。
+select_target() {
+  local idx="$1"
+  if (( idx < 0 || idx >= ${#TARGET_ENTRIES[@]} )); then
+    return 1
+  fi
+  SELECTED_TARGET=$idx
+  CLI_PATH="${TARGET_ENTRIES[$idx]}"
+  TARGET_IDENTITY_LOADED=""
+  TARGET_PACKAGE="" TARGET_VERSION="" TARGET_LAYOUT=""
+  STATUS=()
+  MSG=()
+  return 0
+}
+
+target_note_cn() {
+  local reason="${1:-}"
+  case "$reason" in
+    missing-current-json)   printf '尚未生成运行树（需先启动一次该 CLI）' ;;
+    invalid-current-json)   printf '运行树指针损坏（需先启动一次该 CLI）' ;;
+    stale-runtime-build)    printf '运行树已过期（重启该 CLI 后会重建）' ;;
+    missing-runtime-tree)   printf '运行树目录缺失（需先启动一次该 CLI）' ;;
+    missing-runtime-entry)  printf '运行树入口缺失（需先启动一次该 CLI）' ;;
+    missing-runtime-build)  printf '主包缺少 runtimeBuild 标识' ;;
+    missing-package-version) printf '主包缺少 version 标识' ;;
+    "")                     printf '' ;;
+    *)                      printf '%s' "$reason" ;;
+  esac
+}
+
+# 交互式目标选择：多个目标时让用户选一个。不可补丁的目标（如运行树未生成）也会
+# 列出，但只显示原因、不给可选编号，避免用户选到一个必然失败的入口。
+# 只有本机恰好一个目标时才静默选中，保持单目标机器的旧行为。
+# 返回 0 表示已选定（SELECTED_TARGET 有效）；返回 1 表示用户取消或无可用目标。
+choose_target_interactive() {
+  local i choice usable=0 number=0
+  local -a numbers=()
+  for i in "${!TARGET_ENTRIES[@]}"; do
+    if [[ -z "${TARGET_NOTES[$i]:-}" ]]; then
+      usable=$((usable + 1))
+      numbers[$i]=$((usable))
+    else
+      numbers[$i]=0
+    fi
+  done
+  if (( usable == 0 )); then
+    return 1
+  fi
+  # 只有一个已安装目标时沿用旧行为：不询问、不打印横幅。
+  if (( ${#TARGET_ENTRIES[@]} == 1 )); then
+    select_target 0
+    return 0
+  fi
+  printf '\n%s检测到 %d 个可补丁目标，请选择要应用到哪一个：%s\n' "$BOLD" "$usable" "$NC"
+  for i in "${!TARGET_ENTRIES[@]}"; do
+    local note label
+    note=$(target_note_cn "${TARGET_NOTES[$i]:-}")
+    if [[ -n "$note" ]]; then
+      label="  -) ${TARGET_NAMES[$i]} ${TARGET_VERSIONS[$i]} — 暂不可补丁：$note"
+    else
+      number=$((number + 1))
+      label="  $number) ${TARGET_NAMES[$i]} ${TARGET_VERSIONS[$i]} [${TARGET_KINDS[$i]}]"
+    fi
+    printf '%s\n     %s\n' "$label" "${TARGET_ENTRIES[$i]}"
+  done
+  printf '请选择 [1-%d，回车取消]: ' "$usable"
+  if ! IFS= read -r choice; then
+    return 1
+  fi
+  [[ -n "$choice" ]] || return 1
+  if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > usable )); then
+    warning "无效选择: $choice"
+    return 1
+  fi
+  for i in "${!TARGET_ENTRIES[@]}"; do
+    if [[ "${numbers[$i]}" == "$choice" ]]; then
+      select_target "$i"
       return 0
     fi
   done
@@ -230,11 +450,41 @@ find_cli_js() {
 
 CLI_PATH=""
 
+# 若 <path> 是 @cometix/anthropic-cc 的启动器 cli.js，打印其真实补丁入口
+# （生成运行树中的 runtime-entry.js）；否则什么都不打印。启动器本身不是补丁目标，
+# 直接交给引擎只会得到一句内部解析错误。
+launcher_real_entry() {
+  local entry="$1" dir name version
+  [[ "$(basename "$entry")" == "cli.js" ]] || return 1
+  dir=$(cd "$(dirname "$entry")" 2>/dev/null && pwd -P) || return 1
+  name=$(json_scalar_field "$dir/package.json" name) || return 1
+  [[ "$name" == "@cometix/anthropic-cc" ]] || return 1
+  json_scalar_field "$dir/package.json" runtimeBuild >/dev/null 2>&1 || return 1
+  version=$(json_scalar_field "$dir/package.json" version) || return 1
+  anthropic_cc_runtime_entry_only "$dir" "$version"
+}
+
+# 显式指向启动器时改指向真实入口，并把改写原因讲清楚。
+# 说明走 stderr（调用方用命令替换只取路径），路径走 stdout。
+redirect_launcher_entry() {
+  local entry="$1" real
+  real=$(launcher_real_entry "$entry") || return 1
+  {
+    warning "该路径是 @cometix/anthropic-cc 的启动器，已改指向其生成的运行树:"
+    printf '  %s\n' "$real"
+  } >&2
+  printf '%s\n' "$real"
+}
+
 resolve_target() {
-  local arg="${1:-}"
+  local arg="${1:-}" redirected
   if [[ -n "$arg" ]]; then
     if [[ -f "$arg" ]]; then
-      CLI_PATH="$arg"
+      if redirected=$(redirect_launcher_entry "$arg"); then
+        CLI_PATH="$redirected"
+      else
+        CLI_PATH="$arg"
+      fi
       TARGET_IDENTITY_LOADED=""
       return 0
     fi
@@ -244,7 +494,11 @@ resolve_target() {
     return 1
   fi
   if [[ -n "${CLAUDE_CLI_PATH:-}" && -f "$CLAUDE_CLI_PATH" ]]; then
-    CLI_PATH="$CLAUDE_CLI_PATH"
+    if redirected=$(redirect_launcher_entry "$CLAUDE_CLI_PATH"); then
+      CLI_PATH="$redirected"
+    else
+      CLI_PATH="$CLAUDE_CLI_PATH"
+    fi
     TARGET_IDENTITY_LOADED=""
     return 0
   fi
@@ -575,6 +829,7 @@ parse_and_set_status() {
   LAST_BACKUP=""
   MSG[$id]=""
   local line has_already=0 has_needs=0 has_success=0 has_err=0 err_msg="" structured=0 scope_kind="" scope_files=""
+  local patch_source=""
   local stage_cn
   case "$mode" in
     apply) stage_cn="应用" ;;
@@ -586,6 +841,9 @@ parse_and_set_status() {
       ALREADY_PATCHED)
         has_already=1
         MSG[$id]="已打补丁"
+        ;;
+      PATCH_SOURCE:*)
+        patch_source="${line#PATCH_SOURCE:}"
         ;;
       NEEDS_PATCH)
         has_needs=1
@@ -674,7 +932,16 @@ parse_and_set_status() {
 
   if [[ "$mode" == "check" ]]; then
     if [[ $has_already -eq 1 ]]; then
+      # 仅由上游 patcher 的 /*@cc:…*/ 标记满足时单列一态，不与"本工具已应用"混淆。
+      if [[ "$patch_source" == "external" ]]; then
+        STATUS[$id]=external
+        MSG[$id]="外部补丁已满足（非本工具）"
+        return 0
+      fi
       STATUS[$id]=applied
+      if [[ "$patch_source" == "mixed" ]]; then
+        MSG[$id]="已打补丁（含外部补丁位点）"
+      fi
       return 0
     fi
     if [[ $has_needs -eq 1 ]]; then
@@ -1324,6 +1591,22 @@ function finishSemanticPlan(target, patchId, semanticTargets, files, diagnostics
     attribution: {transformations},
     diagnostics,
   };
+}
+
+// Who actually made this patch "already-patched": 'own' when at least one
+// semantic target carries our own marker in live code, 'external' when every
+// consumed target was satisfied by the upstream patcher's /*@cc:…*/ markers,
+// 'mixed' when both contributed. Reported so the shell can tell the user apart
+// instead of showing a single indistinguishable "已应用".
+function patchSource(plan) {
+  const targets = plan.semanticTargets || [];
+  const own = targets.filter(target => target.expectedCardinality !== 0 &&
+    target.matches.some(match => match.state === 'after')).length;
+  const external = targets.filter(target => target.externallySatisfied === true).length;
+  if (own > 0 && external > 0) return 'mixed';
+  if (own > 0) return 'own';
+  if (external > 0) return 'external';
+  return 'structural';
 }
 
 // Targets whose requirement is satisfied structurally by the package shape
@@ -4568,6 +4851,7 @@ if (command === 'inspect') {
     console.log(`BASELINE:${JSON.stringify(manifestPath)}`);
   } else if (plan.state === 'already-patched') {
     console.log('ALREADY_PATCHED');
+    console.log(`PATCH_SOURCE:${patchSource(plan)}`);
   } else if (command === 'check') {
     console.log('NEEDS_PATCH');
     console.log(`PATCH_COUNT:${plan.files.reduce((count, file) => count + file.replacements.length, 0)}`);
@@ -7466,6 +7750,7 @@ pause() {
 status_label() {
   case "${1:-unknown}" in
     applied) printf '%s✓ 已应用%s' "$GREEN" "$NC" ;;
+    external) printf '%s≈ 外部已应用%s' "$BLUE" "$NC" ;;
     idle)    printf '%s· 未应用%s' "$DIM" "$NC" ;;
     error)   printf '%s! 错误%s' "$RED" "$NC" ;;
     *)       printf '%s? 未检测%s' "$YELLOW" "$NC" ;;
@@ -7476,6 +7761,7 @@ status_label() {
 status_plain() {
   case "${1:-unknown}" in
     applied) printf '✓ 已应用' ;;
+    external) printf '≈ 外部已应用' ;;
     idle)    printf '· 未应用' ;;
     error)   printf '! 错误' ;;
     *)       printf '? 未检测' ;;
@@ -7511,13 +7797,14 @@ applied_ids() {
 count_applied() { count_status applied; }
 
 draw_header() {
-  local a i e u=0 id
+  local a i e x u=0 id
   a=$(count_status applied)
   i=$(count_status idle)
   e=$(count_status error)
+  x=$(count_status external)
   for id in "${PATCH_IDS[@]}"; do
     case "${STATUS[$id]:-}" in
-      applied|idle|error) ;;
+      applied|idle|error|external) ;;
       *) u=$((u + 1)) ;;
     esac
   done
@@ -7536,10 +7823,14 @@ draw_header() {
       printf '包:    %s %s (%s)\n' "$TARGET_PACKAGE" "${TARGET_VERSION:-}" "${TARGET_LAYOUT:-}"
     fi
   fi
-  if [[ $((a + i + e)) -eq 0 ]]; then
+  # 启动器形态目标：补丁写在生成运行树里，升级后会被重建丢失，必须显式提醒。
+  if [[ "$SELECTED_TARGET" -ge 0 && "${TARGET_KINDS[$SELECTED_TARGET]:-}" == "launcher" ]]; then
+    printf '%s注意:  该目标为 @cometix/anthropic-cc 生成的运行树；升级（runtimeBuild 变化）后补丁会失效，需要重新应用%s\n' "$YELLOW" "$NC"
+  fi
+  if [[ $((a + i + e + x)) -eq 0 ]]; then
     printf '状态:  %s尚未检测%s — 按 [r] 刷新全部，或进入补丁后按 [c]\n' "$YELLOW" "$NC"
   else
-    printf '状态:  %s 已应用 · %s 未应用 · %s 错误' "$a" "$i" "$e"
+    printf '状态:  %s 已应用 · %s 外部已应用 · %s 未应用 · %s 错误' "$a" "$x" "$i" "$e"
     [[ "$u" -gt 0 ]] && printf ' · %s 未检测' "$u"
     printf '\n'
   fi
@@ -7566,7 +7857,10 @@ draw_main() {
     idx=$((idx + 1))
   done
   printf '%s\n' '----------------------------------------'
-  printf '[1-7] 选择补丁   [a] 一键应用全部   [R] 全还原   [b] 备份当前   [r] 刷新全部   [p] 换路径   [q] 退出\n'
+  printf '[1-7] 选择补丁   [a] 一键应用全部   [R] 全还原   [b] 备份当前   [r] 刷新全部   [p] 换路径   [t] 换目标   [q] 退出\n'
+  if [[ "$SELECTED_TARGET" -ge 0 && ${#TARGET_ENTRIES[@]} -gt 1 ]]; then
+    printf '目标:  第 %d/%d 个已安装发行版\n' "$((SELECTED_TARGET + 1))" "${#TARGET_ENTRIES[@]}"
+  fi
   if has_baseline 2>/dev/null; then
     printf '备份:  %s\n' "$(basename "$(baseline_path)")"
   else
@@ -7786,6 +8080,8 @@ set_path_interactive() {
   if [[ -f "$p" ]]; then
     CLI_PATH="$p"
     TARGET_IDENTITY_LOADED=""
+    TARGET_PACKAGE="" TARGET_VERSION="" TARGET_LAYOUT=""
+    SELECTED_TARGET=-1
     STATUS=()
     MSG=()
     success "目标已设置（状态已清空，按 [r] 检测）"
@@ -7834,6 +8130,17 @@ menu_loop() {
         refresh_all
         ;;
       p|P) set_path_interactive ;;
+      t|T)
+        if [[ -n "${CC_PATCH_EXPLICIT_TARGET:-}" ]]; then
+          warning "当前目标是显式指定的路径；要换目标请先按 [p] 清除，或用 [q] 退出后重新指定"
+        else
+          load_targets
+          if choose_target_interactive; then
+            success "已切换目标: ${TARGET_NAMES[$SELECTED_TARGET]} ${TARGET_VERSIONS[$SELECTED_TARGET]}"
+          fi
+        fi
+        pause
+        ;;
       1|2|3|4|5|6|7)
         id="${PATCH_IDS[$((choice - 1))]}"
         show_detail "$id"
@@ -7844,37 +8151,121 @@ menu_loop() {
 }
 
 run_check_mode() {
-  if ! require_target_readable; then
-    error "未找到 cli.js 目标（请传入路径或设置 CLAUDE_CLI_PATH）"
-    exit 1
-  fi
   if ! ensure_node; then
     exit 1
   fi
-  # --check 静默跑全量，进度不刷屏
-  refresh_all 1 || true
+  # 显式指定目标时只报告该目标；否则依次报告本机全部检测到的目标，
+  # 不静默只报第一个（多发行版共存的机器上这会让用户补错对象）。
+  local -a entries=() notes=() stubs=()
+  if [[ -n "${CC_PATCH_EXPLICIT_TARGET:-}" ]]; then
+    require_target_readable || { error "目标不可读: $CLI_PATH"; exit 1; }
+    entries=("$CLI_PATH")
+    notes=("")
+    stubs=("")
+  else
+    load_targets
+    local i
+    if (( ${#TARGET_ENTRIES[@]} == 0 )); then
+      error "未找到 cli.js 目标（请传入路径或设置 CLAUDE_CLI_PATH）"
+      exit 1
+    fi
+    for i in "${!TARGET_ENTRIES[@]}"; do
+      if [[ -z "${TARGET_NOTES[$i]:-}" ]]; then
+        entries+=("${TARGET_ENTRIES[$i]}")
+      else
+        # 解析失败的启动器：没有可检测入口，只保留说明
+        entries+=("")
+      fi
+      notes+=("$(target_check_note "$i")")
+      stubs+=("${TARGET_ENTRIES[$i]}")
+    done
+  fi
+
+  local idx entry ec=0
+  for idx in "${!entries[@]}"; do
+    # 启动器解析失败时入口为空：这一项目标只有说明、没有可检测的代码，
+    # 不能把 179 字节启动器交给引擎（那只会得到一句内部解析错误）。
+    if [[ -z "${entries[$idx]}" ]]; then
+      if (( ${#entries[@]} > 1 )); then
+        printf '==================== 目标 %d/%d ====================\n' "$((idx + 1))" "${#entries[@]}"
+      fi
+      printf '目标:  %s\n' "${stubs[$idx]:-未知}"
+      if [[ -n "${notes[$idx]}" ]]; then
+        printf '注意:  %s\n' "${notes[$idx]}"
+      fi
+      printf '状态:  暂不可补丁\n'
+      continue
+    fi
+    if (( ${#entries[@]} > 1 )); then
+      printf '==================== 目标 %d/%d ====================\n' "$((idx + 1))" "${#entries[@]}"
+    fi
+    CLI_PATH="${entries[$idx]}"
+    TARGET_IDENTITY_LOADED=""
+    STATUS=()
+    MSG=()
+    TARGET_PACKAGE="" TARGET_VERSION="" TARGET_LAYOUT=""
+    # --check 静默跑全量，进度不刷屏
+    refresh_all 1 || true
+    CC_PATCH_TARGET_NOTE="${notes[$idx]}" print_check_table || ec=1
+  done
+  exit "$ec"
+}
+
+# 单个目标在 --check 输出里的附加说明：不可补丁原因 + 启动树形态的耐久性提醒。
+target_check_note() {
+  local idx="$1" note
+  note=$(target_note_cn "${TARGET_NOTES[$idx]:-}")
+  if [[ -n "$note" ]]; then
+    printf '%s' "$note"
+    return 0
+  fi
+  if [[ "${TARGET_KINDS[$idx]:-}" == "launcher" ]]; then
+    printf '该目标为 @cometix/anthropic-cc 生成的运行树；升级（runtimeBuild 变化）后补丁会失效，需要重新应用'
+  fi
+}
+
+# 打印单个目标的七补丁状态表；任一补丁报错时返回 1
+print_check_table() {
   local id ec=0 st_cn
   printf '目标: %s\n' "$CLI_PATH"
   if [[ -n "${TARGET_PACKAGE:-}" ]]; then
     printf '包: %s %s (%s)\n' "$TARGET_PACKAGE" "${TARGET_VERSION:-}" "${TARGET_LAYOUT:-}"
   fi
+  if [[ -n "${CC_PATCH_TARGET_NOTE:-}" ]]; then
+    printf '注意: %s\n' "$CC_PATCH_TARGET_NOTE"
+  fi
   printf '\n'
-  printf '%-18s %-10s %s\n' "ID" "状态" "说明"
-  printf '%-18s %-10s %s\n' "------------------" "----------" "-------"
+  printf '%-18s %-12s %s\n' "ID" "状态" "说明"
+  printf '%-18s %-12s %s\n' "------------------" "------------" "-------"
   for id in "${PATCH_IDS[@]}"; do
     case "${STATUS[$id]:-unknown}" in
       applied) st_cn="已应用" ;;
+      external) st_cn="外部已应用" ;;
       idle)    st_cn="未应用" ;;
       error)   st_cn="错误" ;;
       *)       st_cn="未知" ;;
     esac
-    printf '%-18s %-10s %s\n' "$id" "$st_cn" "${MSG[$id]:-}"
+    printf '%-18s %-12s %s\n' "$id" "$st_cn" "${MSG[$id]:-}"
     [[ "${STATUS[$id]:-}" == "error" ]] && ec=1
   done
-  exit "$ec"
+  return "$ec"
 }
 
 run_restore_all_mode() {
+  # 全还原是破坏性操作：多发行版共存的机器上绝不能静默挑第一个目标，
+  # 必须由用户显式指定要还原哪一个。
+  if [[ -z "${CC_PATCH_EXPLICIT_TARGET:-}" ]]; then
+    load_targets
+    if (( ${#TARGET_ENTRIES[@]} > 1 )); then
+      error "检测到 ${#TARGET_ENTRIES[@]} 个可补丁目标，--restore-all 需要显式指定要还原哪一个:"
+      local i
+      for i in "${!TARGET_ENTRIES[@]}"; do
+        printf '  %d) %s %s\n     %s\n' "$((i + 1))" "${TARGET_NAMES[$i]}" "${TARGET_VERSIONS[$i]}" "${TARGET_ENTRIES[$i]}"
+      done
+      printf '用法: %s <目标入口路径> --restore-all\n' "$(basename "$0")"
+      exit 1
+    fi
+  fi
   if ! require_target_readable; then
     error "未找到 cli.js 目标（请传入路径或设置 CLAUDE_CLI_PATH）"
     exit 1
@@ -7908,6 +8299,11 @@ main() {
     esac
   done
 
+  CC_PATCH_EXPLICIT_TARGET=""
+  if [[ -n "$path_arg" || -n "${CLAUDE_CLI_PATH:-}" ]]; then
+    # 用户显式指定：只处理该目标，不枚举、不询问
+    CC_PATCH_EXPLICIT_TARGET=1
+  fi
   resolve_target "${path_arg:-}" || true
 
   if [[ "$mode" == "check" ]]; then
@@ -7915,6 +8311,22 @@ main() {
   fi
   if [[ "$mode" == "restore-all" ]]; then
     run_restore_all_mode
+  fi
+
+  # 交互菜单：枚举全部目标；多个可补丁目标时先让用户选择，未选择不写任何文件。
+  if [[ -z "$CC_PATCH_EXPLICIT_TARGET" ]]; then
+    load_targets
+    if ! choose_target_interactive; then
+      if (( ${#TARGET_ENTRIES[@]} == 0 )); then
+        error "未找到 cli.js 目标（请传入路径或设置 CLAUDE_CLI_PATH）"
+      else
+        info "未选择目标，已退出"
+      fi
+      exit 1
+    fi
+  elif ! require_target_readable; then
+    error "未找到 cli.js 目标（请传入路径或设置 CLAUDE_CLI_PATH）"
+    exit 1
   fi
 
   menu_loop
