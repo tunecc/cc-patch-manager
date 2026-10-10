@@ -1,0 +1,626 @@
+schema: comet.native.v4
+name: fix-unlock-status-false-positive
+language: zh-CN
+phase: archive
+status: done
+state_version: 17
+brief: brief.md
+document_constraints_version: 2
+shape_confirmation_hash: 725b2a183306b56fcc531843d18b5a86b07b877b1d929c837d2167cf41d655b1
+spec_changes:
+  - capability: patch-engine
+    operation: modify
+    source: specs/patch-engine/spec.md
+workspace:
+  isolation: current
+  change_branch: main
+  target_branch: main
+  finish: null
+loop:
+  stage: done
+  goal_cycle: 3
+  iteration: 1
+  attempt: 1
+  retry_epoch: 0
+  failed_iteration_count: 1
+  no_progress_count: 0
+  execution_failure_count: 0
+  previous_unresolved_ids: []
+  next_action: null
+acceptance:
+  - id: A1
+    source: brief.md
+    text: A1 单目标（仅 `@cometix/claude-code`）：行为与现在完全一致，`--check`
+      只输出一个身份行、不出现多目标横幅、不出现运行树提示。
+    result: passed
+    reason:
+      text: "Built my own single-target fixture in /tmp (npm-root stub returning a
+        root holding only @cometix/claude-code 2.1.284, HOME redirected, real
+        npm shadowed). `cc-patch-manager.sh --check` printed exactly one
+        identity line ('目标: <path>' + '包: @cometix/claude-code 2.1.284
+        (split-esm)') and nothing else: grep confirmed no '目标 1/' multi-target
+        banner and no '运行树' durability note. Output shape is byte-for-byte the
+        pre-change single-target shape."
+      truncated: false
+  - id: A2
+    source: brief.md
+    text: A2 多目标（两个发行版都在）：`--check` 依次列出 2
+      个目标（各自包名、版本、路径）及每个补丁状态；交互菜单在应用前弹出目标选择清单；未选择时不写任何文件。
+    result: passed
+    reason:
+      text: "Real dual-target machine: `--check` printed '目标 1/2' then '目标 2/2', each
+        with package name, version, path and all seven per-patch statuses, in
+        discovery order (@cometix/claude-code 2.1.284 split-esm first, then
+        @cometix/anthropic-cc 2.1.296 runtime-entry.js). Interactive run `printf
+        '1\\nq\\n'` showed the picker listing both targets with
+        [direct]/[launcher] kinds and paths before any menu action, then drew
+        the menu for the chosen target. Nothing-selected path: `printf '\\n'`
+        printed '[信息] 未选择目标，已退出' and exited 1; I hashed the whole fixture
+        (find+shasum) before and after and it was byte-identical, with no
+        .cc-patch-manager-baseline created. Invalid choice '9' warned and exited
+        1 without writing."
+      truncated: false
+  - id: A3
+    source: brief.md
+    text: A3 `@cometix/anthropic-cc` 目标：解析到当前运行树的 `runtime-entry.js`；七个补丁
+      `NEEDS_PATCH → apply → ALREADY_PATCHED → restore` 全通过；`--check` 显示的包名/版本为
+      `@cometix/anthropic-cc` 2.1.296。
+    result: passed
+    reason:
+      text: "Real machine `--check` resolved the target to
+        /Users/tune/.local/share/anthropic-cc/versions/2.1.296/build-1791622995\
+        381-dAxjz9/runtime-entry.js and reported '包: @cometix/anthropic-cc
+        2.1.296 (split-esm)'. Independently copied that 141 MB runtime tree to
+        /tmp and drove the lifecycle myself via the runtime: all seven patches
+        (auto-mode 3, keybindings 1, transcript-dialog 2, ultracode 2,
+        voice-mode 7, context-limit 3, computer-use 4 sites) went NEEDS_PATCH ->
+        apply -> ALREADY_PATCHED -> restore OK; `runtime_exec inspect` reported
+        TARGET_PACKAGE:@cometix/anthropic-cc / TARGET_VERSION:2.1.296. The
+        2.1.296 source tree was never touched."
+      truncated: false
+  - id: A4
+    source: brief.md
+    text: A4 运行树缺失（装过主包但从未启动过）：目标仍被列出但带中文可操作备注，不报"entry has neither split-ESM
+      imports nor a single-CJS shape"这类内部错误。
+    result: passed
+    reason:
+      text: "Built my own broken-launcher fixture in /tmp (a @cometix/anthropic-cc
+        package with runtimeBuild in package.json, a 163-byte stub cli.js
+        importing ./runtime.mjs, a stub npm on PATH, an empty
+        ANTHROPIC_CC_DATA_DIR) plus a healthy @cometix/claude-code sibling.
+        `--check` still listed the broken target as '目标 2/2' with '注意:
+        尚未生成运行树（需先启动一次该 CLI）' and '状态: 暂不可补丁', and the healthy sibling was fully
+        reported alongside it. Greps over the output confirmed 'entry has
+        neither split-ESM imports nor a single-CJS shape', 'cruce 目标结构检查失败' and
+        '统一补丁失败' were all ABSENT — no internal engine error leaked."
+      truncated: false
+  - id: A5
+    source: brief.md
+    text: A5 `runtimeBuild` 不匹配 / 运行树被重建：识别为 `stale-runtime-build` 并提示"运行树已过期（重启该
+      CLI 后会重建）"；启动器形态目标在 `--check` 与菜单头常驻显示耐久性提醒。
+    result: passed
+    reason:
+      text: "Built my own stale fixture (runtime tree present, current.json present,
+        but source 'rb-old' != package runtimeBuild 'rb-abc'): `--check` printed
+        '注意: 运行树已过期（重启该 CLI 后会重建）' + '状态: 暂不可补丁'. Durability reminder verified
+        in both required surfaces: `--check` on a healthy launcher fixture
+        printed '该目标为 @cometix/anthropic-cc 生成的运行树；升级（runtimeBuild
+        变化）后补丁会失效，需要重新应用', and the real-machine interactive menu (`printf
+        '2\\nq\\n'`) printed the same reminder in the header under '包:
+        @cometix/anthropic-cc 2.1.296'. See risks for the explicit-path gap,
+        which I did not treat as a failure of this item."
+      truncated: false
+  - id: A6
+    source: brief.md
+    text: A6 显式指定路径（位置参数 / `CLAUDE_CLI_PATH`）仍然最高优先，且指向 `@cometix/anthropic-cc`
+      包内启动器 `cli.js` 时自动改指向运行树 `runtime-entry.js` 并说明原因。
+    result: passed
+    reason:
+      text: "Real machine: `./cc-patch-manager.sh
+        /opt/homebrew/lib/node_modules/@cometix/anthropic-cc/cli.js --check`
+        printed to stderr '[注意] 该路径是 @cometix/anthropic-cc 的启动器，已改指向其生成的运行树:' +
+        the runtime-entry.js path, then reported only that target (no
+        multi-target banner) with identity @cometix/anthropic-cc 2.1.296 and all
+        seven 未应用. CLAUDE_CLI_PATH also honoured with highest priority: with
+        only CLAUDE_CLI_PATH set, `--check` reported exactly that one target and
+        did not enumerate the machine's two installed distributions. A
+        non-launcher path passes through untouched (covered by the new test's
+        passthrough assertion)."
+      truncated: false
+  - id: A7
+    source: brief.md
+    text: A7 三态状态显示：仅有本工具标记 → "已应用"；仅有上游 `@cc:` 标记 → "外部已应用"；两者都无 → "未应用"；`--check`
+      与交互菜单显示一致。
+    result: passed
+    reason:
+      text: "Real 2.1.284 target exercises all three states. `--check`: 6 x 已应用, 1 x
+        外部已应用 (ultracode, with '外部补丁已满足（非本工具）'), 0 x 未应用; the 2.1.296 target
+        shows 7 x 未应用. Interactive menu after `[r]` refresh on the same 2.1.284
+        target (`printf '1\\nr\\nq\\n'`) printed header '状态: 6 已应用 · 1 外部已应用 · 0
+        未应用 · 0 错误' and per-patch rows '1 ✓ 已应用 … 4 ≈ 外部已应用 … 7 ✓ 已应用' —
+        identical to `--check`. The new test also asserts the runtime emits
+        PATCH_SOURCE:external for an upstream-marker-only patch and
+        PATCH_SOURCE:own for a self-applied one, and that parse_and_set_status
+        maps them to the distinct external/applied statuses."
+      truncated: false
+  - id: A8
+    source: brief.md
+    text: A8 真实安装只读验收：2.1.296 运行树临时副本上七补丁 `check→apply→check→restore`、批量应用、`node
+      runtime-entry.js --version` 冒烟与 `restore-all` 均成功，副本回到应用前哈希；2.1.296 源运行树与
+      2.1.284 源包验收前后哈希不变。
+    result: passed
+    reason:
+      text: "Independently hashed all 9988 files (2.1.296 runtime tree 3453, 2.1.284
+        package 5697, @cometix/anthropic-cc main package 838) with find+shasum —
+        a stronger check than the test's own hash, which excludes node_modules.
+        All three were byte-identical before and after running `bash
+        tests/test_real_package_acceptance.sh cruce-launcher` (exit 0) and the
+        two `--check` runs, and no .cc-patch-manager-baseline appeared inside
+        the runtime tree or the main package. On my own /tmp copy of the runtime
+        tree: seven patches check->apply->check->restore all succeeded, bulk
+        apply of all 7 succeeded, `node runtime-entry.js --version` printed
+        '2.1.296 (Claude Code)', restore-all reported RESTORED:all, and the copy
+        returned to its exact pre-run hash (f47590b8f59d...). The 2.1.284 source
+        package's pre-existing .cc-patch-manager-baseline was unchanged."
+      truncated: false
+  - id: A9
+    source: brief.md
+    text: A9 现有快速测试集全部通过（18 个既有测试 + 1 个新增）。 补充行为（同属范围第 2 项，不单独占验收 ID）：破坏性
+      `--restore-all` 在多目标环境下拒绝执行并要求显式指定目标，不静默挑第一个。
+    result: passed
+    reason:
+      text: "Re-ran the whole fast suite myself on the current working tree with `bash
+        -c 'set -e; for t in tests/test_*.sh; do echo \"== $t\"; bash \"$t\" ||
+        exit 1; done'`: 19 test headers, every one printing PASS (or SKIP for
+        test_real_package_acceptance.sh with no target kind, which exits 0),
+        ALL_SUITE_DONE, exit 0. That is 18 pre-existing tests plus the new
+        tests/test_launcher_layout_discovery.sh. I also re-ran the new test
+        standalone (PASS, exit 0) and `bash -n cc-patch-manager.sh` (clean).
+        Both Runtime receipts correspond to this implementation version — I
+        re-executed both myself rather than trusting them."
+      truncated: false
+builder_handoff:
+  candidate_id: 2917dd0a-4043-4d93-94f2-b51eb4a5cf66
+  identity_provider: skill-coordinated
+  builder_execution_ref: skill-coordinated:builder:7d477eb5-6997-4922-9037-1801fc51d2dd
+  iteration: 1
+  summary:
+    text: "修复第一轮独立验收判定失败的 A4 / A5。缺陷：discover_targets 在命令替换里调用
+      resolve_anthropic_cc_runtime_entry，该函数把失败原因写进全局变量
+      CC_RESOLVE_REASON，而命令替换运行在子 shell 中，原因随子 shell 一起丢失——备注列恒为空，--check
+      改而显示通用耐久性提示，并把 179 字节启动器 cli.js 交给引擎，输出 A4 明令禁止的『统一补丁失败: \"entry has
+      neither split-ESM imports nor a single-CJS shape\"』与『cruce
+      目标结构检查失败，已拒绝旧单文件写入路径』并退出 1；选择清单里该目标显示 [launcher] 而非原因且可被选中。掩盖原因：新增测试直接调用
+      resolve_anthropic_cc_runtime_entry，CC_RESOLVE_REASON 留在测试自身 shell 中，后续
+      discover_targets 子 shell 继承该残留值，cut -f5 偶然通过；测试也从未对损坏启动器跑过
+      --check。修复内容：(1) resolve_anthropic_cc_runtime_entry 改为单行输出
+      '<真实入口>\\t<失败原因>'，两个字段走同一行 stdout，命令替换即可同时取到；新增
+      anthropic_cc_runtime_entry_only 供只需入口的调用方；彻底移除全局变量传值。(2) discover_targets
+      解析失败时入口留空、只带原因；run_check_mode 对入口为空的目标只输出路径、中文原因与『暂不可补丁』，不再调用引擎。(3)
+      choose_target_interactive
+      对不可补丁目标只显示原因、不给可选编号；只有本机恰好一个目标时才静默选中，否则一律列出全部已发现目标，避免唯一可用目标被静默选中时用户看不到另一个\
+      发行版。(4) [t] 在目标是显式指定路径时拒绝覆盖。(5) 测试改为通过命令替换断言原因，并新增：损坏启动器的 --check
+      不得出现内部引擎错误、必须出现中文原因与『暂不可补丁』、健康兄弟目标仍被完整报告；选择清单必须显示不可用原因且不给编号。回归验证：把修复按原样改回\
+      缺陷版本后测试在『successful resolution carries no
+      reason』断言上失败（证明断言有效），恢复后通过。修复后复跑：19/19 测试通过；cruce-launcher 真实包验收通过；本机
+      --check 两个目标输出正常；两个真实安装仍未写入。"
+    truncated: false
+  addressed_acceptance_ids:
+    - A1
+    - A2
+    - A3
+    - A4
+    - A5
+    - A6
+    - A7
+    - A8
+    - A9
+  acceptance_review:
+    - id: A1
+      status: implemented-with-evidence
+      evidence:
+        - "tests/test_launcher_layout_discovery.sh：single_root 只装
+          @cometix/claude-code 时 find_cli_js 返回该包 cli.js，--check 输出含『包:
+          @cometix/claude-code 2.1.284 (split-esm)』且不含『目标 1/』横幅、不含『运行树』提示"
+        - 18 个既有测试全部通过，其中 test_target_descriptor.sh 对单目标发现与布局检查的断言未改动即通过
+      note: 单目标路径完全沿用旧语义；discover_targets 在只有一个目标时与旧 locations 列表等价。
+    - id: A2
+      status: implemented-with-evidence
+      evidence:
+        - tests/test_launcher_layout_discovery.sh：dual_root
+          同时装两个发行版，discover_targets 输出 2 行且包名集合为 @cometix/anthropic-cc +
+          @cometix/claude-code；--check 输出含『目标 1/2』『目标 2/2』以及两个发行版的身份行
+        - choose_target_interactive 在 usable>1 时打印编号清单并等待选择，未输入或越界时返回 1，main()
+          随即退出且不调用任何 apply
+        - 本机实跑：./cc-patch-manager.sh 进入菜单前打印两个目标清单
+      note: 未选择时不写任何文件由 main() 的退出分支保证；切换目标时清空身份/状态缓存也有断言覆盖。
+    - id: A3
+      status: implemented-with-evidence
+      evidence:
+        - bash tests/test_real_package_acceptance.sh cruce-launcher：以本机真实
+          @cometix/anthropic-cc 2.1.296 运行树为源，复制到临时副本后七补丁逐项
+          NEEDS_PATCH→apply→ALREADY_PATCHED→restore、批量应用、node runtime-entry.js
+          --version 输出 2.1.296 (Claude Code)、restore-all 报告
+          RESTORED:all、副本哈希回到应用前
+        - "本机 --check：目标 2/2 显示『包: @cometix/anthropic-cc 2.1.296
+          (split-esm)』且七个补丁均为未应用/需修补 N 处"
+      note: 验收脚本的 entry_name 变量让 cruce-launcher 用 runtime-entry.js 作为入口。
+    - id: A4
+      status: implemented-with-evidence
+      evidence:
+        - tests/test_launcher_layout_discovery.sh：broken-data
+          为空目录时，discover_targets 输出的 anthropic-cc 行第 5 列为
+          missing-current-json（通过命令替换取值，不读全局变量）
+        - 同测试新增断言：ANTHROPIC_CC_DATA_DIR 指向空目录时 bash cc-patch-manager.sh --check
+          输出含『尚未生成运行树（需先启动一次该 CLI）』与『暂不可补丁』，且不含 'entry has neither split-ESM
+          imports nor a single-CJS shape'、不含 'cruce 目标结构检查失败'，同时仍完整报告健康的
+          @cometix/claude-code 2.1.284 兄弟目标
+        - target_note_cn missing-current-json → 『尚未生成运行树（需先启动一次该 CLI）』
+      note: 首轮失败已修复：解析结果改为单行 '<入口>\t<原因>' 一并返回，原因不再经全局变量跨子 shell
+        传递；解析失败的目标入口留空，run_check_mode 只输出说明不调用引擎。
+    - id: A5
+      status: implemented-with-evidence
+      evidence:
+        - tests/test_launcher_layout_discovery.sh：stale_main 的 runtimeBuild 改为
+          rb-new 而 current.json 的 source 仍为
+          rb-old，resolve_anthropic_cc_runtime_entry 单行输出入口为空、原因为
+          stale-runtime-build（同样经命令替换断言）
+        - target_note_cn stale-runtime-build → 『运行树已过期（重启该 CLI 后会重建）』
+        - "本机 --check：目标 2/2 输出『注意: 该目标为 @cometix/anthropic-cc
+          生成的运行树；升级（runtimeBuild 变化）后补丁会失效，需要重新应用』；菜单头 draw_header 对 launcher
+          形态常驻显示同一提醒（TARGET_KINDS=launcher 判定）"
+      note: 首轮失败的正是这条备注无法 surfacing；修复后 stale 检测单元级与端到端（--check 备注行）都已验证。
+    - id: A6
+      status: implemented-with-evidence
+      evidence:
+        - 本机实跑：./cc-patch-manager.sh
+          /opt/homebrew/lib/node_modules/@cometix/anthropic-cc/cli.js --check
+          打印『[注意] 该路径是 @cometix/anthropic-cc 的启动器，已改指向其生成的运行树』+ 运行树路径，随后正常输出
+          @cometix/anthropic-cc 2.1.296 的七补丁状态
+        - tests/test_launcher_layout_discovery.sh：redirect_launcher_entry 对启动器
+          cli.js 返回运行树 runtime-entry.js；对 runtime-entry.js 本身返回非零（不被误判为启动器）
+      note: redirect_launcher_entry 的说明走 stderr、路径走 stdout，调用方用命令替换只取路径。
+    - id: A7
+      status: implemented-with-evidence
+      evidence:
+        - 本机 --check：@cometix/claude-code 2.1.284 上 ultracode 显示『外部已应用 /
+          外部补丁已满足（非本工具）』，auto-mode/keybindings/context-limit
+          显示『已应用』，transcript-dialog/voice-mode/computer-use 显示『已应用（含外部补丁位点）』
+        - tests/test_launcher_layout_discovery.sh：仅含
+          /*@cc:unlock-ultracode#xhigh-capability*/ 的夹具 check 输出 ALREADY_PATCHED
+          + PATCH_SOURCE:external；本工具 apply 过的 keybindings 夹具输出
+          PATCH_SOURCE:own；parse_and_set_status 分别把两者映射为 external 与 applied
+        - status_label/status_plain/draw_header/print_check_table 均已加入 external
+          分支，菜单与 --check 一致
+      note: patchSource 只认 live 代码里的本工具标记（state==='after'）与 externallySatisfied
+        标记；structural 表示全部目标期望基数本来就是 0。
+    - id: A8
+      status: implemented-with-evidence
+      evidence:
+        - "bash tests/test_real_package_acceptance.sh cruce-launcher 通过（PASS:
+          cruce-launcher 2.1.296 real-package acceptance (7 applicable, 0
+          documented inapplicable)），脚本内含源包前后哈希比对"
+        - 本机复核：~/.local/share/anthropic-cc/versions/2.1.296/build-*/.cc-patch-manager-baseline
+          不存在（该运行树从未被写入）；/opt/homebrew/lib/node_modules/@cometix/claude-code 的
+          baseline 漂移文件数仍为 8，与改动前一致
+      note: 全部真实安装操作都发生在 /tmp 临时副本上；改动后已清理临时目录。
+    - id: A9
+      status: implemented-with-evidence
+      evidence:
+        - tests/test_auto_mode_engine.sh、test_cc_2_1_273_compat.sh、test_cc_2_1_280_compat.sh、test_cc_2_1_284_compat.sh、test_claude_patcher_coexistence.sh、test_computer_use_integration.sh、test_context_limit_integration.sh、test_dual_layout_lifecycle.sh、test_fast_apply_all.sh、test_launcher_layout_discovery.sh（新增）、test_module_index.sh、test_package_baseline_transaction.sh、test_patch_plan_contract.sh、test_real_package_acceptance.sh、test_restore_all_baseline.sh、test_restore_skips_missing_target.sh、test_target_descriptor.sh、test_voice_mode_gate.sh、test_voice_mode_platform.sh：19/19
+          PASS
+        - bash -n cc-patch-manager.sh 与 bash -n
+          tests/test_real_package_acceptance.sh 均通过
+      note: 新增 1 个测试文件，未删除或跳过任何既有测试。
+  checks:
+    - name:
+        text: bash -n cc-patch-manager.sh
+        truncated: false
+      result: passed
+      note:
+        text: 语法检查通过
+        truncated: false
+    - name:
+        text: tests/test_launcher_layout_discovery.sh（新增聚焦测试，含首轮失败的回归断言）
+        truncated: false
+      result: passed
+      note:
+        text: 覆盖 A1-A7；新增『损坏启动器 --check 不得泄漏内部引擎错误』与『选择清单必须显示不可用原因且不给编号』
+        truncated: false
+    - name:
+        text: 变异验证：把修复改回缺陷版本
+        truncated: false
+      result: passed
+      note:
+        text: " reintroduce 原缺陷（全局变量回传原因）后测试在『successful resolution carries no
+          reason』断言上失败，证明断言有效；恢复修复后通过"
+        truncated: false
+    - name:
+        text: "fast suite: bash tests/test_*.sh"
+        truncated: false
+      result: passed
+      note:
+        text: 19 passed, 0 failed（18 既有 + 1 新增）
+        truncated: false
+    - name:
+        text: "real-package acceptance: cruce-launcher（@cometix/anthropic-cc 2.1.296
+          运行树）"
+        truncated: false
+      result: passed
+      note:
+        text: 七补丁 check→apply→check→restore、批量应用、node runtime-entry.js --version
+          冒烟、restore-all RESTORED:all、副本回到应用前哈希、源运行树哈希不变
+        truncated: false
+    - name:
+        text: live read-only --check on both real targets
+        truncated: false
+      result: passed
+      note:
+        text: 目标 1/2 @cometix/claude-code 2.1.284（ultracode=外部已应用）；目标 2/2
+          @cometix/anthropic-cc 2.1.296 运行树（七补丁未应用 + 耐久性提醒）
+        truncated: false
+    - name:
+        text: broken-launcher --check on a synthetic dual-target fixture
+        truncated: false
+      result: passed
+      note:
+        text: "输出『目标/注意: 尚未生成运行树（需先启动一次该 CLI）/状态: 暂不可补丁』，退出码 0，无内部引擎错误"
+        truncated: false
+    - name:
+        text: interactive picker with one broken launcher + one usable target
+        truncated: false
+      result: passed
+      note:
+        text: 清单同时列出两者，损坏项显示『暂不可补丁：…』且编号为 -)，提示为『请选择 [1-1』
+        truncated: false
+    - name:
+        text: "real-package acceptance: cometixcode（@cometix/claude-code 2.1.284）"
+        truncated: false
+      result: failed
+      note:
+        text: restore-all 树哈希不复原；改动前 HEAD 上失败哈希完全相同（e5f634c0c78a… vs
+          2ececb902dc4…）。根因：该安装 2026-09-29 建基线后 8 个受管 chunk 与 baseline
+          漂移，属机器现状，非本次回归，也不在 A1-A9 范围内
+        truncated: false
+  checks_truncated: false
+  known_limits:
+    - text: cometixcode 真实包验收（@cometix/claude-code 2.1.284 的 restore-all 树哈希复原）在改动前的
+        HEAD 上就已失败：该安装自 2026-09-29 创建 baseline 后，8 个受管 chunk 与 baseline
+        记录发生漂移。属机器现状，未在本次范围内修复。
+      truncated: false
+    - text: 启动器形态的补丁耐久性只做到『显式提醒』：运行树被重建后脚本会提示补丁可能失效并报告未应用，但不会自动重打。
+      truncated: false
+    - text: 官方 @anthropic-ai/claude-code 2.1.296 只有原生二进制（无 cli.js），不在支持范围。
+      truncated: false
+    - text: 本次未对任何真实安装打补丁；用户需自行运行脚本选择目标并应用。
+      truncated: false
+  known_limits_truncated: false
+  review: null
+  submitted_at: 2026-10-10T11:58:09.629Z
+blockers: []
+verification:
+  candidate_id: 2917dd0a-4043-4d93-94f2-b51eb4a5cf66
+  identity_provider: skill-coordinated
+  verifier_execution_ref: skill-coordinated:verifier:3576b1a7-0ade-4ae2-9a01-c0bd2bf92984
+  iteration: 1
+  attempt: 1
+  assurance: skill-coordinated
+  verdict: pass
+  checks:
+    - id: fast-suite
+      name:
+        text: fast suite (tests/test_*.sh)
+        truncated: false
+      argv_display:
+        - text: -c
+          truncated: false
+        - text: set -e; for t in tests/test_*.sh; do echo "== $t"; bash "$t" || exit 1;
+            done
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 53589
+    - id: real-acceptance-launcher
+      name:
+        text: "real-package acceptance: cruce-launcher (@cometix/anthropic-cc 2.1.296
+          runtime tree)"
+        truncated: false
+      argv_display:
+        - text: tests/test_real_package_acceptance.sh
+          truncated: false
+        - text: cruce-launcher
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 549050
+  summary:
+    text: "The round-1 defect is genuinely and completely repaired, and I re-judged
+      all nine items from scratch rather than only A4/A5. Residue check:
+      CC_RESOLVE_REASON is gone from the entire tree; the single-line
+      <entry>\\t<reason> protocol is emitted at one place and parsed at exactly
+      two (anthropic_cc_runtime_entry_only and discover_targets), with the
+      specified operators; the only other caller of
+      resolve_anthropic_cc_runtime_entry is anthropic_cc_runtime_entry_only, so
+      nobody was missed; I audited all 61 bare-global assignments in the script
+      and confirmed every function reachable through a command substitution
+      (redirect_launcher_entry, launcher_real_entry,
+      resolve_anthropic_cc_runtime_entry, json_scalar_field,
+      anthropic_cc_versions_root) declares every variable local, while
+      load_targets/select_target/choose_target_interactive run in the current
+      shell via process substitution so their global writes survive. The
+      regression test really catches the bug's return: I reintroduced the exact
+      round-1 shape (global CC_RESOLVE_REASON, reason read after the command
+      substitution) in a /tmp copy and the new test failed with exit 1 at
+      'successful resolution carries no reason', while the real copy passes with
+      exit 0; the defective copy's --check also reproduced the forbidden 'cruce
+      目标结构检查失败，已拒绝旧单文件写入路径' leak. All nine items verified with my own evidence,
+      not the Builder's: my own broken/stale/healthy/single launcher fixtures in
+      /tmp, the real dual-target machine for --check and the interactive picker,
+      an independent 7-patch lifecycle plus smoke and restore-all on my own copy
+      of the real 2.1.296 runtime tree, and an independent all-files hash of the
+      three real installs before and after. The fast suite passes 19/19. Three
+      risks recorded (tab-in-path parsing, explicit-path durability gap,
+      pre-existing cometixcode/stale-baseline weakness); none of them is a
+      failure of A1-A9, and the cometixcode failure was proven pre-existing by
+      an identical run on a pristine HEAD extraction. Verdict: pass."
+    truncated: false
+  risks:
+    - text: "[LOW] R1: A literal tab in a path breaks the <entry>\\t<reason> protocol
+        (the prompt's 'cannot on POSIX' premise is not strictly correct). —
+        Verified empirically: with ANTHROPIC_CC_DATA_DIR containing a tab,
+        resolve_anthropic_cc_runtime_entry emits
+        '/tmp/verif-ta<TAB>b/.../runtime-entry.js<TAB>' and the parsing at lines
+        284-285 yields entry='/tmp/verif-ta' (truncated) and
+        reason='b/.../runtime-entry.js<TAB>'. The operators themselves are
+        exactly the specified ${resolved%%$'\\t'*} / ${resolved#*$'\\t'} and are
+        correct for tab-free paths. POSIX forbids only NUL and '/' in filenames,
+        so tabs are legal. Requires a tab in $ANTHROPIC_CC_DATA_DIR /
+        $XDG_DATA_HOME / $HOME or the npm global root, which no real npm global
+        install path has; discover_targets' five-field IFS=$'\\t' read has the
+        same inherent limitation. Not an A1-A9 failure."
+      truncated: false
+    - text: "[LOW] R2: An explicitly-specified path gets no launcher durability
+        reminder, in either --check or the menu header. — run_check_mode sets
+        notes=(\"\") when CC_PATCH_EXPLICIT_TARGET=1, and draw_header requires
+        SELECTED_TARGET >= 0 (explicit paths leave it at -1). Confirmed:
+        `./cc-patch-manager.sh <anthropic-cc>/cli.js --check` printed no 注意
+        line. A6's stated requirement (redirect + reason) is met and A5's
+        discovery-path requirement is met, so I passed both; but a user who pins
+        the runtime entry via a positional arg or CLAUDE_CLI_PATH is not warned
+        that the tree is rebuilt on upgrade — the same 'looks unlocked, actually
+        lost' failure mode this change exists to prevent."
+      truncated: false
+    - text: "[MEDIUM] R3: The `cometixcode` real-package acceptance fails, and the
+        cause is a genuine latent tool-side weakness in restore-all — but it
+        predates this candidate. — Confirmed by an independent pristine
+        comparison: `bash tests/test_real_package_acceptance.sh cometixcode`
+        exits 1 with 'FAIL: tree hash mismatch: expected e5f634c0c78a…, got
+        2ececb902dc4…' on the current working tree AND identically on a pristine
+        `git archive HEAD` extraction in /tmp, so it is not a regression from
+        this candidate. Root cause: the shipped @cometix/claude-code 2.1.284
+        install carries a stale .cc-patch-manager-baseline (createdAt
+        2026-09-29) whose snapshots predate the upstream patcher's /*@cc:*/
+        markers; restoreAllFromBaseline validates only assertBaselineIdentity
+        and assertBaselineMirrors and never compares each managed file's live
+        content against its baseline sha256, so restore writes stale snapshots
+        over live marker-carrying chunks (8 chunk files differ post-restore). It
+        does not affect A9 because that test skips (exit 0) without a target
+        kind. Flagged because restore silently reverting externally-patched code
+        is a real latent defect, just not introduced here."
+      truncated: false
+  risks_truncated: false
+  completed_at: 2026-10-10T13:01:48.002Z
+history:
+  - goal_cycle: 1
+    iteration: 1
+    attempt: 0
+    outcome: recovery
+    unresolved_ids: []
+    summary:
+      text: Native confirmed acceptance criteria changed
+      truncated: false
+    completed_at: 2026-10-10T10:42:05.501Z
+  - goal_cycle: 2
+    iteration: 1
+    attempt: 1
+    outcome: fail
+    unresolved_ids:
+      - A4
+      - A5
+    summary:
+      text: "Independent verdict: fail. I ran the required Runtime handshakes (both
+        accepted), then judged the change adversarially against the real
+        dual-distribution machine rather than trusting the Builder's receipts.
+        The core fix is genuinely delivered: discover_targets enumerates both
+        distributions in order, launcher redirection matches upstream
+        runtime.mjs semantics exactly (I read versionsRoot/selected/launch and
+        confirmed the ANTHROPIC_CC_DATA_DIR -> XDG_DATA_HOME -> ~/.local/share
+        precedence, the current.json build+source handling, the runtimeBuild
+        equality check and the cli.js/runtime-entry.js existence checks), the
+        three-state PATCH_SOURCE protocol is correct and I validated every
+        classification against the actual bytes in live code, and the
+        real-install read-only guarantee holds under my own before/after
+        hashing. A1, A2, A3, A6, A7, A8, A9 pass with concrete evidence. A4 and
+        A5 fail on one concrete subshell bug: discover_targets invokes
+        resolve_anthropic_cc_runtime_entry inside a command substitution, so
+        CC_RESOLVE_REASON never propagates and the note field is always empty in
+        a fresh process. The observable consequence on a machine whose runtime
+        tree is missing or stale is exactly what the change promised to
+        eliminate — --check prints the generic durability note instead of the
+        actionable Chinese reason, hands the 179-byte launcher cli.js to the
+        engine, and reports 'entry has neither split-ESM imports nor a
+        single-CJS shape', exiting 1; the stale-runtime-build note '运行树已过期（重启该
+        CLI 后会重建）' never appears at all. Worse, the new regression test passes
+        only because an earlier direct call to the resolver leaves the reason in
+        the test's shell, which the discover_targets subshell inherits — I
+        proved this by replaying the same fixture in a fresh shell (note=[]).
+        The fix is small and localised; I recommend returning to Build to
+        propagate the reason out of the subshell and to add a --check assertion
+        on the broken/stale launcher fixture."
+      truncated: false
+    completed_at: 2026-10-10T11:29:05.261Z
+  - goal_cycle: 2
+    iteration: 2
+    attempt: 0
+    outcome: recovery
+    unresolved_ids: []
+    summary:
+      text: Native Shape artifacts changed
+      truncated: false
+    completed_at: 2026-10-10T11:56:14.327Z
+  - goal_cycle: 3
+    iteration: 1
+    attempt: 1
+    outcome: pass
+    unresolved_ids: []
+    summary:
+      text: "The round-1 defect is genuinely and completely repaired, and I re-judged
+        all nine items from scratch rather than only A4/A5. Residue check:
+        CC_RESOLVE_REASON is gone from the entire tree; the single-line
+        <entry>\\t<reason> protocol is emitted at one place and parsed at
+        exactly two (anthropic_cc_runtime_entry_only and discover_targets), with
+        the specified operators; the only other caller of
+        resolve_anthropic_cc_runtime_entry is anthropic_cc_runtime_entry_only,
+        so nobody was missed; I audited all 61 bare-global assignments in the
+        script and confirmed every function reachable through a command
+        substitution (redirect_launcher_entry, launcher_real_entry,
+        resolve_anthropic_cc_runtime_entry, json_scalar_field,
+        anthropic_cc_versions_root) declares every variable local, while
+        load_targets/select_target/choose_target_interactive run in the current
+        shell via process substitution so their global writes survive. The
+        regression test really catches the bug's return: I reintroduced the
+        exact round-1 shape (global CC_RESOLVE_REASON, reason read after the
+        command substitution) in a /tmp copy and the new test failed with exit 1
+        at 'successful resolution carries no reason', while the real copy passes
+        with exit 0; the defective copy's --check also reproduced the forbidden
+        'cruce 目标结构检查失败，已拒绝旧单文件写入路径' leak. All nine items verified with my own
+        evidence, not the Builder's: my own broken/stale/healthy/single launcher
+        fixtures in /tmp, the real dual-target machine for --check and the
+        interactive picker, an independent 7-patch lifecycle plus smoke and
+        restore-all on my own copy of the real 2.1.296 runtime tree, and an
+        independent all-files hash of the three real installs before and after.
+        The fast suite passes 19/19. Three risks recorded (tab-in-path parsing,
+        explicit-path durability gap, pre-existing cometixcode/stale-baseline
+        weakness); none of them is a failure of A1-A9, and the cometixcode
+        failure was proven pre-existing by an identical run on a pristine HEAD
+        extraction. Verdict: pass."
+      truncated: false
+    completed_at: 2026-10-10T13:01:48.002Z
+history_overflow:
+  dropped_entries: 0
+  first_dropped_at: null
+  last_dropped_at: null
+  outcome_counts:
+    pass: 0
+    fail: 0
+    blocked: 0
+    execution-error: 0
+    recovery: 0
+verification_result: pass
+verification_report: verification.md
+archived: true
+created_at: 2026-10-10T09:27:36.412Z
